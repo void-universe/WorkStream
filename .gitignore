@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.tsbuildinfo
+.qoder-sites/
+.qoder-sites.json
+
+# 本机假数据库（演示账号、会话与测试消息），不入库
+dev/.wsdb.json
+dev/.wsdb.json.*
