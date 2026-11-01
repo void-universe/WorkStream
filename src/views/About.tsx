@@ -122,8 +122,8 @@ export function AboutView({
             </Field>
             <Field label="品牌标样式" hint="嵌入式：透明底 + 跟随主题的字色（暗色白字、亮色黑字）。">
               <NativeSelect className="h-8 text-xs" value={brand} onChange={(event) => onBrandChange(event.target.value as BrandMode)}>
-                <NativeSelectOption value="block">实心块（默认）</NativeSelectOption>
-                <NativeSelectOption value="embed">嵌入式 · 透明底</NativeSelectOption>
+                <NativeSelectOption value="embed">嵌入式 · 透明底（默认）</NativeSelectOption>
+                <NativeSelectOption value="block">实心块</NativeSelectOption>
               </NativeSelect>
             </Field>
           </div>

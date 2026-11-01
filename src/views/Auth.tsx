@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api, describeError, setToken, type User } from "../api";
+import { readBrandMode } from "../lib/brand";
 import { CopyButton, Field, Notice, TextInput } from "../lib/ui";
 
 type RegisterResult = { ok: true; user: User; verify_link: string };
@@ -49,7 +50,11 @@ export function AuthView({ onSignedIn }: { onSignedIn: (user: User, token?: stri
     <main className="mx-auto flex min-h-dvh w-full max-w-lg flex-col justify-center gap-6 px-5 py-10">
       <header className="grid gap-1.5">
         <div className="flex items-center gap-2">
-          <span className="grid size-8 place-items-center rounded-lg bg-foreground font-mono text-xs font-bold text-background">
+          <span
+            className={`grid size-8 place-items-center rounded-lg font-mono text-xs font-bold ${
+              readBrandMode() === "embed" ? "bg-transparent text-foreground" : "bg-foreground text-background"
+            }`}
+          >
             {">_"}
           </span>
           <h1 className="text-xl font-semibold tracking-tight">WorkStream</h1>
