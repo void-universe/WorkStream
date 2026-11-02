@@ -13,6 +13,7 @@
     "build": "tsc --noEmit && node scripts/build.mjs",
     "preview": "vite preview --host 127.0.0.1",
     "dev:function": "node dev/local-function.mjs 8000",
+    "dev:function:worker": "node dev/local-function.mjs 8000 --worker",
     "smoke": "node dev/smoke.mjs",
     "check:schema": "node dev/check-schema.mjs",
     "qa": "node scripts/check-node.mjs && node dev/check-schema.mjs && node dev/smoke.mjs",
@@ -42,6 +43,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@qwen-code/qwen-code": "^0.26.5",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",

@@ -92,6 +92,13 @@ export type Delivery = {
   error: string | null;
 };
 
+export type Attachment = {
+  file_id: string;
+  name: string;
+  content_type: string;
+  size_bytes: number;
+};
+
 export type Message = {
   id: string;
   stream_id: string;
@@ -101,6 +108,7 @@ export type Message = {
   sender_name: string;
   content: string;
   mentions: { type: "human" | "agent"; id: string }[];
+  attachments?: Attachment[];
   deliveries?: Delivery[];
   kind: "chat" | "system";
   error: string | null;
@@ -122,6 +130,7 @@ export type AgentPresence = {
   avatar?: string | null;
   color: string;
   status: "active" | "paused";
+  owned_by_caller?: boolean;
   working: boolean;
   running: number;
   queued: number;
@@ -159,7 +168,7 @@ export type AgentPresenceDetail = {
     created_at: string;
   };
   owner: { id: string; display_name: string };
-  streams: { stream_id: string; name: string; role: string; queued: number; running: number }[];
+  streams: { stream_id: string; name: string; role: string; weight: number; queued: number; running: number }[];
   current: PresenceCurrent | null;
   queue: AgentProfileMail[];
 };

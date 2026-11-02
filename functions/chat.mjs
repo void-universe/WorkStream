@@ -1,13 +1,72 @@
 // 群消息：发送、翻页、@ 解析；@ 虚拟员工入其邮箱队列，@ 真实员工投递到其选定通道。
 import { deliver } from "./accounts.mjs";
 import { AGENT_COLUMNS } from "./agents.mjs";
+import { fireInterrupt } from "./bus.mjs";
 import { requireMembership } from "./perm.mjs";
 import { streamPresence } from "./presence.mjs";
 import { insertMessage } from "./rooms.mjs";
 import { Halt, isUuid, json, newId, now, text, truncate, uuid } from "./util.mjs";
 
 export const MESSAGE_COLUMNS =
-  "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,created_at";
+  "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,attachments,created_at";
+
+const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const MAX_IMAGES = 4;
+const MAX_IMAGE_CHARS = 800_000;
+const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/** base64 长度换算成真实字节数，用于群里显示大小与入库统计。 */
+const b64Bytes = (value) =>
+  Math.floor((value.length * 3) / 4) - (value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0);
+
+/**
+ * 图片存进群文件表（content 列放纯 base64），消息里只留引用。
+ * 这样 messages.list 翻页不会拖着几 MB 的 base64，虚拟员工按需再取原件。
+ */
+async function storeImages(db, { streamId, userId, items }) {
+  if (!Array.isArray(items) || !items.length) return [];
+  if (items.length > MAX_IMAGES) throw new Halt("too_many_images", 400);
+  const out = [];
+  for (const item of items) {
+    const type = String(item?.content_type ?? "");
+    const data = String(item?.data ?? "");
+    if (!IMAGE_TYPES.has(type)) throw new Halt("unsupported_image_type", 400);
+    if (!B64_RE.test(data) || data.length > MAX_IMAGE_CHARS) throw new Halt("invalid_image_data", 400);
+    const name = text(item?.name ?? "图片", { max: 120, name: "name" });
+    if (name.includes("/") || name.includes("\\") || name.startsWith(".")) throw new Halt("invalid_file_name", 400);
+    const created = await db.files.insert({
+      id: newId(), stream_id: streamId, name, object_path: null,
+      size_bytes: b64Bytes(data), content_type: type, store: "db", content: data,
+      uploaded_by: userId, created_at: now(),
+    }, { columns: "id" });
+    if (!created) throw new Halt("image_write_failed", 503);
+    out.push({ file_id: created.id, name, content_type: type, size_bytes: b64Bytes(data) });
+  }
+  return out;
+}
+
+/** 自己名下的员工正在这个群里跑任务时，新的 @ 就是插话：
+ * 写进那条邮箱的 meta，正在生成的流式回复会在分片边界掐断并按新消息重答。
+ */
+async function registerInterrupts(db, { user, streamId, message, agents }) {
+  const owned = agents.filter((agent) => agent.owner_id === user.id).map((agent) => agent.id);
+  if (!owned.length) return [];
+  const running = await db.mail.list([["agent_id", owned], ["stream_id", streamId], ["status", "running"]], {
+    columns: "id,agent_id,trigger_seq,meta", order: ["started_at", { ascending: true }], limit: 20,
+  });
+  const out = [];
+  for (const mail of running) {
+    const handled = Math.max(Number(mail.trigger_seq ?? 0), Number(mail.meta?.interrupt?.seq ?? 0));
+    if (Number(message.seq) <= handled) continue;
+    const meta = { ...(mail.meta ?? {}), interrupt: { message_id: message.id, seq: Number(message.seq), at: now() } };
+    const claimed = await db.mail.claim([["id", mail.id], ["status", "running"]], { meta });
+    if (claimed) {
+      fireInterrupt(mail.id);
+      out.push({ agent_id: mail.agent_id, mail_id: mail.id });
+    }
+  }
+  return out;
+}
 
 function parseMentions(raw) {
   if (!Array.isArray(raw) || !raw.length) return [];
@@ -72,16 +131,18 @@ export const actions = {
       items,
       has_more: rows.length > limit,
       oldest_seq: items[0]?.seq ?? null,
-      presence: await streamPresence(db, streamId),
+      presence: await streamPresence(db, streamId, user.id),
     });
   },
 
   async "messages.send"({ db, user, body }) {
     const streamId = uuid(body.stream_id, "stream_id");
     const membership = await requireMembership(db, streamId, user.id);
-    const content = text(body.content, { max: 8000, name: "content" });
+    const content = text(body.content ?? "", { max: 8000, required: false });
     const mentions = parseMentions(body.mentions);
     const replyTo = body.reply_to ? uuid(body.reply_to, "reply_to") : null;
+    const attachments = await storeImages(db, { streamId, userId: user.id, items: body.attachments });
+    if (!content && !attachments.length) throw new Halt("invalid_content", 400);
 
     const agentIds = mentions.filter((m) => m.type === "agent").map((m) => m.id);
     const humanIds = mentions.filter((m) => m.type === "human").map((m) => m.id);
@@ -110,10 +171,15 @@ export const actions = {
       content,
       mentions,
       replyTo,
+      attachments,
     });
 
+    const interrupted = await registerInterrupts(db, { user, streamId, message, agents });
+    const merged = new Set(interrupted.map((row) => row.agent_id));
     const queued = [];
     for (const agent of agents) {
+      // 该员工正在本群跑任务且这次 @ 已被登记成插话：不再另起一条任务，避免回两遍。
+      if (merged.has(agent.id)) continue;
       const mail = await db.mail.insert({
         id: newId(),
         agent_id: agent.id,
@@ -149,13 +215,32 @@ export const actions = {
       notified.push({ user_id: human.id, channel: human.at_channel === "real_email" ? "real_email" : "virtual" });
     }
 
-    return json({ ok: true, message, queued, notified, my_role: membership.role });
+    return json({ ok: true, message, queued, interrupted, notified, my_role: membership.role });
+  },
+
+  /** 取一条消息附带的原图：群成员才能取，返回 base64 供前端拼 data URL。 */
+  async "messages.attachment"({ db, user, params }) {
+    const fileId = uuid(params.get("id"), "id");
+    const file = await db.files.byId(fileId, { columns: "id,stream_id,name,content_type,size_bytes,content,store" });
+    if (!file) throw new Halt("file_not_found", 404);
+    await requireMembership(db, file.stream_id, user.id);
+    if (file.store !== "db" || !String(file.content_type).startsWith("image/")) {
+      throw new Halt("attachment_not_image", 400);
+    }
+    return json({
+      ok: true,
+      attachment: {
+        file_id: file.id, name: file.name, content_type: file.content_type,
+        size_bytes: file.size_bytes, data: file.content ?? "",
+      },
+    });
   },
 };
 
 export const shapeMessage = (row) => ({
   ...row,
   mentions: Array.isArray(row.mentions) ? row.mentions : [],
+  attachments: Array.isArray(row.attachments) ? row.attachments : [],
 });
 
 /** 该虚拟员工在这个群里的时间片权重；未设即为均分（权重 1）。 */

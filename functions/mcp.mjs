@@ -7,7 +7,7 @@ import { streamWeight } from "./chat.mjs";
 import { createGroupFile, deleteGroupFile, insertMessage } from "./rooms.mjs";
 import { seal } from "./sec.mjs";
 import { BUILTIN_SKILLS, installedSkillRows } from "./skills.mjs";
-import { email as emailOf, json, newId, now, oneOf, sha256Hex, text, truncate, uuid } from "./util.mjs";
+import { CONTEXT_CHARS_DEFAULT, email as emailOf, json, newId, now, oneOf, sha256Hex, text, truncate, uuid } from "./util.mjs";
 
 const shape = (properties = {}, required = []) => ({
   type: "object",
@@ -313,7 +313,7 @@ async function createStream(db, scope, args) {
     join_policy: "request",
     announcement,
     announcement_at: announcement ? now() : null,
-    context_chars: 12000,
+    context_chars: CONTEXT_CHARS_DEFAULT,
     next_seq: 1,
     mcp_key_hash: null,
     created_at: now(),

@@ -1,12 +1,13 @@
-// 跨视图复用的小件：头像、@ 高亮、复制、字段容器、派发状态。
-import { useRef, useState, type CSSProperties, type InputHTMLAttributes, type ReactNode } from "react";
+// 跨视图复用的小件：头像、@ 高亮、复制、字段容器、派发状态、消息贴图。
+import { useEffect, useRef, useState, type CSSProperties, type InputHTMLAttributes, type ReactNode } from "react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
-import type { Delivery } from "../types";
+import { describeError, get } from "../api";
+import type { Attachment, Delivery } from "../types";
 import { initials } from "./format";
 
 export type Kind = "human" | "agent" | "system";
@@ -41,18 +42,18 @@ export function PersonAvatar({
   const avatarNode =
     kind === "agent" ? (
       <span
-        className={cn(base, "ring-2 ring-offset-2 ring-offset-background")}
+        className={cn(base, "ring-2 ring-offset-2 ring-offset-background", className)}
         style={{ background: "var(--machine-soft)", color: "var(--machine)", "--tw-ring-color": color ?? "var(--machine)" } as CSSProperties}
         title="虚拟员工"
       >
         {face}
       </span>
     ) : kind === "system" ? (
-      <span className={cn(base, "bg-muted text-muted-foreground")} title="系统">
+      <span className={cn(base, "bg-muted text-muted-foreground", className)} title="系统">
         ⚙
       </span>
     ) : (
-      <span className={cn(base, "bg-signal-soft text-signal")} title="真实员工">
+      <span className={cn(base, "bg-signal-soft text-signal", className)} title="真实员工">
         {face}
       </span>
     );
@@ -252,7 +253,7 @@ export function MentionText({ content, names }: { content: string; names: string
     <>
       {parts.map((part, index) =>
         part.startsWith("@") && sorted.some((n) => part === `@${n}`) ? (
-          <span key={index} className="rounded-sm bg-signal-soft px-0.5 font-medium text-signal">
+          <span key={index} className="rounded-sm bg-signal/15 px-0.5 font-medium text-signal">
             {part}
           </span>
         ) : (
@@ -263,13 +264,152 @@ export function MentionText({ content, names }: { content: string; names: string
   );
 }
 
+const thumbCache = new Map<string, string>();
+
+/** 消息贴图：列表里只带引用，缩略图渲染这一条时才去拉原图字节；模块级缓存避免翻页重复拉。 */
+export function MessageImages({ attachments, dense = false }: { attachments?: Attachment[]; dense?: boolean }) {
+  const [open, setOpen] = useState<Attachment | null>(null);
+  if (!attachments?.length) return null;
+  return (
+    <>
+      <div className="mb-1.5 flex flex-wrap gap-1.5">
+        {attachments.map((file) => (
+          <Thumb key={file.file_id} file={file} dense={dense} onOpen={() => setOpen(file)} />
+        ))}
+      </div>
+      {open ? <Lightbox file={open} onClose={() => setOpen(null)} /> : null}
+    </>
+  );
+}
+
+function Thumb({ file, dense, onOpen }: { file: Attachment; dense: boolean; onOpen: () => void }) {
+  const [data, setData] = useState<string | null>(thumbCache.get(file.file_id) ?? null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (data) return;
+    let alive = true;
+    get<{ ok: true; attachment: { data: string } }>("messages.attachment", { id: file.file_id })
+      .then((result) => {
+        if (!alive) return;
+        thumbCache.set(file.file_id, result.attachment.data);
+        setData(result.attachment.data);
+      })
+      .catch((reason) => {
+        if (alive) setError(describeError(reason));
+      });
+    return () => {
+      alive = false;
+    };
+  }, [file.file_id, data]);
+
+  if (error) {
+    return (
+      <span className="grid max-w-40 rounded-md border border-destructive/40 px-2 py-1 text-[11px] leading-snug text-destructive">
+        {file.name}：{error}
+      </span>
+    );
+  }
+  if (!data) {
+    return (
+      <span
+        className={cn("animate-pulse rounded-md bg-muted", dense ? "size-16" : "size-20")}
+        role="img"
+        aria-label={`${file.name} 加载中`}
+      />
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      title={`${file.name} · 点开看原图`}
+      className="overflow-hidden rounded-md border border-border/60"
+    >
+      <img
+        src={`data:${file.content_type};base64,${data}`}
+        alt={file.name}
+        draggable={false}
+        className={cn("object-cover", dense ? "size-16" : "size-20")}
+      />
+    </button>
+  );
+}
+
+function Lightbox({ file, onClose }: { file: Attachment; onClose: () => void }) {
+  const src = thumbCache.get(file.file_id);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  if (!src) return null;
+  return (
+    // 遮罩盖住整屏，点空白或 Esc 关掉；图片本身拦住冒泡，免得误触。
+    <div
+      role="dialog"
+      aria-label={file.name}
+      className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-4"
+      onClick={onClose}
+    >
+      <figure className="grid justify-items-center gap-2" onClick={(event) => event.stopPropagation()}>
+        <img
+          src={`data:${file.content_type};base64,${src}`}
+          alt={file.name}
+          draggable={false}
+          className="max-h-[80vh] max-w-full rounded-md object-contain"
+        />
+        <figcaption className="max-w-full truncate text-xs text-white/80">{file.name}</figcaption>
+      </figure>
+    </div>
+  );
+}
+
 export async function copyText(value: string, hint = "已复制") {
   try {
     await navigator.clipboard.writeText(value);
     toast.success(hint);
+    return true;
   } catch {
     toast.error("浏览器拒绝了剪贴板访问，请手动选中复制。");
+    return false;
   }
+}
+
+/** 点一下就复制的行内码片：群 UUID 这类要转给别人去搜的串，不值得再多一个按钮。 */
+export function CopyChip({
+  value,
+  display,
+  title = "点一下复制",
+  className,
+}: {
+  value: string;
+  display?: string;
+  title?: string;
+  className?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      title={title}
+      onClick={() => {
+        void copyText(value).then((ok) => {
+          if (!ok) return;
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 1600);
+        });
+      }}
+      className={cn(
+        "shrink-0 cursor-copy rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal",
+        className,
+      )}
+    >
+      {copied ? "已复制 ✓" : (display ?? value)}
+    </button>
+  );
 }
 
 export function CopyButton({ value, label, className }: { value: string; label?: string; className?: string }) {

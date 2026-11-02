@@ -49,7 +49,7 @@ const agent = await call("agents.create", {
   api_key: "demo",
   model: "demo",
   system_prompt: "回答要短，先给结论再给清单。",
-  context_chars: 12000,
+  context_chars: 200000,
 });
 step(`虚拟员工「${agent.agent.name}」就位，Key 尾号 ${agent.agent.api_key_tail}`);
 

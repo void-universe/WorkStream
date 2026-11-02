@@ -3,6 +3,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:http";
 import { makeHandler } from "../functions/handler.mjs";
 import { serveSite } from "../functions/adapter.mjs";
 import { executeTool } from "../functions/mcp.mjs";
@@ -54,6 +55,85 @@ function check(name, condition, detail) {
 }
 
 const step = (title) => console.log(`\n${title}`);
+
+/**
+ * 本机假上游（OpenAI 兼容 SSE）：正文逐字下发、工具参数分片下发、故意够慢，
+ * 才能真的验证流式累加、工具拼接、插话掐断和多模态部件。
+ */
+function startMockUpstream() {
+  const seen = [];
+  const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", async () => {
+      let body = null;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end("{}");
+        return;
+      }
+      seen.push(body);
+      res.on("error", () => {});
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+      const send = (delta, finishReason = null) => res.write(
+        `data: ${JSON.stringify({ id: "mock", choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`,
+      );
+      const alive = () => !res.destroyed && !res.writableEnded;
+      const finish = () => {
+        if (!alive()) return;
+        res.write("data: [DONE]\n\n");
+        res.end();
+      };
+      const say = async (text, gap = 30) => {
+        for (const piece of Array.from(text)) {
+          if (!alive()) return;
+          send({ content: piece });
+          await sleep(gap);
+        }
+        finish();
+      };
+      // 除“慢慢写”“插话重答”两条剧本外，其余一次写完，免得自检被人为拖慢。
+      const sayFast = (text) => {
+        send({ content: text });
+        send({}, "stop");
+        finish();
+      };
+      const system = String(body.messages?.[0]?.content ?? "");
+      const last = body.messages?.[body.messages.length - 1];
+      if (system.includes("被 @ 你的新消息打断")) { sayFast("已按插话重排：一、准备；二、执行；三、复盘。"); return; }
+      if (system.includes("慢慢写")) { await say("正在慢慢写这段长正文", 140); return; }
+      if (Array.isArray(last?.content) && last.content.some((part) => part.type === "image_url")) {
+        sayFast("图里是一块红色的方砖。");
+        return;
+      }
+      if (body.tools?.length && !body.messages.some((m) => m.role === "tool") && system.includes("查历史")) {
+        send({ tool_calls: [{ index: 0, id: "call_mock_1", type: "function", function: { name: "search_history" } }] });
+        await sleep(10);
+        for (const piece of ['{"query":', '"发布清单","limit":5}']) {
+          send({ tool_calls: [{ index: 0, function: { arguments: piece } }] });
+          await sleep(10);
+        }
+        send({}, "tool_calls");
+        finish();
+        return;
+      }
+      if (body.tools?.length) { sayFast("查到 3 条历史记录，已按时间排好。"); return; }
+      sayFast("收到，我按上下文回应。");
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        port: server.address().port,
+        seen,
+        close: () => new Promise((done) => { server.close(() => done()); }),
+      });
+    });
+  });
+}
 
 async function main() {
   step("1. 注册与邮箱验证（开发态收件箱）");
@@ -206,6 +286,10 @@ async function main() {
   const tick = await call("scheduler.tick", { token: ana, method: "GET" });
   const ran = tick.payload.ran ?? [];
   check("tick 跑掉了队列任务", ran.some((r) => r.status === "done"), tick.payload);
+  check("同一员工同一群一轮只跑一封，第二封按 FIFO 等下一轮",
+    ran.length === 1 && tick.payload.queued === 1, tick.payload);
+  const tickAgain = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("下一轮把排队那封也跑掉", (tickAgain.payload.ran ?? []).some((r) => r.status === "done"), tickAgain.payload);
   const history = await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } });
   const agentReply = (history.payload.items ?? []).find((m) => m.sender_type === "agent");
   check("虚拟员工的回复落进群聊", Boolean(agentReply), history.payload);
@@ -403,10 +487,186 @@ async function main() {
   }
   await call("messages.send", { token: ana, body: { stream_id: streamId, content: "@小Q 收个尾", mentions: [{ type: "agent", id: agentId }] } });
   const tick2 = await call("scheduler.tick", { token: ana, method: "GET" });
-  check("压缩后任务仍能完成", (tick2.payload.ran ?? []).some((r) => r.status === "done"), tick2.payload);
+  check("压缩后任务仍能完成", (tick2.payload.ran ?? []).some((r) => r.status === "done" && r.mode !== "compress"), tick2.payload);
+  check("压缩转成后台信排队，不占回复的关键路径", (tick2.payload.queued ?? 0) >= 1, tick2.payload);
+  const tick3 = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("后台压缩信下一轮跑完", (tick3.payload.ran ?? []).some((r) => r.status === "done" && r.mode === "compress"), tick3.payload);
   const memory = await call("agents.memory.list", { token: ana, method: "GET", body: { agent_id: agentId, scope: "stream", stream_id: streamId } });
   const summary = (memory.payload.items ?? []).find((m) => m.kind === "summary");
   check("写入本群压缩摘要并记录覆盖序号", Boolean(summary) && Number(summary.covers_through_seq) > 0, memory.payload);
+
+  step("8b. 流式上游：插话、叫停与原图");
+  const mock = await startMockUpstream();
+  const PNG_B64 = AVATAR.split(",")[1];
+  const mockAgent = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小M", role: "流式联调", api_base_url: `http://127.0.0.1:${mock.port}/v1`,
+      api_key: "mock-key-1", model: "mock", context_chars: 8000,
+    },
+  });
+  const mockAgentId = mockAgent.payload.agent?.id;
+  await call("streams.agents.add", { token: ana, body: { stream_id: streamId, agent_id: mockAgentId } });
+
+  // 图片：原件进群文件表，消息只留引用，上游收到多模态部件。
+  const imageSend = await call("messages.send", {
+    token: ana,
+    body: {
+      stream_id: streamId, content: "@小M 这张图里是什么颜色",
+      mentions: [{ type: "agent", id: mockAgentId }],
+      attachments: [{ name: "红色方块.png", content_type: "image/png", data: PNG_B64 }],
+    },
+  });
+  const fileRef = imageSend.payload.message?.attachments?.[0];
+  check("图片随消息发出，消息里只留引用", imageSend.payload.message?.attachments?.length === 1 && Boolean(fileRef?.file_id), imageSend.payload);
+  await call("scheduler.tick", { token: ana, method: "GET" });
+  check("发给上游的上下文带上了 image_url 部件",
+    mock.seen.some((body) => Array.isArray(body.messages?.[1]?.content)
+      && body.messages[1].content.some((part) => part.type === "image_url" && String(part.image_url?.url).startsWith("data:image/png;base64,"))));
+  const imageReply = ((await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items ?? [])
+    .find((m) => m.sender_id === mockAgentId);
+  check("虚拟员工读图后能回答颜色", String(imageReply?.content).includes("红色"), imageReply);
+  const fetchImage = await call("messages.attachment", { token: ana, method: "GET", body: { id: fileRef?.file_id } });
+  check("群成员能取回原图 base64", fetchImage.payload.attachment?.data === PNG_B64, fetchImage.payload);
+  const stealImage = await call("messages.attachment", { token: deeToken, method: "GET", body: { id: fileRef?.file_id } });
+  check("非群成员取不到原图", stealImage.status === 403, stealImage.payload);
+  const badType = await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "带张不支持的图", attachments: [{ name: "a.svg", content_type: "image/svg+xml", data: PNG_B64 }] },
+  });
+  check("白名单外的图片类型被拒", badType.status === 400 && badType.payload.error === "unsupported_image_type", badType.payload);
+  const emptySend = await call("messages.send", { token: ana, body: { stream_id: streamId, content: "" } });
+  check("空正文且无图被拒", emptySend.status === 400 && emptySend.payload.error === "invalid_content", emptySend.payload);
+
+  // 工具回路走 SSE 分片拼接。
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "@小M 查历史里的发布清单", mentions: [{ type: "agent", id: mockAgentId }] },
+  });
+  await call("scheduler.tick", { token: ana, method: "GET" });
+  check("SSE 分片拼出的工具参数能真的执行", mock.seen.some((body) => body.messages?.some((m) => m.role === "tool")));
+
+  // 插话：正在流式生成时新的 @ 掐断半截，按新消息重答，只回一条。
+  const steerSend = await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "@小M 慢慢写一份周报", mentions: [{ type: "agent", id: mockAgentId }] },
+  });
+  check("开跑前插话消息仍会排队", steerSend.payload.queued?.length === 1, steerSend.payload);
+  const steerTick = call("scheduler.tick", { token: ana, method: "GET" });
+  await new Promise((resolve) => { setTimeout(resolve, 700); });
+  const steer = await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "@小M 只要三条就行", mentions: [{ type: "agent", id: mockAgentId }] },
+  });
+  const steerRan = (await steerTick).payload;
+  check("任务正在跑时，新的 @ 登记成插话而不是另起一条任务",
+    steer.payload.interrupted?.length === 1 && (steer.payload.queued ?? []).length === 0, steer.payload);
+  check("插话后任务照样收尾", (steerRan.ran ?? []).some((r) => r.status === "done"), steerRan);
+  const afterSteer = ((await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items ?? [])
+    .filter((m) => m.sender_id === mockAgentId);
+  check("半截正文不会落进群里", afterSteer.every((m) => !String(m.content).includes("慢慢写")), afterSteer.map((m) => m.content));
+  check("落进群里的是按插话重答的那条", afterSteer.some((m) => String(m.content).includes("已按插话重排")), afterSteer.map((m) => m.content));
+  const steerMsg = ((await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items ?? [])
+    .find((m) => m.id === steer.payload.message?.id);
+  check("插话那条消息对员工显示已处理", (steerMsg?.deliveries ?? []).some((d) => d.status === "done"), steerMsg);
+
+  // 叫停：不插话，直接掐断，不产出回复。
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "@小M 慢慢写一份月报", mentions: [{ type: "agent", id: mockAgentId }] },
+  });
+  const stopTick = call("scheduler.tick", { token: ana, method: "GET" });
+  await new Promise((resolve) => { setTimeout(resolve, 700); });
+  const stop = await call("scheduler.interrupt", { token: ana, body: { stream_id: streamId, agent_id: mockAgentId } });
+  await stopTick;
+  check("主人可以叫停正在生成的回复", stop.payload.mode === "stop", stop.payload);
+  const stopMails = await call("mail.list", { token: ana, method: "GET", body: { agent_id: mockAgentId } });
+  check("被叫停的任务留痕为 cancelled/interrupted",
+    (stopMails.payload.items ?? []).some((m) => m.status === "cancelled" && m.error === "interrupted"), stopMails.payload);
+  const afterStop = ((await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items ?? [])
+    .filter((m) => m.sender_id === mockAgentId);
+  check("叫停后不会吐半截回复", afterStop.every((m) => !String(m.content).includes("慢慢写")), afterStop.map((m) => m.content));
+  const strangerStop = await call("scheduler.interrupt", { token: bToken, body: { stream_id: streamId, agent_id: mockAgentId } });
+  check("别人不能叫停你的虚拟员工",
+    strangerStop.status === 403 && strangerStop.payload.error === "agent_not_owned", strangerStop.payload);
+  const noRun = await call("scheduler.interrupt", { token: ana, body: { stream_id: streamId, agent_id: mockAgentId } });
+  check("没在跑时叫停给出明确错误", noRun.status === 409 && noRun.payload.error === "nothing_running", noRun.payload);
+  step("8c. 上下文窗口：预算够就装全量，装不下就取最新并自动补齐摘要");
+  await call("agents.update", { token: ana, body: { id: mockAgentId, context_chars: 200000 } });
+  for (let i = 0; i < 405; i += 1) {
+    await call("messages.send", { token: ana, body: { stream_id: streamId, content: `长流水 ${i}` } });
+  }
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "@小M 复述最后一条流水号", mentions: [{ type: "agent", id: mockAgentId }] },
+  });
+  await call("scheduler.tick", { token: ana, method: "GET" });
+  const seenWith = (needle) => String((mock.seen
+    .filter((body) => String(body.messages?.[0]?.content ?? "").includes(needle))
+    .pop() ?? {}).messages?.[0]?.content ?? "");
+  const wideSystem = seenWith("复述最后一条流水号");
+  check("预算够大时窗口装下全部记录（不再有条数上限把最旧的挤掉）",
+    wideSystem.includes("长流水 404") && wideSystem.includes("长流水 0"), wideSystem.slice(0, 200));
+
+  await call("agents.update", { token: ana, body: { id: mockAgentId, context_chars: 8000 } });
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "@小M 预算调小了，再报一次最后一条流水号", mentions: [{ type: "agent", id: mockAgentId }] },
+  });
+  const narrowTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  const narrowSystem = seenWith("预算调小了");
+  check("预算装不下时窗口留下的是最新记录",
+    narrowSystem.includes("长流水 404") && !narrowSystem.includes("长流水 0"), narrowSystem.slice(0, 200));
+  check("窗口被截断就补投压缩信，被挤出去的记录不会永远进不了摘要", (narrowTick.payload.queued ?? 0) >= 1, narrowTick.payload);
+
+  // 积压由后台压缩信自己排空，不用真人再发消息；排空后窗口就该从水位线连续往下。
+  const readCovers = async () => {
+    const mem = await call("agents.memory.list", {
+      token: ana, method: "GET", body: { agent_id: mockAgentId, scope: "stream", stream_id: streamId },
+    });
+    return Number((mem.payload.items ?? []).find((m) => m.kind === "summary")?.covers_through_seq ?? 0);
+  };
+  for (let round = 0; round < 40; round += 1) {
+    const tick = await call("scheduler.tick", { token: ana, method: "GET" });
+    const compressing = (tick.payload.ran ?? []).some((r) => r.mode === "compress");
+    if (!compressing && (tick.payload.queued ?? 0) === 0) break;
+  }
+  const covers = await readCovers();
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "@小M 收尾核对", mentions: [{ type: "agent", id: mockAgentId }] },
+  });
+  await call("scheduler.tick", { token: ana, method: "GET" });
+  const finalSeq = Number(/最近记录：\n#(\d+)/.exec(seenWith("收尾核对"))?.[1] ?? 0);
+  check("摘要覆盖序号把水位线推到最新记录之前（积压真的排空了）", covers > 0, { covers });
+  check("窗口从水位线连续往下，中间不留既看不见也没被摘要覆盖的缺口",
+    finalSeq === covers + 1, { finalSeq, covers });
+
+  step("8d. 前缀缓存：稳定态下上一轮窗口整段可复用");
+  for (const word of ["前缀甲", "前缀乙"]) {
+    await call("messages.send", {
+      token: ana,
+      body: { stream_id: streamId, content: `@小M ${word}`, mentions: [{ type: "agent", id: mockAgentId }] },
+    });
+    await call("scheduler.tick", { token: ana, method: "GET" });
+  }
+  // 按「上一条 @ 你的消息」那一块认轮次：下一轮的转录里也带着上一轮的关键词，按全文匹配会两轮取到同一份。
+  const triggered = (needle) => String(mock.seen
+    .map((body) => String(body.messages?.[0]?.content ?? ""))
+    .filter((system) => (system.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "").includes(needle))
+    .pop() ?? "");
+  const [prev, curr] = [triggered("前缀甲"), triggered("前缀乙")];
+  let shared = 0;
+  while (shared < prev.length && shared < curr.length && prev[shared] === curr[shared]) shared += 1;
+  // 转录窗口之后才是每轮必变的块（本群记忆 / 触发消息），公共前缀至少要覆盖到窗口末尾。
+  const windowEnd = ["\n\n本群记忆", "\n\n上一条 @ 你的消息"]
+    .map((mark) => prev.indexOf(mark)).find((at) => at > 0) ?? prev.length;
+  check("两轮请求的公共前缀覆盖整段上一轮窗口（头部没滑动，提供商侧前缀缓存能吃下）",
+    shared >= windowEnd && windowEnd > 0,
+    { 命中率: `${((shared / curr.length) * 100).toFixed(1)}%`, 断点后: curr.slice(shared, shared + 40) });
+  check("每轮只新付本轮新增的记录与触发消息（可复用前缀 ≥95%）", shared / curr.length >= 0.95,
+    { 命中率: `${((shared / curr.length) * 100).toFixed(1)}%`, 长度: [prev.length, curr.length], 断点后: curr.slice(shared, shared + 60) });
+  await mock.close();
 
   step("9. 成员管理：提管理员、拉人、踢人");
   const members = await call("streams.get", { token: ana, method: "GET", body: { id: streamId } });

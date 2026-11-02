@@ -80,6 +80,11 @@ export function int(value, { min = 0, max = 1_000_000_000, name = "number", fall
   return parsed;
 }
 
+// 上下文预算按字符计：中文约 1 字≈1 token、英文约 4 字符≈1 token。
+// 默认 20 万字符够 256K token 窗口的模型用掉一半，上限留给百万窗口的模型。
+export const CONTEXT_CHARS_DEFAULT = 200_000;
+export const CONTEXT_CHARS_MAX = 2_000_000;
+
 export function oneOf(value, allowed, name = "field", fallback) {
   if (value === undefined || value === null) {
     if (fallback !== undefined) return fallback;

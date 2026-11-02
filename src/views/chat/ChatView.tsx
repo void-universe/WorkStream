@@ -1,16 +1,18 @@
 // 群聊主视图：时间线 + @ 派发输入框 + 右侧操作面板。
 // 站点 Function 不能常驻后台，所以时间片推进由这里的轮询驱动（标签页切到后台时自动停）。
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FolderIcon, MegaphoneIcon, SettingsIcon, UsersIcon, XIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { describeError, get, type Agent } from "../../api";
 import type { AgentPresence, Message, StreamDetail, User, Vm } from "../../types";
-import { clockOf, shortUuid, timeAgo } from "../../lib/format";
-import { CopyButton, DeliveryChips, MentionText, PersonAvatar } from "../../lib/ui";
+import { cn } from "@/lib/utils";
+import { shortUuid, timeAgo } from "../../lib/format";
+import { CopyChip, DeliveryChips, MentionText, MessageImages, PersonAvatar } from "../../lib/ui";
 import { Composer, mentionablesOf, type SendResult } from "./Composer";
-import { AnnouncementSection, FilesSection, McpPanel, MembersPanel, SettingsPanel, VmsPanel } from "./Panels";
+import { FilesSection, MembersPanel, SettingsPanel } from "./Panels";
 
 type TickResult = {
   ok: true;
@@ -18,12 +20,6 @@ type TickResult = {
   queued: number;
   budget?: number;
   since: number;
-};
-
-type BoardResult = {
-  ok: true;
-  budget?: number;
-  boards: { agent: Agent; streams: { stream_id: string; queued: number; running: number }[] }[];
 };
 
 type MessagesResult = {
@@ -35,6 +31,18 @@ type MessagesResult = {
 };
 
 const PAGE = 60;
+
+/** 右侧抽屉的三个页面；虚拟机、MCP 等低频项收进群设置的「高级设置」。 */
+type DrawerTab = "members" | "files" | "settings";
+
+const DRAWER_TABS: { value: DrawerTab; label: string; title: string }[] = [
+  { value: "members", label: "成员", title: "群成员" },
+  { value: "files", label: "群文件", title: "群文件" },
+  { value: "settings", label: "设置", title: "群设置" },
+];
+
+/** 相邻消息间隔超过这个毫秒数才插一条居中的时间分隔。 */
+const TIME_GAP_MS = 5 * 60_000;
 
 /** 消息序号不变时，@ 派发的读/处理状态也可能变化；用它决定是否替换列表。 */
 function messageKey(items: Message[]) {
@@ -59,13 +67,13 @@ export function ChatView({
   const [presence, setPresence] = useState<AgentPresence[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [loadError, setLoadError] = useState("");
-  const [queue, setQueue] = useState({ queued: 0, running: 0 });
   const scrollerRef = useRef<HTMLDivElement>(null);
   const lastSeqRef = useRef(0);
   const messageKeyRef = useRef("");
   const sinceRef = useRef(0);
   const stickRef = useRef(true);
   const tickRef = useRef(false);
+  const [drawer, setDrawer] = useState<DrawerTab | null>(null);
 
   const loadDetail = useCallback(async () => {
     try {
@@ -125,7 +133,7 @@ export function ChatView({
     void loadLatest();
   }, [loadDetail, loadLatest]);
 
-  // 每 5 秒：先把时间片丢出去（不阻塞下面的读），再读队列看板与最新消息。
+  // 每 5 秒：先把时间片丢出去（不阻塞下面的读），再读最新消息。
   // tick 跑完后再补一次读，让“处理中 → 已读”尽快落到界面。
   useEffect(() => {
     let stopped = false;
@@ -133,19 +141,8 @@ export function ChatView({
       if (stopped || document.hidden) return;
       const tickPromise = runTick();
       try {
-        const [board, latest] = await Promise.all([
-          get<BoardResult>("scheduler.board"),
-          get<MessagesResult>("messages.list", { stream_id: streamId, limit: PAGE }),
-        ]);
+        const latest = await get<MessagesResult>("messages.list", { stream_id: streamId, limit: PAGE });
         if (stopped) return;
-        const counters = board.boards
-          .flatMap((entry) => entry.streams)
-          .filter((row) => row.stream_id === streamId)
-          .reduce(
-            (sum, row) => ({ queued: sum.queued + row.queued, running: sum.running + row.running }),
-            { queued: 0, running: 0 },
-          );
-        setQueue(counters);
         const changed = applyLatest(latest);
         const tick = await tickPromise;
         if (stopped || !tick) return;
@@ -154,7 +151,6 @@ export function ChatView({
         const after = await get<MessagesResult>("messages.list", { stream_id: streamId, limit: PAGE });
         if (stopped) return;
         applyLatest(after);
-        setQueue((current) => ({ ...current, queued: tick.queued }));
       } catch {
         /* 轮询失败下一轮再试，不打扰用户 */
       }
@@ -198,8 +194,7 @@ export function ChatView({
     setMessages((current) => [...current, result.message]);
     lastSeqRef.current = result.message.seq;
     messageKeyRef.current = messageKey([...messages, result.message]);
-    const tick = await runTick();
-    if (tick) setQueue((current) => ({ ...current, queued: tick.queued }));
+    await runTick();
   }
 
   async function loadEarlier() {
@@ -236,7 +231,6 @@ export function ChatView({
     return <div className="grid h-full place-items-center text-sm text-muted-foreground">正在打开群…</div>;
   }
 
-  const announcement = detail.stream.announcement.trim();
   const reload = loadDetail;
   const agentColors = new Map<string, string>();
   for (const agent of myAgents) if (agent.color) agentColors.set(agent.id, agent.color);
@@ -245,39 +239,36 @@ export function ChatView({
   }
 
   return (
-    <div className="grid h-full min-h-0 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px]">
-      <section className="flex min-h-0 flex-col">
-        <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b px-4 py-3">
+    <div className="grid h-full min-h-0 grid-cols-1">
+      <section className="relative flex min-h-0 flex-col">
+        <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b px-4 py-2.5">
           <h1 className="text-base font-semibold tracking-tight">{detail.stream.name}</h1>
-          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">{shortUuid(detail.stream.id)}</code>
-          <CopyButton value={detail.stream.id} label="UUID" />
-          <span className="text-xs text-muted-foreground">
-            {detail.members.filter((m) => m.type === "human").length} 真人 · {detail.members.filter((m) => m.type === "agent").length} 虚拟
-          </span>
-          <span className="ml-auto flex items-center gap-2">
-            <Badge variant={queue.running ? "default" : "outline"} className="rounded-sm font-mono text-[11px]">
-              运行 {queue.running}
-            </Badge>
-            <Badge variant="secondary" className="rounded-sm font-mono text-[11px]">
-              排队 {queue.queued}
-            </Badge>
+          <CopyChip value={detail.stream.id} display={shortUuid(detail.stream.id)} title="点一下复制完整群 UUID，别人凭它搜索申请进群" />
+          <span className="text-xs text-muted-foreground">{detail.members.length} 位成员</span>
+          <span className="ml-auto flex items-center gap-0.5">
+            {detail.stream.announcement.trim() ? (
+              <Button size="icon-sm" variant="ghost" title="群公告" onClick={() => setDrawer("settings")}>
+                <MegaphoneIcon className="size-4 text-machine" />
+              </Button>
+            ) : null}
+            <Button size="icon-sm" variant="ghost" title="群成员" onClick={() => setDrawer("members")}>
+              <UsersIcon className="size-4" />
+            </Button>
+            <Button size="icon-sm" variant="ghost" title="群文件" onClick={() => setDrawer("files")}>
+              <FolderIcon className="size-4" />
+            </Button>
+            <Button size="icon-sm" variant="ghost" title="群设置" onClick={() => setDrawer("settings")}>
+              <SettingsIcon className="size-4" />
+            </Button>
           </span>
         </header>
-
-        {announcement ? (
-          <div className="flex items-start gap-2 border-b bg-machine-soft px-4 py-2.5 text-machine lg:hidden">
-            <span className="mt-0.5 shrink-0 text-[11px] font-semibold tracking-wide uppercase">公告</span>
-            <p className="min-w-0 flex-1 whitespace-pre-wrap text-xs leading-relaxed">{announcement}</p>
-            <span className="shrink-0 font-mono text-[11px] opacity-70">{timeAgo(detail.stream.announcement_at)}</span>
-          </div>
-        ) : null}
 
         <div
           ref={scrollerRef}
           className="min-h-0 flex-1 overflow-y-auto px-4 py-4 scrollbar-thin"
           style={{ overflowAnchor: "none" }}
         >
-          <div className="grid gap-3">
+          <div className="grid gap-4">
             {hasMore ? (
               <Button size="sm" variant="ghost" className="justify-self-center text-xs" onClick={() => void loadEarlier()}>
                 加载更早的消息
@@ -286,53 +277,77 @@ export function ChatView({
             {messages.length === 0 ? (
               <p className="py-10 text-center text-sm text-muted-foreground">群里还很安静，@ 一位虚拟员工开个头。</p>
             ) : null}
-            {messages.map((message) => (
-              <MessageRow
-                key={message.id}
-                message={message}
-                names={names}
-                me={user.id}
-                color={agentColors.get(message.sender_id)}
-                avatar={
-                  presenceMap.get(message.sender_id)?.avatar ??
-                  avatarMap.get(message.sender_id) ??
-                  (message.sender_id === user.id ? user.avatar : null)
-                }
-                presence={message.sender_type === "agent" ? presenceMap.get(message.sender_id) : undefined}
-              />
-            ))}
+            {messages.map((message, index) => {
+              const previous = messages[index - 1];
+              const system = message.sender_type === "system" || message.kind === "system";
+              const showTime =
+                !system && (!previous || Date.parse(message.created_at) - Date.parse(previous.created_at) > TIME_GAP_MS);
+              return (
+                <Fragment key={message.id}>
+                  {showTime ? (
+                    <p className="text-center text-[11px] text-muted-foreground">{timeAgo(message.created_at)}</p>
+                  ) : null}
+                  <MessageRow
+                    message={message}
+                    names={names}
+                    me={user.id}
+                    color={agentColors.get(message.sender_id)}
+                    avatar={
+                      presenceMap.get(message.sender_id)?.avatar ??
+                      avatarMap.get(message.sender_id) ??
+                      (message.sender_id === user.id ? user.avatar : null)
+                    }
+                    presence={message.sender_type === "agent" ? presenceMap.get(message.sender_id) : undefined}
+                  />
+                </Fragment>
+              );
+            })}
           </div>
         </div>
 
         <footer className="border-t px-4 py-3">
           <Composer streamId={streamId} members={detail.members} presence={presence} onSent={(result) => void afterSent(result)} />
         </footer>
-      </section>
 
-      <aside className="min-h-0 overflow-y-auto border-t bg-sidebar p-3 scrollbar-thin lg:border-l lg:border-t-0">
-        <div className="grid gap-2.5">
-          <AnnouncementSection detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} />
-          <FilesSection detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} />
-        </div>
-        <Tabs defaultValue="members" className="mt-3">
-          <TabsList className="grid w-full grid-cols-4">
-            <TabsTrigger value="members" className="text-xs">成员</TabsTrigger>
-            <TabsTrigger value="vms" className="text-xs">虚拟机</TabsTrigger>
-            <TabsTrigger value="mcp" className="text-xs">MCP</TabsTrigger>
-            <TabsTrigger value="settings" className="text-xs">设置</TabsTrigger>
-          </TabsList>
-          {([
-            ["members", <MembersPanel key="m" detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} presence={presence} />],
-            ["vms", <VmsPanel key="v" detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} />],
-            ["mcp", <McpPanel key="p" detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} />],
-            ["settings", <SettingsPanel key="s" detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} />],
-          ] as const).map(([value, node]) => (
-            <TabsContent key={value} value={value} className="mt-0 p-0 pt-3">
-              {node}
-            </TabsContent>
-          ))}
-        </Tabs>
-      </aside>
+        {drawer ? (
+          <aside className="absolute inset-y-0 right-0 z-30 flex w-[400px] max-w-[88%] flex-col border-l bg-background shadow-[-16px_0_28px_-24px_rgba(0,0,0,0.45)]">
+            <div className="flex items-center gap-2 border-b px-4 py-3">
+              <h2 className="min-w-0 flex-1 truncate text-sm font-semibold">
+                {DRAWER_TABS.find((tab) => tab.value === drawer)?.title}
+              </h2>
+              <Button size="icon-xs" variant="ghost" title="关闭" onClick={() => setDrawer(null)}>
+                <XIcon className="size-4" />
+              </Button>
+            </div>
+            <Tabs value={drawer} onValueChange={(value) => setDrawer(value as DrawerTab)} className="flex min-h-0 flex-1 flex-col">
+              <TabsList className="mx-3 mt-3 h-8 w-auto shrink-0 justify-start gap-0 self-start rounded-none bg-transparent p-0">
+                {DRAWER_TABS.map((tab) => (
+                  <TabsTrigger
+                    key={tab.value}
+                    value={tab.value}
+                    className={cn(
+                      "rounded-none border-b-2 border-transparent px-2 text-xs data-[state=active]:border-signal data-[state=active]:bg-transparent",
+                    )}
+                  >
+                    {tab.label}
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+              <div className="min-h-0 flex-1 overflow-y-auto p-3 scrollbar-thin">
+                <TabsContent value="members" className="mt-0">
+                  <MembersPanel detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} presence={presence} />
+                </TabsContent>
+                <TabsContent value="files" className="mt-0">
+                  <FilesSection detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} />
+                </TabsContent>
+                <TabsContent value="settings" className="mt-0">
+                  <SettingsPanel detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} />
+                </TabsContent>
+              </div>
+            </Tabs>
+          </aside>
+        ) : null}
+      </section>
     </div>
   );
 }
@@ -353,15 +368,12 @@ function MessageRow({
   presence?: AgentPresence;
 }) {
   if (message.sender_type === "system" || message.kind === "system") {
-    return (
-      <p className="mx-auto max-w-lg rounded-md bg-muted/60 px-3 py-1.5 text-center text-xs leading-relaxed text-muted-foreground">
-        {message.content}
-      </p>
-    );
+    return <p className="py-0.5 text-center text-[11px] leading-relaxed text-muted-foreground">{message.content}</p>;
   }
   const agent = message.sender_type === "agent";
+  const mine = message.sender_id === me;
   return (
-    <article className="flex items-start gap-2.5">
+    <article className={cn("group flex items-start gap-2.5", mine && "flex-row-reverse")}>
       <PersonAvatar
         name={message.sender_name}
         kind={agent ? "agent" : "human"}
@@ -370,26 +382,36 @@ function MessageRow({
         href={agent ? `#/agents/${message.sender_id}` : undefined}
         busy={presence?.working}
       />
-      <div className="min-w-0 flex-1">
-        <header className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-          <span className={agent ? "text-sm font-medium text-machine" : "text-sm font-medium"}>{message.sender_name}</span>
-          {agent && presence?.signature ? (
-            <span className="max-w-48 truncate text-[11px] text-muted-foreground">「{presence.signature}」</span>
-          ) : null}
-          {agent ? (
-            <Badge variant="outline" className="rounded-sm font-mono text-[10px] text-machine">
-              虚拟员工
-            </Badge>
-          ) : null}
-          <span className="font-mono text-[11px] text-muted-foreground">#{message.seq}</span>
-          <span className="ml-auto font-mono text-[11px] text-muted-foreground">{clockOf(message.created_at)}</span>
-          {message.sender_id === me ? <span className="text-[11px] text-muted-foreground">我</span> : null}
-        </header>
-        <p className="mt-1 whitespace-pre-wrap text-sm leading-relaxed">
+      <div className={cn("flex min-w-0 max-w-[81%] flex-col items-start gap-1", mine && "items-end")}>
+        {mine ? null : (
+          <header className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 px-1">
+            <span className={cn("text-xs font-medium", agent && "text-machine")}>{message.sender_name}</span>
+            {agent ? (
+              <Badge variant="outline" className="rounded-full px-1.5 py-0 font-mono text-[10px] font-normal text-machine">
+                虚拟
+              </Badge>
+            ) : null}
+            {agent && presence?.signature ? (
+              <span className="max-w-40 truncate text-[11px] text-muted-foreground">「{presence.signature}」</span>
+            ) : null}
+          </header>
+        )}
+        <div
+          className={cn(
+            "rounded-[10px] px-3.5 py-2.5 text-sm leading-relaxed whitespace-pre-wrap",
+            mine ? "bg-signal-soft" : "border border-border/50 bg-card",
+          )}
+        >
+          <MessageImages attachments={message.attachments} />
           <MentionText content={message.content} names={names} />
-        </p>
-        <DeliveryChips deliveries={message.deliveries} />
-        {message.error ? <p className="mt-1 text-xs text-destructive">这条的回执出错：{message.error}</p> : null}
+        </div>
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5 px-1">
+          <DeliveryChips deliveries={message.deliveries} dense />
+          <span className="font-mono text-[10px] text-muted-foreground opacity-0 transition-opacity group-hover:opacity-70">
+            #{message.seq}
+          </span>
+        </div>
+        {message.error ? <p className="px-1 text-xs text-destructive">这条的回执出错：{message.error}</p> : null}
       </div>
     </article>
   );

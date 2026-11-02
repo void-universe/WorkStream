@@ -1,23 +1,28 @@
 // 群聊右侧的操作面板：成员与 @ 派发、群文件、群设置、授权虚拟机、MCP 端点。
 import { useEffect, useState, type ReactNode } from "react";
-import { ChevronDownIcon } from "lucide-react";
+import {
+  DownloadIcon,
+  EyeIcon,
+  FileCodeIcon,
+  FileSpreadsheetIcon,
+  FileTextIcon,
+  ServerIcon,
+  Trash2Icon,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Progress } from "@/components/ui/progress";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { api, describeError, get, post } from "../../api";
 import type { Agent } from "../../types";
 import { byteSize, timeAgo } from "../../lib/format";
 import { defaultFlashColors, readStreamFlash, saveFlashColors, type FlashColors, type FlashScene } from "../../lib/flash";
-import { CopyButton, Field, Notice, PersonAvatar, RoleBadge, SectionTitle, TextInput } from "../../lib/ui";
+import { CopyButton, CopyChip, Notice, PersonAvatar, RoleBadge, SectionTitle, TextInput } from "../../lib/ui";
 import type { AgentPresence, GroupFile, Member, Request, StreamDetail, Vm } from "../../types";
 
 type Props = {
@@ -41,227 +46,184 @@ async function run(action: string, body: unknown, done: string, reload: () => Pr
   }
 }
 
-/** 右栏的折叠卡片：标题 + 计数 + 可选操作按钮，内容可收起。 */
-export function RailSection({
-  title,
-  meta,
-  defaultOpen = false,
-  aside,
-  children,
-}: {
-  title: string;
-  meta?: ReactNode;
-  defaultOpen?: boolean;
-  aside?: ReactNode;
-  children: ReactNode;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
+/** 分组列表容器：行与行之间用发丝线分隔。 */
+function ListGroup({ children }: { children: ReactNode }) {
+  return <div className="divide-y divide-border/50 overflow-hidden rounded-xl border border-border/60 bg-card/50">{children}</div>;
+}
+
+/** 设置类列表行：左侧标题与说明，右侧控件。 */
+function Row({ label, hint, children }: { label: string; hint?: ReactNode; children: ReactNode }) {
   return (
-    <section className="rounded-xl border border-border/60 bg-card/50">
-      <Collapsible open={open} onOpenChange={setOpen}>
-        <div className="flex items-center gap-2 px-2.5">
-          <CollapsibleTrigger className="flex min-w-0 flex-1 items-center gap-2 py-2.5 text-left text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">
-            <ChevronDownIcon className={cn("size-3.5 shrink-0 transition-transform duration-200", !open && "-rotate-90")} />
-            <span className="truncate">{title}</span>
-            {meta}
-          </CollapsibleTrigger>
-          {aside}
-        </div>
-        <CollapsibleContent>
-          <div className="px-2.5 pb-2.5">{children}</div>
-        </CollapsibleContent>
-      </Collapsible>
-    </section>
+    <div className="flex items-center gap-3 px-3 py-2.5">
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium">{label}</p>
+        {hint ? <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">{hint}</p> : null}
+      </div>
+      <div className="flex shrink-0 items-center gap-2">{children}</div>
+    </div>
   );
 }
 
 export function MembersPanel({ detail, myAgents, reload, presence }: Props & { presence?: AgentPresence[] }) {
   const role = detail.my_role;
-  const humans = detail.members.filter((m) => m.type === "human");
-  const agents = detail.members.filter((m) => m.type === "agent");
+  const members = detail.members;
+  const agents = members.filter((member) => member.agent);
   const presenceOf = new Map((presence ?? []).map((entry) => [entry.agent_id, entry]));
   const inGroup = new Set(agents.map((m) => m.agent?.id));
   const candidates = myAgents.filter((a) => !inGroup.has(a.id));
+  const pending = detail.requests.filter((request) => request.status === "pending").length;
   const [inviteEmail, setInviteEmail] = useState("");
   const [pickAgent, setPickAgent] = useState("");
 
   return (
-    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5 [&>*]:min-w-0">
-      <section className="grid gap-2">
-        <SectionTitle>真实员工 · {humans.length}</SectionTitle>
-        {humans.map((member) => (
-          <div key={member.membership_id} className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
-            <PersonAvatar name={member.display_name ?? "?"} kind="human" avatar={member.avatar} />
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-sm">{member.display_name}</p>
-              <p className="truncate font-mono text-xs text-muted-foreground">{member.email}</p>
-            </div>
-            <RoleBadge role={member.role} />
-            {isLeader(role) && member.role !== "owner" ? (
-              <>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-7 px-2 text-xs"
-                  onClick={() =>
-                    void run(
-                      "streams.members.promote",
-                      {
-                        stream_id: detail.stream.id,
-                        membership_id: member.membership_id,
-                        role: member.role === "admin" ? "member" : "admin",
-                      },
-                      member.role === "admin" ? "已降为成员" : "已提升为管理员",
-                      reload,
-                    )
-                  }
-                >
-                  {member.role === "admin" ? "降为成员" : "升为管理"}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-7 px-2 text-xs text-destructive"
-                  onClick={() =>
-                    void run("streams.members.remove", { stream_id: detail.stream.id, membership_id: member.membership_id }, "已移出群", reload)
-                  }
-                >
-                  移出
-                </Button>
-              </>
-            ) : null}
-          </div>
-        ))}
-        <div className="flex items-center gap-2">
-          <TextInput
-            value={inviteEmail}
-            onChange={(event) => setInviteEmail(event.target.value)}
-            placeholder="同事邮箱，邀请 ta 进群"
-            className="h-8 text-xs"
-          />
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-8 shrink-0 text-xs"
-            disabled={!isLeader(role) || !inviteEmail.includes("@")}
-            onClick={() => {
-              void run("streams.invite", { stream_id: detail.stream.id, email: inviteEmail }, "邀请信已投递", reload);
-              setInviteEmail("");
-            }}
-          >
-            邀请
-          </Button>
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4 [&>*]:min-w-0">
+      <section className="grid gap-1.5">
+        <SectionTitle>群成员 · {members.length}</SectionTitle>
+        <div className="grid grid-cols-4 gap-1 rounded-xl border border-border/60 bg-card/50 p-3">
+          {members.map((member) => (
+            <MemberTile
+              key={member.membership_id}
+              detail={detail}
+              member={member}
+              presence={member.agent ? presenceOf.get(member.agent.id) : undefined}
+              reload={reload}
+            />
+          ))}
         </div>
-        {!isLeader(role) ? <Notice>只有群主和管理员能拉人、踢人和审批申请。</Notice> : null}
-      </section>
-
-      <Separator />
-
-      <section className="grid gap-2">
-        <SectionTitle>虚拟员工 · {agents.length}</SectionTitle>
-        {agents.length === 0 ? <Notice>这个群还没有虚拟员工，@ 不到人。</Notice> : null}
-        {agents.map((member) => {
-          const agent = member.agent;
-          if (!agent) return null;
-          return <AgentSlice key={member.membership_id} detail={detail} agent={agent} presence={presenceOf.get(agent.id)} />;
-        })}
-        {candidates.length ? (
+        {agents.length ? (
+          <p className="px-1 text-[11px] leading-relaxed text-muted-foreground">
+            虚拟员工在本群的忙碌程度、处理时间轴和群权重，点头像进详情页看。
+          </p>
+        ) : null}
+        <div className="grid gap-2">
           <div className="flex items-center gap-2">
-            <NativeSelect className="h-8 flex-1 text-xs" value={pickAgent} onChange={(event) => setPickAgent(event.target.value)}>
-              <NativeSelectOption value="">挑一个我的虚拟员工拉进群…</NativeSelectOption>
-              {candidates.map((agent) => (
-                <NativeSelectOption key={agent.id} value={agent.id}>
-                  {agent.name} · {agent.model}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
+            <TextInput
+              value={inviteEmail}
+              onChange={(event) => setInviteEmail(event.target.value)}
+              placeholder="同事邮箱，邀请 ta 进群"
+              className="h-8 text-xs"
+            />
             <Button
               size="sm"
               variant="outline"
               className="h-8 shrink-0 text-xs"
-              disabled={!pickAgent}
+              disabled={!isLeader(role) || !inviteEmail.includes("@")}
               onClick={() => {
-                void run("streams.agents.add", { stream_id: detail.stream.id, agent_id: pickAgent }, "虚拟员工已进群", reload);
-                setPickAgent("");
+                void run("streams.invite", { stream_id: detail.stream.id, email: inviteEmail }, "邀请信已投递", reload);
+                setInviteEmail("");
               }}
             >
-              拉入
+              邀请
             </Button>
           </div>
-        ) : null}
-        <p className="text-xs text-muted-foreground">虚拟员工必须是某个真实员工的，主人不在群里就拉不进来。</p>
+          {candidates.length ? (
+            <div className="flex items-center gap-2">
+              <NativeSelect className="h-8 flex-1 text-xs" value={pickAgent} onChange={(event) => setPickAgent(event.target.value)}>
+                <NativeSelectOption value="">拉一位我的虚拟员工进群…</NativeSelectOption>
+                {candidates.map((agent) => (
+                  <NativeSelectOption key={agent.id} value={agent.id}>
+                    {agent.name} · {agent.model}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 shrink-0 text-xs"
+                disabled={!pickAgent}
+                onClick={() => {
+                  void run("streams.agents.add", { stream_id: detail.stream.id, agent_id: pickAgent }, "虚拟员工已进群", reload);
+                  setPickAgent("");
+                }}
+              >
+                拉入
+              </Button>
+            </div>
+          ) : null}
+        </div>
+        {!isLeader(role) ? <Notice>只有群主和管理员能拉人、踢人和审批申请。</Notice> : null}
       </section>
 
-      <RequestsSection detail={detail} reload={reload} />
-
-      {role === "owner" ? <OwnerTools detail={detail} humans={humans} reload={reload} /> : null}
+      {pending ? <RequestsSection detail={detail} reload={reload} /> : null}
     </div>
   );
 }
 
-function AgentSlice({ detail, agent, presence }: { detail: StreamDetail; agent: Agent; presence?: AgentPresence }) {
-  const [weight, setWeight] = useState(1);
+/** 一格成员：头像、名字后跟一个真人/虚拟标签；身份细节点头像进详情页看。 */
+function MemberTile({
+  detail,
+  member,
+  presence,
+  reload,
+}: {
+  detail: StreamDetail;
+  member: Member;
+  presence?: AgentPresence;
+  reload: () => Promise<void>;
+}) {
+  const agent = member.agent;
   const leader = isLeader(detail.my_role);
+  const name = member.display_name ?? agent?.name ?? "?";
+  const canRemove = member.role !== "owner" && (agent ? detail.my_role === "owner" : leader);
   return (
-    <div className="grid gap-2 rounded-lg border p-2.5">
-      <div className="flex items-center gap-2.5">
-        <PersonAvatar
-          name={agent.name}
-          kind="agent"
-          color={agent.color}
-          avatar={presence?.avatar ?? agent.avatar}
-          href={`#/agents/${agent.id}`}
-          busy={presence?.working}
-        />
-        <div className="min-w-0 flex-1">
-          <p className="flex flex-wrap items-center gap-1.5 truncate text-sm">
-            {agent.name}
-            {agent.status === "paused" ? <span className="text-xs text-muted-foreground">已暂停</span> : null}
-            {presence?.working ? (
-              <Badge variant="secondary" className="gap-1 rounded-full bg-machine-soft px-1.5 py-0 text-[10px] font-normal text-machine">
-                <span aria-hidden className="size-1.5 animate-spin rounded-full border border-current border-t-transparent" />
-                处理中
-              </Badge>
-            ) : presence?.queued ? (
-              <Badge variant="secondary" className="rounded-full px-1.5 py-0 text-[10px] font-normal">
-                排队 {presence.queued}
-              </Badge>
-            ) : null}
-          </p>
-          {presence?.signature ? <p className="truncate text-[11px] text-muted-foreground">「{presence.signature}」</p> : null}
-          <p className="truncate font-mono text-xs text-muted-foreground">
-            {agent.model} · key {agent.api_key_tail}
-          </p>
-        </div>
-        <Badge variant="outline" className="rounded-sm font-mono text-[11px]">
-          {agent.owner_id === detail.stream.owner_id ? "群主的" : "组员自带"}
-        </Badge>
-      </div>
-      <div className="flex items-center gap-2">
-        <span className="text-xs text-muted-foreground">时间片权重</span>
-        <input
-          type="range"
-          min={1}
-          max={20}
-          value={weight}
-          disabled={!leader}
-          onChange={(event) => setWeight(Number(event.target.value))}
-          className="h-1 flex-1 accent-[var(--signal)]"
-        />
-        <span className="w-6 text-right font-mono text-xs tabular-nums">{weight}</span>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-7 px-2 text-xs"
-          disabled={!leader}
-          onClick={() =>
-            void run("scheduler.weight", { stream_id: detail.stream.id, agent_id: agent.id, weight }, `已把 ${agent.name} 在本群的优先级设为 ${weight}`, async () => {})
-          }
+    <div className="group/tile relative flex min-w-0 flex-col items-center gap-1 rounded-lg px-1 py-2 hover:bg-muted/60">
+      <PersonAvatar
+        name={name}
+        kind={agent ? "agent" : "human"}
+        color={agent?.color}
+        avatar={presence?.avatar ?? agent?.avatar ?? member.avatar}
+        href={agent ? `#/agents/${agent.id}` : undefined}
+        busy={presence?.working}
+        className="size-11 text-sm"
+        title={agent ? `${agent.name} · ${agent.model}` : `${name} · ${member.email}`}
+      />
+      <p className="flex w-full min-w-0 items-center justify-center gap-1">
+        <span className="min-w-0 truncate text-[11px]">{name}</span>
+        <span
+          className={cn(
+            "shrink-0 rounded-sm border px-1 text-[9px] leading-4",
+            agent ? "border-machine/30 text-machine" : "border-border text-muted-foreground",
+          )}
         >
-          确认
-        </Button>
-      </div>
-      {!leader ? <p className="text-xs text-muted-foreground">优先级由群主或管理员确认，默认均分。</p> : null}
+          {agent ? "虚拟" : "真人"}
+        </span>
+      </p>
+      {member.role !== "member" ? <RoleBadge role={member.role} /> : null}
+      {leader && canRemove ? (
+        <div className="absolute inset-x-0 bottom-0 hidden flex-col items-center gap-0.5 rounded-lg bg-background/95 py-1 shadow-sm group-hover/tile:flex group-focus-within/tile:flex">
+          {!agent ? (
+            <Button
+              size="xs"
+              variant="ghost"
+              className="h-5 px-1 text-[10px]"
+              onClick={() =>
+                void run(
+                  "streams.members.promote",
+                  {
+                    stream_id: detail.stream.id,
+                    membership_id: member.membership_id,
+                    role: member.role === "admin" ? "member" : "admin",
+                  },
+                  member.role === "admin" ? "已降为成员" : "已提升为管理员",
+                  reload,
+                )
+              }
+            >
+              {member.role === "admin" ? "降为成员" : "升为管理"}
+            </Button>
+          ) : null}
+          <Button
+            size="xs"
+            variant="ghost"
+            className="h-5 px-1 text-[10px] text-destructive"
+            onClick={() =>
+              void run("streams.members.remove", { stream_id: detail.stream.id, membership_id: member.membership_id }, "已移出群", reload)
+            }
+          >
+            移出
+          </Button>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -281,61 +243,63 @@ function RequestsSection({ detail, reload }: { detail: StreamDetail; reload: () 
 
   if (!isLeader(detail.my_role)) return null;
   return (
-    <section className="grid gap-2">
+    <section className="grid gap-1.5">
       <SectionTitle
         aside={
-          <Button size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => void refresh()}>
+          <Button size="xs" variant="ghost" onClick={() => void refresh()}>
             刷新
           </Button>
         }
       >
         入群记录
       </SectionTitle>
-      {list.length === 0 ? <p className="text-xs text-muted-foreground">没有待处理的申请。</p> : null}
-      {list.map((request) => (
-        <div key={request.id} className="flex items-center gap-2 rounded-md border px-2.5 py-2">
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-xs">
-              {request.applicant_name ?? request.applicant_email ?? (request.kind === "agent" ? "虚拟员工" : "未知")}
-              <span className="ml-1.5 text-muted-foreground">
-                {request.kind === "human" ? "申请进群" : request.kind === "invite" ? "被邀请" : "借用虚拟员工"}
-              </span>
-            </p>
-            <p className="truncate font-mono text-[11px] text-muted-foreground">
-              {request.status} · {timeAgo(request.created_at)}
-            </p>
-          </div>
-          {request.status === "pending" ? (
-            <>
-              <Button
-                size="sm"
-                className="h-7 px-2 text-xs"
-                onClick={() =>
-                  void run("streams.decide", { request_id: request.id, approve: true }, "已通过", async () => {
-                    setItems(null);
-                    await reload();
-                  })
-                }
-              >
-                通过
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 px-2 text-xs"
-                onClick={() =>
-                  void run("streams.decide", { request_id: request.id, approve: false }, "已拒绝", async () => {
-                    setItems(null);
-                    await reload();
-                  })
-                }
-              >
-                拒绝
-              </Button>
-            </>
-          ) : null}
-        </div>
-      ))}
+      {list.length === 0 ? <p className="px-1 text-[11px] text-muted-foreground">没有待处理的申请。</p> : null}
+      {list.length ? (
+        <ListGroup>
+          {list.map((request) => (
+            <div key={request.id} className="flex items-center gap-2 px-3 py-2">
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-xs">
+                  {request.applicant_name ?? request.applicant_email ?? (request.kind === "agent" ? "虚拟员工" : "未知")}
+                  <span className="ml-1.5 text-muted-foreground">
+                    {request.kind === "human" ? "申请进群" : request.kind === "invite" ? "被邀请" : "借用虚拟员工"}
+                  </span>
+                </p>
+                <p className="truncate font-mono text-[11px] text-muted-foreground">
+                  {request.status} · {timeAgo(request.created_at)}
+                </p>
+              </div>
+              {request.status === "pending" ? (
+                <>
+                  <Button
+                    size="xs"
+                    onClick={() =>
+                      void run("streams.decide", { request_id: request.id, approve: true }, "已通过", async () => {
+                        setItems(null);
+                        await reload();
+                      })
+                    }
+                  >
+                    通过
+                  </Button>
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    onClick={() =>
+                      void run("streams.decide", { request_id: request.id, approve: false }, "已拒绝", async () => {
+                        setItems(null);
+                        await reload();
+                      })
+                    }
+                  >
+                    拒绝
+                  </Button>
+                </>
+              ) : null}
+            </div>
+          ))}
+        </ListGroup>
+      ) : null}
     </section>
   );
 }
@@ -344,49 +308,51 @@ function OwnerTools({ detail, humans, reload }: { detail: StreamDetail; humans: 
   const [target, setTarget] = useState("");
   const others = humans.filter((m) => m.role !== "owner");
   return (
-    <section className="grid gap-2">
-      <Separator />
+    <section className="grid gap-1.5">
       <SectionTitle>群主工具</SectionTitle>
-      <div className="flex items-center gap-2">
-        <NativeSelect className="h-8 flex-1 text-xs" value={target} onChange={(event) => setTarget(event.target.value)}>
-          <NativeSelectOption value="">把群移交给…</NativeSelectOption>
-          {others.map((member) => (
-            <NativeSelectOption key={member.membership_id} value={member.membership_id}>
-              {member.display_name}
-            </NativeSelectOption>
-          ))}
-        </NativeSelect>
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-8 shrink-0 text-xs"
-          disabled={!target}
-          onClick={() => {
-            void run("streams.transfer", { stream_id: detail.stream.id, membership_id: target }, "群主已移交", reload);
-            setTarget("");
-          }}
-        >
-          移交
-        </Button>
-      </div>
-      <Button
-        size="sm"
-        variant="outline"
-        className="justify-self-start text-xs"
-        onClick={() =>
-          void run("streams.leave", { stream_id: detail.stream.id }, "已退群", async () => {
-            window.location.hash = "#/";
-          })
-        }
-      >
-        退出这个群
-      </Button>
-      <p className="text-xs text-muted-foreground">移交前不能退群；停用群只关闭入口，历史消息按保留策略留在库中。</p>
+      <ListGroup>
+        <Row label="移交群主" hint="移交前不能退群。">
+          <NativeSelect className="h-8 w-32 text-xs" value={target} onChange={(event) => setTarget(event.target.value)}>
+            <NativeSelectOption value="">移交给…</NativeSelectOption>
+            {others.map((member) => (
+              <NativeSelectOption key={member.membership_id} value={member.membership_id}>
+                {member.display_name}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+          <Button
+            size="xs"
+            variant="outline"
+            disabled={!target}
+            onClick={() => {
+              void run("streams.transfer", { stream_id: detail.stream.id, membership_id: target }, "群主已移交", reload);
+              setTarget("");
+            }}
+          >
+            移交
+          </Button>
+        </Row>
+        <Row label="退出这个群" hint="停用群只关闭入口，历史消息按保留策略留在库中。">
+          <Button
+            size="xs"
+            variant="ghost"
+            className="text-destructive"
+            onClick={() =>
+              void run("streams.leave", { stream_id: detail.stream.id }, "已退群", async () => {
+                window.location.hash = "#/";
+              })
+            }
+          >
+            退群
+          </Button>
+        </Row>
+      </ListGroup>
     </section>
   );
 }
 
-export function AnnouncementSection({ detail, reload }: Props) {
+/** 群公告：钉钉把它放在群设置里，不占聊天区。管理者可就地编辑。 */
+function AnnouncementSection({ detail, reload }: Pick<Props, "detail" | "reload">) {
   const leader = isLeader(detail.my_role);
   const published = detail.stream.announcement.trim();
   const [editing, setEditing] = useState(false);
@@ -394,78 +360,63 @@ export function AnnouncementSection({ detail, reload }: Props) {
   useEffect(() => setValue(detail.stream.announcement), [detail.stream.announcement]);
 
   return (
-    <RailSection
-      title="群公告"
-      defaultOpen={Boolean(published)}
-      meta={
-        <Badge variant="secondary" className="rounded-full px-1.5 py-0 text-[10px] font-normal">
-          {published ? "已发布" : "未发布"}
-        </Badge>
-      }
-      aside={
-        leader ? (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="h-6 shrink-0 px-1.5 text-[11px]"
-            onClick={() => setEditing((current) => !current)}
-          >
-            {editing ? "收起" : "编辑"}
-          </Button>
-        ) : null
-      }
-    >
-      {published ? (
-        <p className="whitespace-pre-wrap text-xs leading-relaxed">{published}</p>
-      ) : (
-        <p className="text-xs leading-relaxed text-muted-foreground">
-          还没有公告。写一句本群的节奏或截止时间，虚拟员工用 get_announcement 能读到。
-        </p>
-      )}
-      {published ? (
-        <p className="mt-1 font-mono text-[10px] text-muted-foreground">更新于 {timeAgo(detail.stream.announcement_at)}</p>
-      ) : null}
-      {leader && editing ? (
-        <div className="mt-2 grid gap-2">
-          <Textarea
-            rows={3}
-            value={value}
-            onChange={(event) => setValue(event.target.value)}
-            placeholder="如：周五 18:00 前定稿，逾期顺延。"
-            className="text-xs"
-          />
-          <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              className="h-7 text-xs"
-              onClick={() => {
-                void run("streams.announcement", { stream_id: detail.stream.id, content: value }, "公告已发布", reload)
-                  .then((ok) => { if (ok) setEditing(false); });
-              }}
-            >
-              发布公告
+    <section className="grid gap-1.5">
+      <SectionTitle>群公告</SectionTitle>
+      <ListGroup>
+        <Row
+          label="公告内容"
+          hint={published ? <span className="whitespace-pre-wrap text-foreground/80">{published}</span> : "还没有群公告。"}
+        >
+          {leader ? (
+            <Button size="xs" variant="outline" onClick={() => setEditing((current) => !current)}>
+              {editing ? "收起" : published ? "编辑" : "发布"}
             </Button>
-            {published ? (
+          ) : null}
+        </Row>
+        {published ? (
+          <Row label="发布时间" hint="公告会注入每个员工的本群上下文。">
+            <span className="font-mono text-[11px] text-muted-foreground">{timeAgo(detail.stream.announcement_at)}</span>
+          </Row>
+        ) : null}
+        {leader && editing ? (
+          <div className="grid gap-2 px-3 pb-3">
+            <Textarea
+              rows={4}
+              value={value}
+              onChange={(event) => setValue(event.target.value)}
+              placeholder="如：周五 18:00 前定稿，逾期顺延。"
+              className="text-xs"
+            />
+            <div className="flex items-center gap-2">
               <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 text-xs"
+                size="xs"
                 onClick={() => {
-                  setValue("");
-                  void run("streams.announcement", { stream_id: detail.stream.id, content: "" }, "公告已清空", reload)
-                    .then((ok) => { if (ok) setEditing(false); });
+                  void run("streams.announcement", { stream_id: detail.stream.id, content: value }, "公告已发布", reload).then((ok) => {
+                    if (ok) setEditing(false);
+                  });
                 }}
               >
-                清空
+                发布公告
               </Button>
-            ) : null}
+              {published ? (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => {
+                    setValue("");
+                    void run("streams.announcement", { stream_id: detail.stream.id, content: "" }, "公告已清空", reload).then((ok) => {
+                      if (ok) setEditing(false);
+                    });
+                  }}
+                >
+                  清空
+                </Button>
+              ) : null}
+            </div>
           </div>
-        </div>
-      ) : null}
-      <p className="mt-2 text-[10px] leading-relaxed text-muted-foreground">
-        公告会注入每个员工的本群上下文；MCP 用 get_announcement / set_announcement 读写。
-      </p>
-    </RailSection>
+        ) : null}
+      </ListGroup>
+    </section>
   );
 }
 
@@ -563,61 +514,69 @@ export function FilesSection({ detail, reload }: Props) {
   }
 
   return (
-    <RailSection
-      title="群文件"
-      defaultOpen
-      meta={<Badge variant="secondary" className="rounded-full px-1.5 py-0 font-mono text-[10px]">{files.length}</Badge>}
-      aside={
-        <Button size="sm" variant="ghost" className="h-6 shrink-0 px-1.5 text-[11px]" onClick={() => setUploadOpen((current) => !current)}>
-          {uploadOpen ? "收起上传" : "上传"}
-        </Button>
-      }
-    >
+    <section className="grid min-w-0 gap-1.5">
+      <SectionTitle
+        aside={
+          <div className="flex items-center gap-2">
+            <Badge variant="secondary" className="rounded-full px-1.5 py-0 font-mono text-[10px]">{files.length}</Badge>
+            <Button size="xs" variant="ghost" onClick={() => setUploadOpen((current) => !current)}>
+              {uploadOpen ? "收起上传" : "上传"}
+            </Button>
+          </div>
+        }
+      >
+        文件列表
+      </SectionTitle>
+      <ListGroup>
       {files.length === 0 ? (
-        <p className="text-xs leading-relaxed text-muted-foreground">还没有文件。纪要、清单、脚本片段都可以直接贴进来。</p>
+        <p className="px-3 py-3 text-xs leading-relaxed text-muted-foreground">还没有文件。纪要、清单、脚本片段都可以直接贴进来。</p>
       ) : (
-        <ScrollArea className="max-h-56">
-          <div className="grid gap-1">
+        <div>
+          <div className="grid gap-0.5 p-1.5">
             {files.map((file) => (
-              <div key={file.id} className="flex items-center gap-1 rounded-md border px-2 py-1.5">
+              <div key={file.id} className="group flex items-center gap-2.5 rounded-lg px-1.5 py-1.5 hover:bg-accent/60">
+                <FileGlyph name={file.name} />
                 <button
                   type="button"
                   className="min-w-0 flex-1 text-left"
                   title="在线预览"
                   onClick={() => void openPreview(file)}
                 >
-                  <p className="truncate text-xs hover:underline">{file.name}</p>
-                  <p className="truncate font-mono text-[10px] text-muted-foreground">
+                  <p className="truncate text-xs font-medium">{file.name}</p>
+                  <p className="truncate text-[10px] text-muted-foreground">
                     {byteSize(file.size_bytes)} · {file.uploaded_name ?? "成员"} · {timeAgo(file.created_at)}
                   </p>
                 </button>
-                <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" onClick={() => void openPreview(file)}>
-                  预览
-                </Button>
-                <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" onClick={() => void download(file)}>
-                  下载
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-6 px-1.5 text-[11px] text-destructive"
-                  onClick={() =>
-                    void run("files.delete", { id: file.id }, "已删除", async () => {
-                      await refresh();
-                      await reload();
-                    })
-                  }
-                >
-                  删除
-                </Button>
+                <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                  <Button size="icon-xs" variant="ghost" title="预览" onClick={() => void openPreview(file)}>
+                    <EyeIcon />
+                  </Button>
+                  <Button size="icon-xs" variant="ghost" title="下载" onClick={() => void download(file)}>
+                    <DownloadIcon />
+                  </Button>
+                  <Button
+                    size="icon-xs"
+                    variant="ghost"
+                    className="text-destructive"
+                    title="删除"
+                    onClick={() =>
+                      void run("files.delete", { id: file.id }, "已删除", async () => {
+                        await refresh();
+                        await reload();
+                      })
+                    }
+                  >
+                    <Trash2Icon />
+                  </Button>
+                </div>
               </div>
             ))}
           </div>
-        </ScrollArea>
+        </div>
       )}
 
       {uploadOpen ? (
-        <div className="mt-2 grid gap-2">
+        <div className="grid gap-2 p-2.5">
           <TextInput
             value={name}
             onChange={(event) => setName(event.target.value)}
@@ -647,10 +606,7 @@ export function FilesSection({ detail, reload }: Props) {
           </div>
         </div>
       ) : null}
-
-      <p className="mt-2 text-[10px] leading-relaxed text-muted-foreground">
-        点文件名在线预览；MCP 用 list_files / read_file / upload_file / delete_file 操作同一批文件。
-      </p>
+      </ListGroup>
 
       <Dialog open={Boolean(preview)} onOpenChange={(open) => { if (!open) setPreview(null); }}>
         <DialogContent className="max-w-3xl">
@@ -685,100 +641,142 @@ export function FilesSection({ detail, reload }: Props) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </RailSection>
+    </section>
   );
 }
 
-export function SettingsPanel({ detail, reload }: Props) {
+/** 按扩展名挑图标：代码 / 表格 / 文本三档，其余走通用文件图标。 */
+function FileGlyph({ name }: { name: string }) {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  const Icon = ext === "csv" ? FileSpreadsheetIcon : ["ts", "tsx", "js", "jsx", "py", "sql", "json", "yaml", "yml"].includes(ext) ? FileCodeIcon : FileTextIcon;
+  return (
+    <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
+      <Icon className="size-4" />
+    </span>
+  );
+}
+
+export function SettingsPanel({ detail, myVms, reload }: Props) {
   const [name, setName] = useState(detail.stream.name);
   const [contextChars, setContextChars] = useState(detail.stream.context_chars);
   const [joinPolicy, setJoinPolicy] = useState(detail.stream.join_policy);
+  const [advanced, setAdvanced] = useState(false);
   const owner = detail.my_role === "owner";
   const leader = isLeader(detail.my_role);
 
   return (
     <div className="grid gap-4">
-      <SectionTitle>群身份</SectionTitle>
-      <div className="flex items-center gap-2 rounded-md border px-2.5 py-2">
-        <code className="min-w-0 flex-1 truncate font-mono text-[11px]">{detail.stream.id}</code>
-        <CopyButton value={detail.stream.id} label="UUID" />
-      </div>
-      <p className="text-xs leading-relaxed text-muted-foreground">
-        拿到这串 UUID 的人可以申请进群；改成「仅邀请」后就不再接受申请，只认邮箱邀请。
-      </p>
+      <AnnouncementSection detail={detail} reload={reload} />
 
-      <Field label="群名" htmlFor="stream-name">
-        <div className="flex gap-2">
-          <TextInput id="stream-name" value={name} onChange={(event) => setName(event.target.value)} className="h-8 text-xs" disabled={!leader} />
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-8 shrink-0 text-xs"
-            disabled={!leader || !name.trim()}
-            onClick={() => void run("streams.rename", { stream_id: detail.stream.id, name }, "群名已更新", reload)}
-          >
-            改名
-          </Button>
-        </div>
-      </Field>
-
-      <Field label="群公告">
-        <Notice>公告在上方「群公告」卡片里发布或清空；虚拟员工通过 get_context / get_announcement 读取。</Notice>
-      </Field>
-
-      <Separator />
-      <SectionTitle>闪烁颜色</SectionTitle>
-      <FlashColorSettings streamId={detail.stream.id} />
-
-      <Separator />
-      <SectionTitle>上下文预算与进群方式</SectionTitle>
-      <Field label="上下文预算（字符）" htmlFor="context-chars" hint={`窗口超预算就按群压缩成摘要记忆，历史靠 MCP 回查。当前 ${detail.stream.context_chars}。`}>
-        <div className="flex gap-2">
-          <Input
-            id="context-chars"
-            type="number"
-            min={2000}
-            max={200000}
-            step={1000}
-            value={contextChars}
-            disabled={!owner}
-            onChange={(event) => setContextChars(Number(event.target.value))}
-            className="h-8 text-xs"
-          />
-          <Button size="sm" variant="outline" className="h-8 shrink-0 text-xs" disabled={!owner} onClick={() => void run("streams.settings", { stream_id: detail.stream.id, context_chars: contextChars }, "预算已更新", reload)}>
-            保存
-          </Button>
-        </div>
-      </Field>
-      <Field label="进群方式">
-        <div className="flex gap-2">
-          <NativeSelect className="h-8 flex-1 text-xs" value={joinPolicy} disabled={!owner} onChange={(event) => setJoinPolicy(event.target.value as "request" | "invite_only")}>
-            <NativeSelectOption value="request">凭 UUID 申请，群主/管理员审批</NativeSelectOption>
-            <NativeSelectOption value="invite_only">只接受邮箱邀请</NativeSelectOption>
-          </NativeSelect>
-          <Button size="sm" variant="outline" className="h-8 shrink-0 text-xs" disabled={!owner} onClick={() => void run("streams.settings", { stream_id: detail.stream.id, join_policy: joinPolicy }, "进群方式已更新", reload)}>
-            保存
-          </Button>
-        </div>
-      </Field>
-
-      {owner ? (
-        <>
-          <Separator />
-          <Button
-            size="sm"
-            variant="outline"
-            className="justify-self-start text-destructive hover:text-destructive"
-            onClick={() =>
-              void run("streams.delete", { stream_id: detail.stream.id }, "群已停用", async () => {
-                window.location.hash = "#/";
-              })
+      <section className="grid gap-1.5">
+        <SectionTitle>群身份</SectionTitle>
+        <ListGroup>
+          <Row label="群名" hint="改名将同步到所有成员的 Stream 面板。">
+            <TextInput id="stream-name" value={name} onChange={(event) => setName(event.target.value)} className="h-8 w-32 text-xs" disabled={!leader} />
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={!leader || !name.trim()}
+              onClick={() => void run("streams.rename", { stream_id: detail.stream.id, name }, "群名已更新", reload)}
+            >
+              改名
+            </Button>
+          </Row>
+          <Row
+            label="群 UUID"
+            hint={
+              <>
+                拿到这串的人可以申请进群；改成「仅邀请」后只认邮箱邀请。
+                <CopyChip
+                  value={detail.stream.id}
+                  title="点一下复制完整群 UUID"
+                  className="mt-1 block max-w-full truncate text-left text-foreground/80"
+                />
+              </>
             }
           >
-            停用这个群
-          </Button>
-        </>
-      ) : null}
+            {null}
+          </Row>
+          <Row label="进群方式">
+            <NativeSelect className="h-8 w-40 text-xs" value={joinPolicy} disabled={!owner} onChange={(event) => setJoinPolicy(event.target.value as "request" | "invite_only")}>
+              <NativeSelectOption value="request">凭 UUID 申请审批</NativeSelectOption>
+              <NativeSelectOption value="invite_only">只接受邮箱邀请</NativeSelectOption>
+            </NativeSelect>
+            <Button size="xs" variant="outline" disabled={!owner} onClick={() => void run("streams.settings", { stream_id: detail.stream.id, join_policy: joinPolicy }, "进群方式已更新", reload)}>
+              保存
+            </Button>
+          </Row>
+        </ListGroup>
+      </section>
+
+      <section className="grid gap-1.5">
+        <SectionTitle
+          aside={
+            <Button size="xs" variant="ghost" onClick={() => setAdvanced((current) => !current)}>
+              {advanced ? "收起" : "展开"}
+            </Button>
+          }
+        >
+          高级设置
+        </SectionTitle>
+        {advanced ? (
+          <div className="grid gap-4">
+            <ListGroup>
+              <Row label="上下文预算（字符）" hint={`窗口超预算就按群压缩成摘要记忆，历史靠 MCP 回查。中文约 1 字≈1 token，256K 窗口的模型填 20 万够用。当前 ${detail.stream.context_chars}。`}>
+                <Input
+                  id="context-chars"
+                  type="number"
+                  min={2000}
+                  max={2000000}
+                  step={20000}
+                  value={contextChars}
+                  disabled={!owner}
+                  onChange={(event) => setContextChars(Number(event.target.value))}
+                  className="h-8 w-24 text-xs"
+                />
+                <Button size="xs" variant="outline" disabled={!owner} onClick={() => void run("streams.settings", { stream_id: detail.stream.id, context_chars: contextChars }, "预算已更新", reload)}>
+                  保存
+                </Button>
+              </Row>
+            </ListGroup>
+
+            <div className="grid gap-1.5">
+              <SectionTitle>闪烁颜色</SectionTitle>
+              <FlashColorSettings streamId={detail.stream.id} />
+            </div>
+
+            <VmsPanel detail={detail} myAgents={[]} myVms={myVms} reload={reload} />
+
+            <McpPanel detail={detail} myAgents={[]} myVms={myVms} reload={reload} />
+
+            {owner ? (
+              <div className="grid gap-1.5">
+                <OwnerTools detail={detail} humans={detail.members.filter((member) => member.type === "human")} reload={reload} />
+                <ListGroup>
+                  <Row label="停用这个群" hint="只关闭入口，历史消息按保留策略留在库中。">
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      className="text-destructive hover:text-destructive"
+                      onClick={() =>
+                        void run("streams.delete", { stream_id: detail.stream.id }, "群已停用", async () => {
+                          window.location.hash = "#/";
+                        })
+                      }
+                    >
+                      停用
+                    </Button>
+                  </Row>
+                </ListGroup>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <p className="px-1 text-[11px] leading-relaxed text-muted-foreground">
+            上下文预算、闪烁颜色、授权虚拟机、群历史 MCP、移交群主与停用群都收在这里。
+          </p>
+        )}
+      </section>
     </div>
   );
 }
@@ -801,15 +799,12 @@ function FlashColorSettings({ streamId }: { streamId: string }) {
   }
 
   return (
-    <div className="grid gap-2.5">
-      <p className="text-xs leading-relaxed text-muted-foreground">
-        只影响这台设备上 Stream 面板的群边框；频率固定（排队快、推进缓），颜色按群单独设置。
-      </p>
+    <ListGroup>
       {FLASH_SCENES.map((scene) => {
         const overridden = Boolean(colors[scene.key]);
         const value = colors[scene.key] ?? defaults[scene.key];
         return (
-          <div key={scene.key} className="flex items-center gap-2.5 rounded-md border px-2.5 py-2">
+          <div key={scene.key} className="flex items-center gap-2.5 px-3 py-2.5">
             <span className="size-6 shrink-0 rounded border border-border" style={{ backgroundColor: value }} />
             <div className="min-w-0 flex-1">
               <p className="text-xs font-medium">{scene.label}</p>
@@ -823,14 +818,14 @@ function FlashColorSettings({ streamId }: { streamId: string }) {
               className="h-7 w-9 cursor-pointer rounded border border-border bg-transparent p-0.5"
             />
             {overridden ? (
-              <Button size="sm" variant="ghost" className="h-7 px-2 text-[11px]" onClick={() => update(scene.key, null)}>
+              <Button size="xs" variant="ghost" onClick={() => update(scene.key, null)}>
                 默认
               </Button>
             ) : null}
           </div>
         );
       })}
-    </div>
+    </ListGroup>
   );
 }
 
@@ -843,78 +838,88 @@ export function VmsPanel({ detail, myVms, reload }: Props) {
 
   return (
     <div className="grid gap-4">
-      <SectionTitle
-        aside={
-          <Button size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => void reload()}>
-            刷新
-          </Button>
-        }
-      >
-        授权的办公虚拟机 · {detail.vms.length}
-      </SectionTitle>
-      {detail.vms.length === 0 ? <Notice>这个群还没绑定虚拟机。建群时就能带上，也可以现在补。</Notice> : null}
-      {detail.vms.map((vm) => (
-        <div key={vm.grant_id} className="grid gap-1.5 rounded-lg border p-2.5">
-          <div className="flex items-center gap-2">
-            <span className="grid size-8 shrink-0 place-items-center rounded-md bg-muted font-mono text-[11px]">VM</span>
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-sm">{vm.label}</p>
-              <p className="truncate font-mono text-[11px] text-muted-foreground">
-                {vm.username ? `${vm.username}@` : ""}
-                {vm.host}:{vm.port}
-                {vm.workdir ? ` · ${vm.workdir}` : ""}
-              </p>
-            </div>
-            <Badge variant={vm.level === "sudo" ? "default" : "secondary"} className="rounded-sm font-normal">
-              {vm.level === "sudo" ? "sudo" : "普通"}
-            </Badge>
-            <Button size="sm" variant="ghost" className="h-7 px-2 text-xs text-destructive" disabled={!canGrant} onClick={() => void run("streams.vms.revoke", { stream_id: detail.stream.id, grant_id: vm.grant_id }, "已解除授权", reload)}>
-              解除
+      <section className="grid gap-1.5">
+        <SectionTitle
+          aside={
+            <Button size="xs" variant="ghost" onClick={() => void reload()}>
+              刷新
             </Button>
-          </div>
-          {vm.last_probe ? (
-            <p className="text-xs text-muted-foreground">
-              连通探测：{vm.last_probe.reachable ? "可达" : "不可达"}（{timeAgo(vm.last_probe.checked_at)}）· {vm.last_probe.note}
-            </p>
-          ) : (
-            <p className="text-xs text-muted-foreground">还没探测过。</p>
-          )}
-        </div>
-      ))}
-
-      <Separator />
-      <Field label="把我的企业虚拟机授权给这个群" hint="只能授权自己登记的虚拟机；等级决定群里虚拟员工拿到的凭据用途。">
-        <div className="flex gap-2">
-          <NativeSelect className="h-8 flex-1 text-xs" value={pick} onChange={(event) => setPick(event.target.value)} disabled={!available.length}>
-            <NativeSelectOption value="">{available.length ? "选择虚拟机…" : "没有可授权的虚拟机"}</NativeSelectOption>
-            {available.map((vm) => (
-              <NativeSelectOption key={vm.id} value={vm.id}>
-                {vm.label} · {vm.host}
-              </NativeSelectOption>
+          }
+        >
+          授权的办公虚拟机 · {detail.vms.length}
+        </SectionTitle>
+        {detail.vms.length === 0 ? <Notice>这个群还没绑定虚拟机。建群时就能带上，也可以现在补。</Notice> : null}
+        {detail.vms.length ? (
+          <ListGroup>
+            {detail.vms.map((vm) => (
+              <div key={vm.grant_id} className="flex items-center gap-2.5 px-3 py-2.5">
+                <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
+                  <ServerIcon className="size-4" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="flex items-center gap-1.5 truncate text-sm">
+                    {vm.label}
+                    <Badge variant={vm.level === "sudo" ? "default" : "secondary"} className="rounded-full px-1.5 py-0 text-[10px] font-normal">
+                      {vm.level === "sudo" ? "sudo" : "普通"}
+                    </Badge>
+                  </p>
+                  <p className="truncate font-mono text-[11px] text-muted-foreground">
+                    {vm.username ? `${vm.username}@` : ""}
+                    {vm.host}:{vm.port}
+                    {vm.workdir ? ` · ${vm.workdir}` : ""}
+                  </p>
+                  <p className="truncate text-[11px] text-muted-foreground">
+                    {vm.last_probe
+                      ? `连通探测：${vm.last_probe.reachable ? "可达" : "不可达"}（${timeAgo(vm.last_probe.checked_at)}）· ${vm.last_probe.note}`
+                      : "还没探测过。"}
+                  </p>
+                </div>
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  className="shrink-0 text-destructive"
+                  disabled={!canGrant}
+                  onClick={() => void run("streams.vms.revoke", { stream_id: detail.stream.id, grant_id: vm.grant_id }, "已解除授权", reload)}
+                >
+                  解除
+                </Button>
+              </div>
             ))}
-          </NativeSelect>
-          <NativeSelect className="h-8 w-24 text-xs" value={level} onChange={(event) => setLevel(event.target.value as "member" | "sudo")}>
-            <NativeSelectOption value="member">普通</NativeSelectOption>
-            <NativeSelectOption value="sudo">sudo</NativeSelectOption>
-          </NativeSelect>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-8 shrink-0 text-xs"
-            disabled={!canGrant || !pick}
-            onClick={() => {
-              void run("streams.vms.grant", { stream_id: detail.stream.id, vm_id: pick, level }, "虚拟机已授权", reload);
-              setPick("");
-            }}
-          >
-            授权
-          </Button>
-        </div>
-      </Field>
-      {!canGrant ? <Notice>授权到群由群主或管理员操作。</Notice> : null}
-      <p className="text-xs leading-relaxed text-muted-foreground">
-        边栏函数没有 TCP 套接字，这里做的是登记 + 按群授权 + 端口连通探测；真正的 SSH 会话执行需要一台常驻 runner，属于后续能力。
-      </p>
+          </ListGroup>
+        ) : null}
+      </section>
+
+      <section className="grid gap-1.5">
+        <SectionTitle>授权到群</SectionTitle>
+        <ListGroup>
+          <Row label="把我的企业虚拟机授权给这个群" hint="只能授权自己登记的虚拟机；等级决定群里虚拟员工拿到的凭据用途。">
+            <NativeSelect className="h-8 w-32 text-xs" value={pick} onChange={(event) => setPick(event.target.value)} disabled={!available.length}>
+              <NativeSelectOption value="">{available.length ? "选择虚拟机…" : "没有可授权"}</NativeSelectOption>
+              {available.map((vm) => (
+                <NativeSelectOption key={vm.id} value={vm.id}>
+                  {vm.label} · {vm.host}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+            <NativeSelect className="h-8 w-20 text-xs" value={level} onChange={(event) => setLevel(event.target.value as "member" | "sudo")}>
+              <NativeSelectOption value="member">普通</NativeSelectOption>
+              <NativeSelectOption value="sudo">sudo</NativeSelectOption>
+            </NativeSelect>
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={!canGrant || !pick}
+              onClick={() => {
+                void run("streams.vms.grant", { stream_id: detail.stream.id, vm_id: pick, level }, "虚拟机已授权", reload);
+                setPick("");
+              }}
+            >
+              授权
+            </Button>
+          </Row>
+        </ListGroup>
+        {!canGrant ? <Notice>授权到群由群主或管理员操作。</Notice> : null}
+      </section>
     </div>
   );
 }
@@ -927,68 +932,57 @@ export function McpPanel({ detail, reload }: Props) {
 
   return (
     <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4 [&>*]:min-w-0">
-      <SectionTitle>群历史 MCP 端点</SectionTitle>
-      <Notice>
-        虚拟员工在群里跑任务时先走内部工具（search_history / read_window / list_files / read_file / upload_file / get_context）。
-        同一个端点也对外开成 JSON-RPC MCP，外部 Agent 用这把群钥匙就能回查历史、读写群文件与公告。
-      </Notice>
-      <div className="grid gap-1.5 rounded-md border px-2.5 py-2">
-        <p className="text-[11px] font-medium text-muted-foreground">对外可调用的工具</p>
-        <div className="flex flex-wrap gap-1">
-          {[
-            "search_history", "read_window", "get_context", "get_announcement",
-            "list_files", "read_file", "upload_file", "delete_file",
-            "send_message", "invite_member", "set_announcement", "list_skills", "read_skill",
-          ].map((name) => (
-            <code key={name} className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px]">{name}</code>
-          ))}
-        </div>
-        <p className="text-[10px] leading-relaxed text-muted-foreground">
-          参数与示例见内置技能「DevStream 群文件与公告」，每个虚拟员工默认都能读到。
-        </p>
-      </div>
-      <div className="flex items-center gap-2">
-        <Button
-          size="sm"
-          variant="outline"
-          className="text-xs"
-          disabled={!owner}
-          onClick={() => {
-            void (async () => {
-              try {
-                const result = await post<{ ok: true; key: string; curl: string }>("streams.mcpkey.rotate", { stream_id: detail.stream.id });
-                setKey(result.key);
-                setCurl(result.curl.replace("$ORIGIN", window.location.origin));
-                toast.success("已生成新的群 MCP 钥匙（只显示这一次）");
-                await reload();
-              } catch (error) {
-                toast.error(describeError(error));
-              }
-            })();
-          }}
-        >
-          {detail.stream.mcp_key_set ? "轮换钥匙" : "生成钥匙"}
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="text-xs text-destructive"
-          disabled={!owner || !detail.stream.mcp_key_set}
-          onClick={() => void run("streams.mcpkey.clear", { stream_id: detail.stream.id }, "钥匙已清除", reload)}
-        >
-          清除
-        </Button>
-      </div>
-      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
-        <div className="flex items-center gap-2">
-          <span className="shrink-0 text-xs text-muted-foreground">端点</span>
-          <code className="w-0 flex-1 truncate rounded bg-muted px-2 py-1 font-mono text-[11px]">{endpoint}</code>
-          <CopyButton value={endpoint} />
-        </div>
-        <p className="text-xs text-muted-foreground">当前状态：{detail.stream.mcp_key_set ? "已设置（库里只存 SHA-256 散列）" : "未设置"}</p>
-      </div>
+      <section className="grid gap-1.5">
+        <SectionTitle>群历史 MCP 端点</SectionTitle>
+        <ListGroup>
+          <Row
+            label="端点"
+            hint={
+              <>
+                {`当前状态：${detail.stream.mcp_key_set ? "已设置（库里只存 SHA-256 散列）" : "未设置"}`}
+                <code className="mt-1 block truncate font-mono text-[11px] text-foreground/80">{endpoint}</code>
+              </>
+            }
+          >
+            <CopyButton value={endpoint} />
+          </Row>
+          <Row label="群钥匙" hint="外部 Agent 凭这把钥匙回查历史、读写群文件与公告；钥匙只显示一次。">
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={!owner}
+              onClick={() => {
+                void (async () => {
+                  try {
+                    const result = await post<{ ok: true; key: string; curl: string }>("streams.mcpkey.rotate", { stream_id: detail.stream.id });
+                    setKey(result.key);
+                    setCurl(result.curl.replace("$ORIGIN", window.location.origin));
+                    toast.success("已生成新的群 MCP 钥匙（只显示这一次）");
+                    await reload();
+                  } catch (error) {
+                    toast.error(describeError(error));
+                  }
+                })();
+              }}
+            >
+              {detail.stream.mcp_key_set ? "轮换钥匙" : "生成钥匙"}
+            </Button>
+            <Button
+              size="xs"
+              variant="ghost"
+              className="text-destructive"
+              disabled={!owner || !detail.stream.mcp_key_set}
+              onClick={() => void run("streams.mcpkey.clear", { stream_id: detail.stream.id }, "钥匙已清除", reload)}
+            >
+              清除
+            </Button>
+          </Row>
+        </ListGroup>
+        {!owner ? <Notice>只有群主能生成或清除这把钥匙。</Notice> : null}
+      </section>
+
       {key ? (
-        <div className="grid gap-2 rounded-lg border border-machine/40 bg-machine-soft p-3">
+        <div className="grid gap-2 rounded-xl border border-machine/40 bg-machine-soft p-3">
           <div className="flex items-center gap-2">
             <code className="min-w-0 flex-1 break-all font-mono text-[11px] text-machine">{key}</code>
             <CopyButton value={key} label="钥匙" />
@@ -1003,7 +997,22 @@ export function McpPanel({ detail, reload }: Props) {
           ) : null}
         </div>
       ) : null}
-      {!owner ? <Notice>只有群主能生成或清除这把钥匙。</Notice> : null}
+
+      <section className="grid gap-1.5">
+        <SectionTitle>对外可调用的工具</SectionTitle>
+        <div className="flex flex-wrap gap-1 rounded-xl border border-border/60 bg-card/50 px-3 py-2.5">
+          {[
+            "search_history", "read_window", "get_context", "get_announcement",
+            "list_files", "read_file", "upload_file", "delete_file",
+            "send_message", "invite_member", "set_announcement", "list_skills", "read_skill",
+          ].map((name) => (
+            <code key={name} className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px]">{name}</code>
+          ))}
+        </div>
+        <p className="px-1 text-[11px] leading-relaxed text-muted-foreground">
+          虚拟员工跑任务走内部工具；同一端点对外开成 JSON-RPC MCP。参数与示例见内置技能「DevStream 群文件与公告」。
+        </p>
+      </section>
     </div>
   );
 }

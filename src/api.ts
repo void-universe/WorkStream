@@ -64,6 +64,13 @@ const MESSAGES: Record<string, string> = {
   invalid_skill_category: "技能分类最多 20 字。",
   skill_upload_failed: "技能保存失败，请重试。",
   skill_install_failed: "技能安装失败，请重试。",
+  too_many_images: "一条消息最多带 4 张图。",
+  unsupported_image_type: "图片只支持 PNG / JPEG / WebP / GIF。",
+  invalid_image_data: "这张图太大或格式不对，换一张试试。",
+  image_write_failed: "图片没存下来，请重发。",
+  attachment_not_image: "这个附件不是可显示的图片。",
+  nothing_running: "这位虚拟员工此刻没在处理任务，不用叫停。",
+  interrupt_message_invalid: "要插话的那条消息不属于你，或不在本群。",
   server_error: "服务端出了点问题，请稍后重试。",
 };
 

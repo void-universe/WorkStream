@@ -99,7 +99,8 @@ function respond(error) {
   return fail("server_error", 500);
 }
 
-const MAX_BODY = 1_048_576;
+// 一条消息最多带 4 张图（每张 base64 上限 800_000 字符），留出 JSON 结构的余量。
+const MAX_BODY = 5_242_880;
 
 async function readBody(request) {
   const type = request.headers.get("content-type")?.split(";")[0].trim();

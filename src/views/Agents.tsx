@@ -48,7 +48,7 @@ const EMPTY: Draft = {
   api_key: "demo",
   model: "demo",
   system_prompt: "",
-  context_chars: 12000,
+  context_chars: 200000,
   status: "active",
 };
 
@@ -411,8 +411,8 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
               <Field label="API Key" htmlFor="agent-key" hint="AES-GCM 加密后入库，接口与浏览器都拿不到原文；留空表示不更换。">
                 <Input id="agent-key" type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder={draft.id ? "留空保持原 Key" : "sk-…"} className="h-8 text-xs" />
               </Field>
-              <Field label="上下文预算（字符）" htmlFor="agent-context" hint="这个员工单轮能看的字符上限，和群预算取较小值。">
-                <Input id="agent-context" type="number" min={2000} max={200000} step={1000} value={draft.context_chars} onChange={(event) => setDraft({ ...draft, context_chars: Number(event.target.value) })} className="h-8 text-xs" />
+              <Field label="上下文预算（字符）" htmlFor="agent-context" hint="单轮能带进模型的字符上限，和群预算取较小值。中文约 1 字≈1 token、英文约 4 字符≈1 token：256K 窗口的模型填 20 万，百万窗口的可以拉到 200 万。">
+                <Input id="agent-context" type="number" min={2000} max={2000000} step={20000} value={draft.context_chars} onChange={(event) => setDraft({ ...draft, context_chars: Number(event.target.value) })} className="h-8 text-xs" />
               </Field>
             </div>
 
@@ -604,17 +604,28 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
 
             <TabsContent value="groups" className="grid gap-1.5 pt-3">
               {detail.streams.length === 0 ? <p className="text-xs text-muted-foreground">还没进过任何群。</p> : null}
-              {detail.streams.map((row) => (
-                <a
-                  key={row.stream_id}
-                  href={`#/stream/${row.stream_id}`}
-                  className="flex items-center gap-2 rounded-md border px-2.5 py-2 text-sm hover:bg-muted/50"
-                >
-                  <span className="min-w-0 flex-1 truncate">{streamNames.get(row.stream_id) ?? shortUuid(row.stream_id)}</span>
-                  <span className="font-mono text-[11px] text-muted-foreground">{row.role}</span>
-                  <span className="text-xs text-signal">进入 →</span>
-                </a>
-              ))}
+              {detail.streams.map((row) => {
+                const name = streamNames.get(row.stream_id) ?? shortUuid(row.stream_id);
+                const live = presence?.streams.find((item) => item.stream_id === row.stream_id);
+                return (
+                  <div key={row.stream_id} className="relative flex items-center gap-2 rounded-md border px-2.5 py-2 text-sm hover:bg-muted/50">
+                    {/* 整行即入口：透明铺底按钮接点击，权重控件浮在它之上。 */}
+                    <a
+                      href={`#/stream/${row.stream_id}`}
+                      aria-label={`进入群聊 ${name}`}
+                      className="absolute inset-0 z-0 rounded-md focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal"
+                    />
+                    <span className="min-w-0 flex-1 truncate">{name}</span>
+                    <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{row.role}</span>
+                    {live && (live.queued || live.running) ? (
+                      <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+                        排队 {live.queued} · 运行 {live.running}
+                      </span>
+                    ) : null}
+                    {live ? <span className="relative z-10"><WeightField agentId={detail.agent.id} streamId={row.stream_id} streamName={name} weight={live.weight} /></span> : null}
+                  </div>
+                );
+              })}
             </TabsContent>
 
             <TabsContent value="queue" className="grid gap-1.5 pt-3">
@@ -665,6 +676,56 @@ function MailBadge({ status }: { status: MailItem["status"] }) {
         <span className="size-2 animate-spin rounded-full border border-current border-t-transparent" aria-hidden />
       ) : null}
       {tone.label}
+    </span>
+  );
+}
+
+/** 本群时间片权重：默认 1 即均分；调到 1–20 需要在这个群里是群主或管理员，否则后端会挡。 */
+function WeightField({
+  agentId,
+  streamId,
+  streamName,
+  weight,
+}: {
+  agentId: string;
+  streamId: string;
+  streamName: string;
+  weight: number;
+}) {
+  const [value, setValue] = useState(weight);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => setValue(weight), [weight]);
+  const dirty = value !== weight;
+
+  async function save() {
+    setBusy(true);
+    try {
+      await post("scheduler.weight", { stream_id: streamId, agent_id: agentId, weight: value });
+      toast.success(`「${streamName}」的权重已设为 ${value}`);
+    } catch (error) {
+      toast.error(describeError(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <span className="flex items-center gap-1.5">
+      <span className="text-[11px] text-muted-foreground">本群权重</span>
+      <Input
+        type="number"
+        min={1}
+        max={20}
+        value={value}
+        disabled={busy}
+        onChange={(event) => setValue(Number(event.target.value))}
+        className="h-7 w-14 text-xs"
+      />
+      {dirty ? (
+        <Button size="xs" variant="outline" disabled={busy} onClick={() => void save()}>
+          保存
+        </Button>
+      ) : null}
     </span>
   );
 }

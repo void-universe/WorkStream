@@ -3,11 +3,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { cn } from "@/lib/utils";
 import { describeError, get, type Agent } from "../api";
 import type { AgentPresence, Message, Stream, StreamDetail, User, Vm } from "../types";
 import { clockOf, shortUuid, timeAgo } from "../lib/format";
 import { flashVars, readFlashColors, type FlashColors } from "../lib/flash";
-import { DeliveryChips, MentionText, PersonAvatar, RoleBadge } from "../lib/ui";
+import { DeliveryChips, MentionText, MessageImages, PersonAvatar, RoleBadge } from "../lib/ui";
 import { navigate } from "../lib/route";
 import { Composer, mentionablesOf } from "./chat/Composer";
 import { CreateGroup, JoinByUuid } from "./streams/StreamForms";
@@ -492,16 +493,23 @@ function StreamTile({
     <article
       title={stateTitle(state)}
       style={flashVars(flash)}
-      className={`group ws-surface ws-surface-hover relative grid gap-2.5 rounded-xl bg-card p-3.5 ${border}`}
+      className={`group ws-surface ws-surface-hover relative grid cursor-pointer gap-2.5 rounded-xl bg-card p-3.5 ${border}`}
     >
+      {/* 整张卡片即入口：一层铺满的透明按钮接点击，分屏/展开等控件浮在它上面。 */}
+      <button
+        type="button"
+        onClick={onEnter}
+        aria-label={`进入群聊 ${stream.name}`}
+        className="absolute inset-0 z-0 rounded-xl focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal"
+      />
       <header className="flex items-start gap-2">
         {state ? <span aria-hidden className={`mt-1.5 size-2 shrink-0 rounded-full ${stateDot(state)} animate-pulse`} /> : null}
-        <button type="button" className="min-w-0 flex-1 text-left" onClick={onEnter} title="进入群聊">
+        <div className="min-w-0 flex-1 text-left">
           <h2 className="truncate text-[15px] font-semibold tracking-tight">{stream.name}</h2>
           <p className="mt-0.5 font-mono text-[11px] text-muted-foreground/80">
             {shortUuid(stream.id)} · {Math.max(0, stream.next_seq - 1)} 条 · {stream.agent_count ?? 0} 虚拟
           </p>
-        </button>
+        </div>
         {stream.my_role ? <RoleBadge role={stream.my_role} /> : null}
       </header>
       <div className="flex flex-wrap items-center gap-1.5">
@@ -512,24 +520,16 @@ function StreamTile({
         {announcement || "（没有公告）"}
       </p>
       <footer className="flex items-center gap-0.5">
-        <PinButton pinned={pinned} onClick={onPin} />
-        <button
-          type="button"
-          onClick={onExpand}
-          className="inline-flex h-7 items-center rounded-full px-2.5 text-xs text-muted-foreground transition-colors duration-200 hover:bg-muted/60 hover:text-foreground"
-        >
-          展开
-        </button>
-        <button
-          type="button"
-          onClick={onEnter}
-          className="ml-auto inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-xs font-medium text-foreground/80 transition-colors duration-200 hover:text-foreground"
-        >
-          进入
-          <span aria-hidden className="transition-transform duration-200 group-hover:translate-x-0.5">
-            →
-          </span>
-        </button>
+        <span className="relative z-10 flex items-center gap-0.5">
+          <PinButton pinned={pinned} onClick={onPin} />
+          <button
+            type="button"
+            onClick={onExpand}
+            className="inline-flex h-7 items-center rounded-full px-2.5 text-xs text-muted-foreground transition-colors duration-200 hover:bg-muted/60 hover:text-foreground"
+          >
+            展开
+          </button>
+        </span>
       </footer>
     </article>
   );
@@ -559,9 +559,15 @@ function StreamRow({
     <article
       title={stateTitle(state)}
       style={flashVars(flash)}
-      className={`group ws-surface ws-surface-hover flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl bg-card px-3.5 py-2.5 ${border}`}
+      className={`group ws-surface ws-surface-hover relative flex cursor-pointer flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl bg-card px-3.5 py-2.5 ${border}`}
     >
-      <button type="button" className="min-w-0 flex-1 text-left" onClick={onEnter} title="进入群聊">
+      <button
+        type="button"
+        onClick={onEnter}
+        aria-label={`进入群聊 ${stream.name}`}
+        className="absolute inset-0 z-0 rounded-xl focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal"
+      />
+      <div className="min-w-0 flex-1 text-left">
         <span className="flex items-center gap-2">
           {state ? <span aria-hidden className={`size-2 shrink-0 rounded-full ${stateDot(state)} animate-pulse`} /> : null}
           <span className="truncate text-sm font-medium">{stream.name}</span>
@@ -571,26 +577,18 @@ function StreamRow({
           {shortUuid(stream.id)} · {Math.max(0, stream.next_seq - 1)} 条 · {stream.agent_count ?? 0} 虚拟 · 更新{" "}
           {timeAgo(stream.updated_at ?? stream.created_at)}
         </span>
-      </button>
+      </div>
       <QueueBadges counters={counters} dense />
-      <PinButton pinned={pinned} onClick={onPin} dense />
-      <button
-        type="button"
-        onClick={onExpand}
-        className="inline-flex h-7 items-center rounded-full px-2.5 text-[11px] text-muted-foreground transition-colors duration-200 hover:bg-muted/60 hover:text-foreground"
-      >
-        展开
-      </button>
-      <button
-        type="button"
-        onClick={onEnter}
-        className="inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[11px] font-medium text-foreground/80 transition-colors duration-200 hover:text-foreground"
-      >
-        进入
-        <span aria-hidden className="transition-transform duration-200 group-hover:translate-x-0.5">
-          →
-        </span>
-      </button>
+      <span className="relative z-10 flex items-center gap-0.5">
+        <PinButton pinned={pinned} onClick={onPin} dense />
+        <button
+          type="button"
+          onClick={onExpand}
+          className="inline-flex h-7 items-center rounded-full px-2.5 text-[11px] text-muted-foreground transition-colors duration-200 hover:bg-muted/60 hover:text-foreground"
+        >
+          展开
+        </button>
+      </span>
     </article>
   );
 }
@@ -856,15 +854,12 @@ function PaneMessage({
   dense: boolean;
 }) {
   if (message.sender_type === "system" || message.kind === "system") {
-    return (
-      <p className="rounded bg-muted/60 px-2 py-1 text-center text-[11px] leading-relaxed text-muted-foreground">
-        {message.content}
-      </p>
-    );
+    return <p className="py-0.5 text-center text-[10px] leading-relaxed text-muted-foreground">{message.content}</p>;
   }
   const agent = message.sender_type === "agent";
+  const mine = message.sender_id === me;
   return (
-    <article className="flex items-start gap-2">
+    <article className={cn("group flex items-start gap-2", mine && "flex-row-reverse")}>
       <PersonAvatar
         name={message.sender_name}
         kind={agent ? "agent" : "human"}
@@ -874,8 +869,8 @@ function PaneMessage({
         href={agent ? `#/agents/${message.sender_id}` : undefined}
         busy={presence?.working}
       />
-      <div className="min-w-0 flex-1">
-        <header className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+      <div className={cn("flex min-w-0 max-w-[85%] flex-col items-start gap-0.5", mine && "items-end")}>
+        <header className={cn("flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 px-0.5", mine && "flex-row-reverse")}>
           <span className={`truncate font-medium ${dense ? "text-xs" : "text-sm"} ${agent ? "text-machine" : ""}`}>
             {message.sender_name}
           </span>
@@ -883,16 +878,20 @@ function PaneMessage({
             <span className="max-w-32 truncate text-[10px] text-muted-foreground">「{presence.signature}」</span>
           ) : null}
           {agent ? <span className="text-[10px] text-machine/70">虚拟</span> : null}
-          {message.sender_id === me ? <span className="text-[10px] text-muted-foreground">我</span> : null}
-          <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground">
-            {clockOf(message.created_at)}
-          </span>
+          <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{clockOf(message.created_at)}</span>
         </header>
-        <p className={`mt-0.5 whitespace-pre-wrap leading-relaxed ${dense ? "text-xs" : "text-[13px]"}`}>
+        <div
+          className={cn(
+            "whitespace-pre-wrap leading-relaxed",
+            dense ? "rounded-xl px-2 py-1 text-xs" : "rounded-xl px-2.5 py-1.5 text-[13px]",
+            mine ? "rounded-tr-sm bg-signal-soft" : "rounded-tl-sm border border-border/50 bg-card",
+          )}
+        >
+          <MessageImages attachments={message.attachments} dense />
           <MentionText content={message.content} names={names} />
-        </p>
+        </div>
         <DeliveryChips deliveries={message.deliveries} dense />
-        {message.error ? <p className="mt-0.5 text-[11px] text-destructive">回执出错：{message.error}</p> : null}
+        {message.error ? <p className="px-0.5 text-[11px] text-destructive">回执出错：{message.error}</p> : null}
       </div>
     </article>
   );

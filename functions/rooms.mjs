@@ -2,10 +2,10 @@
 import { deliver } from "./accounts.mjs";
 import { AGENT_COLUMNS, publicAgent } from "./agents.mjs";
 import { STREAM_COLUMNS, humanMembership, requireMembership, requireRole } from "./perm.mjs";
-import { Halt, email as emailOf, json, newId, now, oneOf, text, uuid } from "./util.mjs";
+import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, email as emailOf, int, json, newId, now, oneOf, text, uuid } from "./util.mjs";
 
 const MESSAGE_COLUMNS =
-  "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,created_at";
+  "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,attachments,created_at";
 const FILE_COLUMNS = "id,stream_id,name,size_bytes,content_type,store,uploaded_by,created_at";
 export const MAX_FILE_BYTES = 400_000;
 
@@ -103,7 +103,7 @@ export async function nextSeq(db, streamId) {
   throw new Halt("seq_contention", 503);
 }
 
-async function insertMessage(db, { streamId, senderType, senderId, senderName, content, mentions, replyTo, kind }) {
+async function insertMessage(db, { streamId, senderType, senderId, senderName, content, mentions, replyTo, kind, attachments }) {
   const seq = await nextSeq(db, streamId);
   const row = await db.messages.insert({
     id: newId(),
@@ -117,6 +117,7 @@ async function insertMessage(db, { streamId, senderType, senderId, senderName, c
     reply_to: replyTo ?? null,
     kind: kind ?? "chat",
     error: null,
+    attachments: attachments ?? [],
     created_at: now(),
   }, { columns: MESSAGE_COLUMNS });
   if (!row) throw new Halt("message_write_failed", 503);
@@ -156,10 +157,9 @@ export const actions = {
   async "streams.create"({ db, user, body }) {
     const name = text(body.name, { max: 60, name: "name" });
     const joinPolicy = oneOf(body.join_policy ?? "request", ["request", "invite_only"], "join_policy");
-    const contextChars = Number(body.context_chars ?? 12000);
-    if (!Number.isSafeInteger(contextChars) || contextChars < 2000 || contextChars > 200000) {
-      throw new Halt("invalid_context_chars", 400);
-    }
+    const contextChars = int(body.context_chars, {
+      min: 2000, max: CONTEXT_CHARS_MAX, name: "context_chars", fallback: CONTEXT_CHARS_DEFAULT,
+    });
     const agentIds = Array.isArray(body.agent_ids) ? body.agent_ids.map((v) => uuid(v, "agent_id")).slice(0, 20) : [];
     const vmIds = Array.isArray(body.vm_ids) ? body.vm_ids.map((v) => uuid(v, "vm_id")).slice(0, 20) : [];
     const id = newId();
@@ -279,9 +279,7 @@ export const actions = {
     if (stream.owner_id !== user.id) throw new Halt("owner_only", 403);
     const values = {};
     if (body.context_chars !== undefined) {
-      const next = Number(body.context_chars);
-      if (!Number.isSafeInteger(next) || next < 2000 || next > 200000) throw new Halt("invalid_context_chars", 400);
-      values.context_chars = next;
+      values.context_chars = int(body.context_chars, { min: 2000, max: CONTEXT_CHARS_MAX, name: "context_chars" });
     }
     if (body.join_policy !== undefined) values.join_policy = oneOf(body.join_policy, ["request", "invite_only"], "join_policy");
     if (!Object.keys(values).length) return json({ ok: true, context_chars: stream.context_chars });

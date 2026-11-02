@@ -2,7 +2,7 @@
 import { open, seal } from "./sec.mjs";
 import { agentPresence } from "./presence.mjs";
 import { installDefaultSkillsFor, skillsForAgent } from "./skills.mjs";
-import { Halt, avatarData, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
+import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, avatarData, int, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
 
 export const AGENT_COLUMNS =
   "id,owner_id,name,role,signature,avatar,api_base_url,api_key_tail,model,system_prompt,context_chars,key_source,color,status,created_at,updated_at";
@@ -83,10 +83,9 @@ export const actions = {
     const systemPrompt = text(body.system_prompt ?? "", { max: 4000, required: false });
     const signature = text(body.signature ?? "", { max: 120, required: false });
     const avatar = avatarData(body.avatar);
-    const contextChars = Number(body.context_chars ?? 12000);
-    if (!Number.isSafeInteger(contextChars) || contextChars < 2000 || contextChars > 200000) {
-      throw new Halt("invalid_context_chars", 400);
-    }
+    const contextChars = int(body.context_chars, {
+      min: 2000, max: CONTEXT_CHARS_MAX, name: "context_chars", fallback: CONTEXT_CHARS_DEFAULT,
+    });
     if (target.scheme === "demo" && model !== "demo") throw new Halt("demo_needs_demo_model", 400);
     const sealed = await seal(apiKey, { supabase: db.client, env });
     const id = newId();
@@ -136,9 +135,7 @@ export const actions = {
     if (body.signature !== undefined) values.signature = text(body.signature, { max: 120, required: false });
     if (body.avatar !== undefined) values.avatar = avatarData(body.avatar);
     if (body.context_chars !== undefined) {
-      const next = Number(body.context_chars);
-      if (!Number.isSafeInteger(next) || next < 2000 || next > 200000) throw new Halt("invalid_context_chars", 400);
-      values.context_chars = next;
+      values.context_chars = int(body.context_chars, { min: 2000, max: CONTEXT_CHARS_MAX, name: "context_chars" });
     }
     if (body.status !== undefined) values.status = oneOf(body.status, ["active", "paused"], "status");
     if (body.api_base_url !== undefined) {
@@ -275,12 +272,16 @@ function upstreamCode(error) {
 
 /**
  * OpenAI 兼容 /chat/completions 调用。
+ * 请求走 SSE 流式：一边收增量一边在分片边界问上层“要不要停”，
+ * 这样群里插话能在几百毫秒内掐断正在生成的回复，而不是等它写完。
  * `demo://local` 走内置演示模型：不联网，基于传入的 memory 与历史做抽取式回应，
- * 用来在没有任何真实 Key 时也能端到端跑通 @ 派发、队列与压缩。
+ * 用来在没有任何真实 Key 时也能端到端跑通 @ 派发、队列、压缩与插话。
  */
-export async function chatCompletion({ baseUrl, apiKey, model, messages, tools, maxTokens, timeoutMs = 60000, summary }) {
-  if (baseUrl === "demo://local") return demoComplete({ messages, tools, summary });
-  const body = { model, messages, stream: false };
+export async function chatCompletion({
+  baseUrl, apiKey, model, messages, tools, maxTokens, timeoutMs = 120000, summary, onInterrupt,
+}) {
+  if (baseUrl === "demo://local") return demoComplete({ messages, tools, summary, onInterrupt });
+  const body = { model, messages, stream: true };
   if (maxTokens) body.max_tokens = maxTokens;
   if (tools?.length) {
     body.tools = tools;
@@ -288,31 +289,117 @@ export async function chatCompletion({ baseUrl, apiKey, model, messages, tools, 
   }
   const response = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+    headers: {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      authorization: `Bearer ${apiKey}`,
+    },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
   });
-  const raw = await response.text().catch(() => "");
   if (!response.ok) {
+    await response.text().catch(() => "");
     const error = new Error("upstream_rejected");
     error.status = response.status;
     throw error;
   }
-  let payload;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
+  if (!response.body) {
     const error = new Error("upstream_bad_json");
     error.code = "upstream_bad_json";
     throw error;
   }
-  const choice = Array.isArray(payload.choices) ? payload.choices[0] : null;
+  return readUpstreamStream(response.body, { onInterrupt });
+}
+
+const IDLE_MS = 800;
+
+/** 解析 `data:` 分片，累加正文与按 index 拼接的工具参数；每次拿到数据或上游静默时检查插话。 */
+async function readUpstreamStream(stream, { onInterrupt }) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const toolCalls = new Map();
+  let buffer = "";
+  let content = "";
+  let inflight = null;
+  const ensureRead = () => {
+    if (!inflight) inflight = reader.read().then((result) => { inflight = null; return result; });
+    return inflight;
+  };
+  const abort = async () => {
+    if (!onInterrupt) return null;
+    const signal = await onInterrupt();
+    if (!signal) return null;
+    await reader.cancel().catch(() => {});
+    throw new Interrupted({ ...signal, partial: content });
+  };
+  const feed = (chunk) => {
+    let parsed;
+    try {
+      parsed = JSON.parse(chunk);
+    } catch {
+      return;
+    }
+    if (parsed?.error) {
+      const error = new Error("upstream_rejected");
+      error.status = Number(parsed.error.code) >= 100 && Number(parsed.error.code) < 600 ? Number(parsed.error.code) : 502;
+      throw error;
+    }
+    const delta = parsed?.choices?.[0]?.delta;
+    if (typeof delta?.content === "string") content += delta.content;
+    for (const call of delta?.tool_calls ?? []) {
+      const index = Number(call?.index ?? 0);
+      const slot = toolCalls.get(index) ?? { id: "", name: "", arguments: "" };
+      if (call?.id) slot.id = call.id;
+      if (call?.function?.name) slot.name = call.function.name;
+      if (typeof call?.function?.arguments === "string") slot.arguments += call.function.arguments;
+      toolCalls.set(index, slot);
+    }
+  };
+  for (;;) {
+    let timeout;
+    const idle = new Promise((resolve) => { timeout = setTimeout(() => resolve("idle"), IDLE_MS); });
+    const outcome = await Promise.race([
+      ensureRead().then((result) => ({ result })),
+      idle.then(() => "idle"),
+    ]).finally(() => clearTimeout(timeout));
+    if (outcome === "idle") {
+      // 上游静默也要有机会被插话掐断，所以空转时仍然问一次。
+      await abort();
+      continue;
+    }
+    if (outcome.result.done) break;
+    buffer += decoder.decode(outcome.result.value, { stream: true });
+    for (;;) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) break;
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload && payload !== "[DONE]") feed(payload);
+    }
+    await abort();
+  }
+  const calls = [...toolCalls.values()].filter((slot) => slot.name);
   return {
     mode: "openai",
-    content: typeof choice?.message?.content === "string" ? choice.message.content : "",
-    tool_calls: Array.isArray(choice?.message?.tool_calls) ? choice.message.tool_calls : [],
-    usage: payload.usage ?? null,
+    content,
+    tool_calls: calls.map((slot) => ({
+      id: slot.id || `call_${newId().slice(0, 8)}`,
+      type: "function",
+      function: { name: slot.name, arguments: slot.arguments || "{}" },
+    })),
+    usage: null,
   };
+}
+
+/** 生成中途被群里插话掐断：带上打断者、新消息序号和已经输出的半截内容。 */
+export class Interrupted extends Error {
+  constructor(payload) {
+    super("interrupted");
+    this.name = "Interrupted";
+    this.payload = payload;
+  }
 }
 
 /** 内置演示模型：有工具请求就先“查询”，否则基于上下文给出可核对的摘要式回复。 */

@@ -41,15 +41,16 @@ function currentOf(rows, messages) {
   };
 }
 
-/** 某个群里所有虚拟员工的现场状态：签名、是否在忙、焦点消息与排队数。 */
-export async function streamPresence(db, streamId) {
+/** 某个群里所有虚拟员工的现场状态：签名、是否在忙、焦点消息与排队数。
+ *  viewerId 用来标记“这位是我雇的员工”——群里只有主人能叫停或插话 ta 的活。 */
+export async function streamPresence(db, streamId, viewerId = null) {
   const memberships = await db.members.list([["stream_id", streamId], ["principal_type", "agent"]], {
     columns: "principal_id", limit: 300,
   });
   const agentIds = [...new Set(memberships.map((row) => row.principal_id))];
   if (!agentIds.length) return [];
   const [agents, mail] = await Promise.all([
-    db.agents.list([["id", agentIds]], { columns: "id,name,signature,avatar,color,status", limit: 300 }),
+    db.agents.list([["id", agentIds]], { columns: "id,name,signature,avatar,color,status,owner_id", limit: 300 }),
     activeMail(db, agentIds, streamId),
   ]);
   const messages = await messageIndex(
@@ -66,6 +67,7 @@ export async function streamPresence(db, streamId) {
       avatar: agent.avatar ?? null,
       color: agent.color,
       status: agent.status,
+      owned_by_caller: Boolean(viewerId) && agent.owner_id === viewerId,
       working: Boolean(current),
       running: mine.filter((row) => row.status === "running").length,
       queued: mine.filter((row) => row.status === "queued").length,
@@ -87,7 +89,7 @@ export async function agentPresence(db, agentId, { streamIds = null } = {}) {
     memberPairs.push(["stream_id", streamIds]);
     mailPairs.push(["stream_id", streamIds]);
   }
-  const [owner, memberships, mail] = await Promise.all([
+  const [owner, memberships, mail, prefs] = await Promise.all([
     db.users.byId(agent.owner_id, { columns: "id,display_name" }),
     db.members.list(memberPairs, {
       columns: "stream_id,role,joined_at", limit: 60,
@@ -95,7 +97,9 @@ export async function agentPresence(db, agentId, { streamIds = null } = {}) {
     db.mail.list(mailPairs, {
       columns: MAIL_COLUMNS, order: ["created_at", { ascending: false }], limit: 40,
     }),
+    db.slice_prefs.list([["agent_id", agentId]], { columns: "stream_id,weight", limit: 60 }),
   ]);
+  const weightOf = new Map(prefs.map((row) => [row.stream_id, row.weight]));
   const memberStreamIds = memberships.map((row) => row.stream_id);
   const streams = memberStreamIds.length
     ? await db.streams.list([["id", memberStreamIds]], { columns: "id,name", limit: 60 })
@@ -112,6 +116,7 @@ export async function agentPresence(db, agentId, { streamIds = null } = {}) {
         stream_id: row.stream_id,
         name: streamName.get(row.stream_id) ?? "已删除的群",
         role: row.role,
+        weight: weightOf.get(row.stream_id) ?? 1,
         queued: mine.filter((item) => item.status === "queued").length,
         running: mine.filter((item) => item.status === "running").length,
       };
