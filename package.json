@@ -15,6 +15,7 @@
     "dev:function": "node dev/local-function.mjs 8000",
     "dev:function:worker": "node dev/local-function.mjs 8000 --worker",
     "smoke": "node dev/smoke.mjs",
+    "bench": "node dev/bench.mjs",
     "check:schema": "node dev/check-schema.mjs",
     "qa": "node scripts/check-node.mjs && node dev/check-schema.mjs && node dev/smoke.mjs",
     "seed": "node dev/seed-demo.mjs"

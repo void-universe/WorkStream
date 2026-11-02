@@ -318,7 +318,7 @@ export async function runTask({ db, env, mailId }) {
     // 不会把「窗口没装下的旧记录」当成已覆盖而永久丢掉。每轮只折叠一批，剩下的下一轮接着折，
     // 也避免把十几万字符塞进一次 400 token 的摘要里。
     const prepared = await assemble({
-      db, agent, stream, trigger, anchor: "head",
+      db, agent, stream, anchor: "head",
       maxChars: Math.max(4000, Math.floor(streamBudget(stream, agent) * 0.12)),
     });
     let folded;
@@ -343,7 +343,7 @@ export async function runTask({ db, env, mailId }) {
     return { status: "done", mode: "compress", ms: 0 };
   }
 
-  let prepared = await assemble({ db, agent, stream, trigger });
+  let prepared = await assemble({ db, agent, stream });
   const skills = await skillPrompt(db, agent.id);
   let messages = await buildContext({ db, agent, stream, prepared, trigger, skills });
   let used = size(messages);
@@ -409,7 +409,7 @@ export async function runTask({ db, env, mailId }) {
       // 插话生效后把新消息当成触发消息重跑一次：半截输出留作提示，不静默丢弃。
       currentTrigger = next;
       absorbed.push({ id: next.id, seq: Number(next.seq ?? 0) });
-      prepared = await assemble({ db, agent, stream, trigger: next });
+      prepared = await assemble({ db, agent, stream });
       messages = await buildContext({
         db, agent, stream, prepared, trigger: next, skills,
         steerNote: `上一条回复说到一半被 @ 你的新消息打断了。已输出的半截是：${truncate(error.payload.partial ?? "", 400)}。请以这条插话为准，重新给出完整回应。`,
@@ -560,7 +560,7 @@ async function finish(db, mailId, status, error) {
 /** 上下文组成：common memory + 本群记忆 + 摘要 + 摘要之后的窗口。
  *  anchor=tail（回复用）：取水位线之后最新的一段，被挤出去的旧记录靠 search_history / read_window 查。
  *  anchor=head（压缩用）：从水位线往后连续取一段，摘要声称覆盖到哪个序号就真的覆盖到那儿。 */
-async function assemble({ db, agent, stream, trigger, anchor = "tail", maxChars = null }) {
+async function assemble({ db, agent, stream, anchor = "tail", maxChars = null }) {
   const common = await db.memories.list([["agent_id", agent.id], ["scope", "common"]], {
     // 升序拼进上下文：新记忆追加到块尾，旧前缀不被打断（降序会让每条新记忆改写块头）。
     columns: "id,kind,content,created_at", order: ["created_at", { ascending: true }], limit: 20,
@@ -572,7 +572,6 @@ async function assemble({ db, agent, stream, trigger, anchor = "tail", maxChars 
   const from = summary?.covers_through_seq ?? 0;
   const { rows, truncated } = await history(db, stream.id, {
     from,
-    to: Number(trigger?.seq ?? 999999),
     // 窗口按字符封顶，不按条数：条数上限会让长群聊在预算还没用满时先被截断。
     maxChars: maxChars ?? Math.floor(streamBudget(stream, agent) * 0.8),
     anchor,
@@ -593,23 +592,27 @@ async function assemble({ db, agent, stream, trigger, anchor = "tail", maxChars 
 const HISTORY_PAGE = 200;
 const HISTORY_MAX_PAGES = 50;
 
-/** 从水位线那一侧按页往回取，累计到字符上限为止；truncated=true 说明还有记录没进窗口。
- *  整群历史可能几万条，一页页取而不是一把捞，既不会把 Function 的内存打满，也不会白读用不上的行。 */
-async function history(db, streamId, { from, to, maxChars, anchor }) {
+/** 从水位线那一侧按页取，累计到字符上限为止；truncated=true 说明还有记录没进窗口。
+ *  整群历史可能几万条，一页页取而不是一把捞，既不会把 Function 的内存打满，也不会白读用不上的行。
+ *  不按触发消息的序号设上界：突发时队列里第 2、3 封的触发消息比群里最新一条老，按它截断就会把
+ *  自己刚发出的回复挡在窗口外（那些回复序号更大），员工于是一条条重复作答；触发消息另有专块给全。 */
+async function history(db, streamId, { from, maxChars, anchor }) {
   const head = anchor === "head";
   const rows = [];
   let chars = 0;
-  let cursor = head ? from : to;
+  let cursor = null;
   let truncated = false;
   let pages = 0;
   for (; pages < HISTORY_MAX_PAGES && !truncated; pages += 1) {
-    const result = await db.client.from("messages")
+    let query = db.client.from("messages")
       .select("id,seq,sender_type,sender_id,sender_name,content,created_at,kind,attachments")
       .eq("stream_id", streamId)
-      .gt("seq", head ? cursor : from)
-      .lte("seq", head ? to : cursor)
+      .gt("seq", head ? (cursor ?? from) : from)
       .order("seq", { ascending: head })
       .limit(HISTORY_PAGE);
+    // tail 锚从最新一条往回翻页：首页不带上界，之后用已读到的最小序号继续往前。
+    if (!head && cursor !== null) query = query.lt("seq", cursor);
+    const result = await query;
     if (result.error) throw new Halt("history_request_failed", 503, { code: result.error.code });
     const batch = Array.isArray(result.data) ? result.data : [];
     if (!batch.length) break;

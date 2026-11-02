@@ -104,6 +104,10 @@ function startMockUpstream() {
       const system = String(body.messages?.[0]?.content ?? "");
       const last = body.messages?.[body.messages.length - 1];
       if (system.includes("被 @ 你的新消息打断")) { sayFast("已按插话重排：一、准备；二、执行；三、复盘。"); return; }
+      // 按触发消息本身认剧本：下一轮的转录里也带着上一轮的关键词，按全文匹配会把两封混成一份。
+      const trig = String(system.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "");
+      if (trig.includes("突发甲")) { sayFast("回甲已落群"); return; }
+      if (trig.includes("突发乙")) { sayFast("回乙已落群"); return; }
       if (system.includes("慢慢写")) { await say("正在慢慢写这段长正文", 140); return; }
       if (Array.isArray(last?.content) && last.content.some((part) => part.type === "image_url")) {
         sayFast("图里是一块红色的方砖。");
@@ -666,6 +670,25 @@ async function main() {
     { 命中率: `${((shared / curr.length) * 100).toFixed(1)}%`, 断点后: curr.slice(shared, shared + 40) });
   check("每轮只新付本轮新增的记录与触发消息（可复用前缀 ≥95%）", shared / curr.length >= 0.95,
     { 命中率: `${((shared / curr.length) * 100).toFixed(1)}%`, 长度: [prev.length, curr.length], 断点后: curr.slice(shared, shared + 60) });
+  step("8e. 突发排队：同群第二封的上下文里必须带着第一封刚落的回复");
+  const burst = async (content) => call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: `@小M ${content}`, mentions: [{ type: "agent", id: mockAgentId }] },
+  });
+  const [firstMail, secondMail] = [await burst("突发甲"), await burst("突发乙")];
+  check("连发两封 @ 排成两封任务（第二封不会被当成插话）",
+    firstMail.payload.queued.length === 1 && secondMail.payload.queued.length === 1
+    && secondMail.payload.interrupted.length === 0,
+    { 第一轮: firstMail.payload.queued, 第二轮: secondMail.payload.queued, 插话: secondMail.payload.interrupted });
+  const burstTick1 = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("同一群同一员工一轮只放最早的一封（并发跑两封会把顺序写乱）",
+    (burstTick1.payload.ran ?? []).length === 1, burstTick1.payload.ran);
+  const burstTick2 = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("第二轮把积压的第二封跑掉", (burstTick2.payload.ran ?? []).length === 1, burstTick2.payload.ran);
+  const secondSystem = triggered("突发乙");
+  check("第二封的上下文能看到第一封的回复（窗口不按触发序号设上界，突发不会重复作答）",
+    secondSystem.includes("回甲已落群") && secondSystem.includes("突发甲"),
+    { 触发块: secondSystem.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息"))?.slice(0, 60) });
   await mock.close();
 
   step("9. 成员管理：提管理员、拉人、踢人");
