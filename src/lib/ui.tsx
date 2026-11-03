@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import { describeError, get } from "../api";
 import type { Attachment, Delivery } from "../types";
+import { AVATAR_PRESETS, avatarPresetDataUrl, presetPreviewUrl } from "./avatars";
 import { initials } from "./format";
 
 export type Kind = "human" | "agent" | "system";
@@ -111,7 +112,7 @@ export async function toAvatarDataUrl(file: File) {
   }
 }
 
-/** 头像选择：预览 + 上传/更换/移除，选图后立刻回调 data URL。 */
+/** 头像选择：预览 + 上传/更换/移除 + 内置默认头像，选定后一律回调 128×128 的 data URL。 */
 export function AvatarPicker({
   name,
   kind,
@@ -127,6 +128,7 @@ export function AvatarPicker({
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [working, setWorking] = useState(false);
+  const [presetBusy, setPresetBusy] = useState("");
 
   async function pick(file: File | undefined) {
     if (!file) return;
@@ -149,34 +151,69 @@ export function AvatarPicker({
     }
   }
 
+  // 默认头像不占仓库图片：SVG 画在代码里，点下去才在浏览器烤成 WebP，跟上传那条路同一个字段。
+  async function usePreset(preset: (typeof AVATAR_PRESETS)[number]) {
+    setPresetBusy(preset.key);
+    try {
+      onChange(await avatarPresetDataUrl(preset.svg));
+    } catch {
+      toast.error("这个默认头像没生成出来，换一个或自己上传。");
+    } finally {
+      setPresetBusy("");
+    }
+  }
+
   return (
-    <div className="flex items-center gap-2.5">
-      <PersonAvatar name={name || "?"} kind={kind} color={color} avatar={avatar} className="size-12 text-sm" />
-      <div className="grid gap-1">
-        <div className="flex items-center gap-1.5">
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            className="h-7 px-2 text-xs"
-            disabled={working}
-            onClick={() => inputRef.current?.click()}
-          >
-            {working ? "处理中…" : avatar ? "换头像" : "上传头像"}
-          </Button>
-          {avatar ? (
+    <div className="grid gap-2">
+      <div className="flex items-center gap-2.5">
+        <PersonAvatar name={name || "?"} kind={kind} color={color} avatar={avatar} className="size-12 text-sm" />
+        <div className="grid gap-1">
+          <div className="flex items-center gap-1.5">
             <Button
               type="button"
               size="sm"
-              variant="ghost"
-              className="h-7 px-2 text-xs text-muted-foreground"
-              onClick={() => onChange("")}
+              variant="outline"
+              className="h-7 px-2 text-xs"
+              disabled={working}
+              onClick={() => inputRef.current?.click()}
             >
-              移除
+              {working ? "处理中…" : avatar ? "换头像" : "上传头像"}
             </Button>
-          ) : null}
+            {avatar ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2 text-xs text-muted-foreground"
+                onClick={() => onChange("")}
+              >
+                移除
+              </Button>
+            ) : null}
+          </div>
+          <p className="text-[11px] text-muted-foreground">PNG / JPEG / WebP，裁成 128×128 存库，不超过 8MB。</p>
         </div>
-        <p className="text-[11px] text-muted-foreground">PNG / JPEG / WebP，裁成 128×128 存库，不超过 8MB。</p>
+      </div>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-[11px] text-muted-foreground">没图就挑一个：</span>
+        {AVATAR_PRESETS.map((preset) => (
+          <button
+            key={preset.key}
+            type="button"
+            title={preset.label}
+            aria-label={preset.label}
+            disabled={working || presetBusy !== ""}
+            onClick={() => void usePreset(preset)}
+            className={cn(
+              "size-7 shrink-0 overflow-hidden rounded-full ring-1 ring-inset ring-black/10 transition",
+              "hover:brightness-110 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal",
+              "disabled:opacity-50",
+              presetBusy === preset.key ? "opacity-40" : "",
+            )}
+          >
+            <img src={presetPreviewUrl(preset.svg)} alt="" draggable={false} className="size-full object-cover" />
+          </button>
+        ))}
       </div>
       <input
         ref={inputRef}

@@ -28,6 +28,8 @@ const prodHandler = makeHandler({ env: () => undefined });
 
 // 1×1 PNG：只验证头像的存取与展示链路，不关心图案。
 const AVATAR = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+// 1×1 WebP：内置默认头像烤出来就是 WebP，单独验一次这一档收不收得下。
+const AVATAR_WEBP = "data:image/webp;base64,UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAwA0JaQAA3AA/vuUAAA=";
 
 let passed = 0;
 const failures = [];
@@ -541,6 +543,13 @@ async function main() {
   check("头像随会话回读", meAvatar.payload.user?.avatar === AVATAR, meAvatar.payload.user);
   const badAvatar = await call("auth.patch", { token: ana, body: { avatar: "javascript:alert(1)" } });
   check("非图片头像被拒", badAvatar.status === 400 && badAvatar.payload.error === "invalid_avatar", badAvatar.payload);
+  // 内置默认头像在前端烤成 128×128 WebP 再交上来，字段口径要和上传那条完全一致。
+  const webpAvatar = await call("auth.patch", { token: ana, body: { avatar: AVATAR_WEBP } });
+  check("WebP 头像收得下（内置默认头像就是这一档）", webpAvatar.payload.user?.avatar === AVATAR_WEBP, webpAvatar.payload.user);
+  const svgAvatar = await call("auth.patch", { token: ana, body: { avatar: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4=" } });
+  check("SVG 头像被拒：默认头像只在前端画，进库的必须是烤好的位图",
+    svgAvatar.status === 400 && svgAvatar.payload.error === "invalid_avatar", svgAvatar.payload);
+  await call("auth.patch", { token: ana, body: { avatar: AVATAR } });
 
   step("2. 虚拟员工：独立 Key + OpenAI 兼容地址 + 两级 memory");
   const agent = await call("agents.create", {
