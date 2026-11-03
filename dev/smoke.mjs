@@ -12,6 +12,9 @@ import { isUpdateAvailable } from "../functions/registries.mjs";
 import { skillPrompt } from "../functions/skills.mjs";
 import { store } from "../functions/store.mjs";
 import { closeOrphanSteps, createStepWriter } from "../functions/steps.mjs";
+import { askCloudAgent, flattenPrompt, parseAgentId, QcaError } from "../functions/qca.mjs";
+import { completeForAgent } from "../functions/agents.mjs";
+import { Interrupted } from "../functions/util.mjs";
 import { createFixtureClient } from "./fixture-supabase.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "ws-smoke-"));
@@ -130,6 +133,13 @@ function startMockUpstream() {
       if (trig.includes("突发甲")) { sayFast("回甲已落群"); return; }
       if (trig.includes("突发乙")) { sayFast("回乙已落群"); return; }
       if (trig.includes("慢慢写")) { await say("正在慢慢写这段长正文", 140); return; }
+      // 自建端点只吐两个字就卡住：验证静默期间照样问一次要不要掐断，跟云端那条通道对齐。
+      if (String(last?.content ?? "").includes("静默卡住")) {
+        think("先想一步再动笔。");
+        send({ content: "半截" });
+        while (!res.destroyed && !res.writableEnded) await sleep(50);
+        return;
+      }
       if (Array.isArray(last?.content) && last.content.some((part) => part.type === "image_url")) {
         sayFast("图里是一块红色的方砖。");
         return;
@@ -357,6 +367,148 @@ function startMockRegistry() {
         port: server.address().port,
         requests,
         state,
+        close: () => new Promise((done) => { server.close(() => done()); }),
+      });
+    });
+  });
+}
+
+/**
+ * 本机假 QCA（Qoder Cloud Agents）：模型清单、environment、session、事件投递与 SSE 增量都按真的契约回，
+ * 另外留三个异常出口（PAT 不认、云端报错、流走光没正文）和一个慢速增量模式，
+ * 用来验证云端后端的每段衔接——尤其"半截增量不能冒充回复"。
+ */
+function startMockQca() {
+  const requests = [];
+  const state = {
+    mode: "ok",
+    text: "云端正文：先做对，再做快。",
+    reasoning: "云端思考链：先想三步……",
+    environments: [],
+    sessionCreated: 0,
+    models: 3,
+    promptSeen: null,
+  };
+  const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  const frame = (obj) => `data: ${JSON.stringify(obj)}\n\n`;
+  let environmentSeq = 0;
+  let userEventSeq = 0;
+
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", async () => {
+      const path = new URL(req.url, "http://mock").pathname;
+      const method = req.method;
+      let body = null;
+      try {
+        body = raw ? JSON.parse(raw) : null;
+      } catch {
+        body = { bad_json: true };
+      }
+      requests.push({ method, path, body, auth: req.headers.authorization ?? "" });
+      const send = (payload) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(payload));
+      };
+      const deny = (status) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end("{}");
+      };
+      // PAT 前缀照云端规矩认：不匹配的自检必须落到 qca_access_denied，而不是"看起来连上了"。
+      if (!/^Bearer pt-[A-Za-z0-9-]+$/.test(String(req.headers.authorization ?? ""))) return deny(401);
+
+      if (method === "GET" && path === "/api/v1/cloud/models") {
+        return send({ data: Array.from({ length: state.models }, (_, i) => ({ id: `model-${i}`, enabled: true })) });
+      }
+      if (method === "GET" && path === "/api/v1/cloud/environments") return send({ data: state.environments, has_more: false });
+      if (method === "POST" && path === "/api/v1/cloud/environments") {
+        const row = { id: `env_mock_${(environmentSeq += 1)}`, config: body?.config, archived_at: null };
+        state.environments.push(row);
+        return send(row);
+      }
+      if (method === "POST" && path === "/api/v1/cloud/sessions") {
+        if (!body?.agent?.id || !body?.environment_id) return deny(400);
+        state.sessionCreated += 1;
+        return send({ id: `sess_mock_${state.sessionCreated}`, agent: body.agent });
+      }
+      const eventsStream = path.match(/^\/api\/v1\/cloud\/sessions\/(sess_[A-Za-z0-9_]+)\/events\/stream$/);
+      if (method === "GET" && eventsStream) {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+        if (state.mode === "silent") return res.end();
+        const replyId = "evt_assistant_1";
+        if (state.mode === "error") {
+          res.write(frame({ type: "event_start", event: { id: replyId, type: "agent.message" } }));
+          res.write(frame({ type: "session.error", error: { message: "云端这轮挂了" } }));
+          return res.end();
+        }
+        if (state.mode === "slow") {
+          res.write(frame({ type: "event_start", event: { id: replyId, type: "agent.message" } }));
+          for (let i = 0; i < 400; i += 1) {
+            if (res.destroyed || res.writableEnded) return;
+            res.write(frame({
+              type: "event_delta", event_id: replyId,
+              delta: { type: "content_delta", index: 0, content: { type: "text", text: `慢${i}` } },
+            }));
+            await sleep(10);
+          }
+          return res.end();
+        }
+        if (state.mode === "stall") {
+          // 云端 agent 在自己那边跑工具：吐了两句增量就长时间不吭声，也不收尾。
+          res.write(frame({ type: "event_start", event: { id: replyId, type: "agent.message" } }));
+          res.write(frame({
+            type: "event_delta", event_id: replyId,
+            delta: { type: "content_delta", index: 0, content: { type: "text", text: "静默前两句" } },
+          }));
+          while (!res.destroyed && !res.writableEnded) await sleep(50);
+          return;
+        }
+        // 故意把首帧切成两个分片下发：断帧拼接没写对，这里就会漏事件。
+        const start = frame({ type: "event_start", event: { id: replyId, type: "agent.message" } });
+        res.write(start.slice(0, 18));
+        await sleep(5);
+        res.write(start.slice(18));
+        res.write(frame({
+          type: "event_delta", event_id: replyId,
+          delta: { type: "content_delta", index: 0, content: { type: "text", text: state.text.slice(0, 4) } },
+        }));
+        res.write(frame({
+          type: "event_delta", event_id: replyId,
+          delta: { type: "content_delta", index: 0, content: { type: "text", text: state.text.slice(4) } },
+        }));
+        if (state.mode === "eof") return res.end();
+        res.write(": 心跳注释行\n\n");
+        // 规范回复里思考链与正文混在同一个 content 数组：只有 text 块允许进群。
+        res.write(frame({
+          type: "agent.message",
+          id: replyId,
+          content: [
+            { type: "thinking", thinking: state.reasoning },
+            { type: "text", text: state.text },
+          ],
+        }));
+        return res.end();
+      }
+      const eventsPost = path.match(/^\/api\/v1\/cloud\/sessions\/(sess_[A-Za-z0-9_]+)\/events$/);
+      if (method === "POST" && eventsPost) {
+        const prompt = body?.events?.[0]?.content?.[0]?.text;
+        if (typeof prompt !== "string") return deny(400);
+        state.promptSeen = { prompt, hasTools: body?.tools !== undefined, sessionId: eventsPost[1] };
+        userEventSeq += 1;
+        return send({ data: [{ id: `evt_user_${userEventSeq}`, type: "user.message" }] });
+      }
+      return deny(404);
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        port: server.address().port,
+        get origin() { return `http://127.0.0.1:${server.address().port}`; },
+        requests,
+        state,
+        count: (method, match) => requests.filter((r) => r.method === method && match.test(r.path)).length,
         close: () => new Promise((done) => { server.close(() => done()); }),
       });
     });
@@ -969,6 +1121,22 @@ async function main() {
   const customHeader = await viaSite({ "x-workstream-token": ana });
   check("自定义令牌头能穿过适配层完成鉴权",
     customHeader.payload?.ok === true && customHeader.payload?.user?.email === "ana@example.com", customHeader.payload);
+
+  // site.meta 是登录页用来决定"用什么方式收验证码、Key 存在哪儿"的唯一入口，必须不带会话也读得到。
+  const meta = await call("site.meta", { method: "GET" });
+  check("site.meta 不带会话也能读（公开路由）",
+    meta.status === 200 && meta.payload.name === "WorkStream" && meta.payload.user === undefined, meta.payload);
+  check("site.meta 报出服务端时间", Boolean(meta.payload.server_time), meta.payload);
+  check("本机形态：库内加密 + 开发态收件箱 + 本地开发标记 + 没有平台 Storage",
+    meta.payload.data_key === "database" && meta.payload.smtp === false
+    && meta.payload.local_dev === true && meta.payload.storage_mode === "database", meta.payload);
+  process.env.WORKSTREAM_SMTP_URL = "http://127.0.0.1:2525/relay";
+  process.env.WORKSTREAM_DATA_KEY = "a".repeat(44);
+  const metaDeployed = await call("site.meta", { method: "GET", entry: prodHandler });
+  check("配了中转端点与独立数据密钥后，site.meta 如实切换到 secret/relay",
+    metaDeployed.payload.smtp === true && metaDeployed.payload.data_key === "secret", metaDeployed.payload);
+  delete process.env.WORKSTREAM_SMTP_URL;
+  delete process.env.WORKSTREAM_DATA_KEY;
 
   step("12. 群管理面：改名与进群设置");
   const g1 = await call("streams.create", { token: ana, body: { name: "临时协调组", agent_ids: [agentId] } });
@@ -1986,6 +2154,288 @@ async function main() {
   check("版本比对：比不动的非数字版本，不同就算有更新", isUpdateAvailable("v1", "v2") === true
     && isUpdateAvailable("v2", "v2") === false);
   await mock22.close();
+
+  step("\n§23 云端 Agent 后端（QCA）：建档、自检、@ 派发与回群");
+  const qca = await startMockQca();
+  const PAT = "pt-smoke-token-1";
+  const badId = await call("agents.create", {
+    token: ana,
+    body: { name: "坏链接", role: "x", backend: "qca", api_base_url: qca.origin, api_key: PAT, qca_agent_id: "https://qoder.cn/dashboard" },
+  });
+  check("云端 Agent 的 id 只认 agent_ 前缀，粘别的链接会被挡下",
+    badId.status === 400 && badId.payload.error === "qca_agent_id_invalid", badId.payload);
+
+  const qcaAgent = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小C", role: "云端联调", backend: "qca", context_chars: 8000,
+      qca_agent_id: "https://qoder.cn/cloud/agents/agent_00udpumq8ag3kz1958f3",
+      api_base_url: qca.origin, api_key: PAT,
+    },
+  });
+  const qcaId = qcaAgent.payload.agent?.id;
+  check("建档：控制台链接里能提出 agent id",
+    qcaAgent.payload.agent?.qca_agent_id === "agent_00udpumq8ag3kz1958f3", qcaAgent.payload);
+  check("建档：后端记成 qca，模型位只留展示名",
+    qcaAgent.payload.agent?.backend === "qca" && qcaAgent.payload.agent?.model === "云端 Agent", qcaAgent.payload);
+  check("建档：令牌只回尾号，明文与密文都不外泄",
+    qcaAgent.payload.agent?.api_key_tail === `••••${PAT.slice(-4)}`
+    && !JSON.stringify(qcaAgent.payload).includes(PAT) && !JSON.stringify(qcaAgent.payload).includes("api_key_cipher"),
+    qcaAgent.payload);
+  const qcaProd = await call("agents.create", {
+    token: ana, entry: prodHandler,
+    body: { name: "元数据", role: "x", backend: "qca", qca_agent_id: "agent_ok", api_base_url: "https://169.254.169.254", api_key: PAT },
+  });
+  check("云端后端照旧过 SSRF：元数据地址被拒",
+    qcaProd.status === 400 && qcaProd.payload.error === "private_api_base_url", qcaProd.payload);
+
+  const qcaPing = await call("agents.test", { token: ana, body: { id: qcaId } });
+  check("连接自检打通云端：报出可见模型数量",
+    qcaPing.payload.result?.reachable === true && qcaPing.payload.result?.mode === "qca"
+    && String(qcaPing.payload.result?.note).includes("可见模型 3 个"), qcaPing.payload);
+  check("自检只读模型清单，不建 environment 也不建 session",
+    qca.count("POST", /\/(environments|sessions)$/) === 0, qca.requests.map((r) => `${r.method} ${r.path}`));
+  await call("agents.update", { token: ana, body: { id: qcaId, api_key: "sk-not-a-pat" } });
+  const deniedPing = await call("agents.test", { token: ana, body: { id: qcaId } });
+  check("令牌不对时自检如实报 qca_access_denied",
+    deniedPing.payload.result?.reachable === false && deniedPing.payload.result?.error === "qca_access_denied", deniedPing.payload);
+  await call("agents.update", { token: ana, body: { id: qcaId, api_key: PAT } });
+  const switchBack = await call("agents.update", { token: ana, body: { id: agentId, backend: "qca", qca_agent_id: "agent_abc" } });
+  check("切后端必须同时换令牌（自建端点的 Key 在云上没用）",
+    switchBack.payload.error === "agent_key_required_for_backend", switchBack.payload);
+
+  await call("streams.agents.add", { token: ana, body: { stream_id: streamId, agent_id: qcaId } });
+  const qcaSend = await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "@小C 用一句话讲发布节奏", mentions: [{ type: "agent", id: qcaId }] },
+  });
+  check("云端员工也能被 @ 派发", qcaSend.payload.queued?.length === 1, qcaSend.payload);
+  const qcaTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("云端这一轮跑完", (qcaTick.payload.ran ?? []).some((r) => r.status === "done"), qcaTick.payload);
+  const qcaHistory = await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } });
+  const qcaReply = (qcaHistory.payload.items ?? []).find((m) => m.sender_id === qcaId);
+  check("云端的规范回复落进群聊", String(qcaReply?.content).includes("先做对，再做快"), qcaReply);
+  check("云端的思考链不进群聊", !JSON.stringify(qcaReply).includes("云端思考链"), qcaReply);
+  const qcaPrompt = qca.state.promptSeen?.prompt ?? "";
+  check("上下文压成一条正文：设定与本次指令分段都在里面",
+    qcaPrompt.includes("〔设定与技能说明〕") && qcaPrompt.includes("〔群上下文与本次指令〕")
+    && qcaPrompt.includes("用一句话讲发布节奏"), qcaPrompt.slice(0, 160));
+  check("我们的群工具不塞给云端 Agent（它用它自己的工具集）",
+    qca.state.promptSeen?.hasTools === false, qca.state.promptSeen);
+  check("云端员工的上下文改口说明群工具调不到，不叫它照着技能说明假执行",
+    qcaPrompt.includes("本次由云端 Agent 作答") && qcaPrompt.includes("请把结论直接写进正文")
+    && !qcaPrompt.includes("按需调用对应工具") && !qcaPrompt.includes("调用 search_history / read_window 工具"),
+    qcaPrompt.slice(0, 260));
+  const qcaAgentRow = (await call("agents.get", { token: ana, method: "GET", body: { id: qcaId } })).payload.agent;
+  check("第一轮建出的 environment 记回员工档案",
+    qca.count("POST", /\/environments$/) === 1 && qcaAgentRow?.qca_environment_id === "env_mock_1", qcaAgentRow);
+
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "@小C 再补一句", mentions: [{ type: "agent", id: qcaId }] },
+  });
+  const qcaTick2 = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("第二轮也跑完", (qcaTick2.payload.ran ?? []).some((r) => r.status === "done"), qcaTick2.payload);
+  check("同群第二轮复用同一条云端 session", qca.count("POST", /\/sessions$/) === 1, qca.requests.map((r) => r.path));
+  check("environment 记下来之后不再每轮重探", qca.count("GET", /\/environments$/) === 1, qca.requests.map((r) => r.path));
+  const qcaSessions = await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id,stream_id,session_id", limit: 20 });
+  check("每个 (员工,群) 只存一条云端 session", qcaSessions.length === 1, qcaSessions);
+
+  const qcaRoom = await call("streams.create", { token: ana, body: { name: "云端隔离组", agent_ids: [qcaId] } });
+  const qcaRoomId = qcaRoom.payload.stream?.id;
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: qcaRoomId, content: "@小C 换个群问", mentions: [{ type: "agent", id: qcaId }] },
+  });
+  await call("scheduler.tick", { token: ana, method: "GET" });
+  const qcaSessions2 = await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id,stream_id,session_id", limit: 20 });
+  check("换群就换云端 session：不同群不会在云上串台",
+    qca.count("POST", /\/sessions$/) === 2 && qcaSessions2.length === 2
+    && new Set(qcaSessions2.map((r) => r.session_id)).size === 2, qcaSessions2);
+
+  qca.state.mode = "error";
+  const errorSend = await call("messages.send", {
+    token: ana,
+    body: { stream_id: qcaRoomId, content: "@小C 云端这轮会挂", mentions: [{ type: "agent", id: qcaId }] },
+  });
+  const errorTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("云端报错这一轮如实失败",
+    (errorTick.payload.ran ?? []).some((r) => r.status === "failed" && r.error === "qca_session_error"),
+    { send: errorSend.payload, ran: errorTick.payload.ran });
+  qca.state.mode = "eof";
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: qcaRoomId, content: "@小C 流提前断了", mentions: [{ type: "agent", id: qcaId }] },
+  });
+  const eofTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("流走光还没拿到规范正文：不拿半截增量冒充回复",
+    (eofTick.payload.ran ?? []).some((r) => r.status === "failed" && r.error === "qca_stream_ended_unfinished"), eofTick.payload.ran);
+  const qcaRoomHistory = await call("messages.list", { token: ana, method: "GET", body: { stream_id: qcaRoomId } });
+  check("失败的那两轮只留系统提示，正文半截不落群",
+    (qcaRoomHistory.payload.items ?? []).filter((m) => m.sender_id === qcaId).length === 1, qcaRoomHistory.payload.items);
+  qca.state.mode = "ok";
+
+  const qcaMembership = (await call("streams.get", { token: ana, method: "GET", body: { id: qcaRoomId } })).payload.members
+    ?.find((m) => m.type === "agent" && m.agent?.id === qcaId);
+  await call("streams.members.remove", { token: ana, body: { stream_id: qcaRoomId, membership_id: qcaMembership?.membership_id } });
+  const qcaSessionsAfterKick = await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id,stream_id", limit: 20 });
+  check("员工被移出群时，他在云端那条 session 缓存一起作废",
+    qcaSessionsAfterKick.length === 1 && qcaSessionsAfterKick[0].stream_id === streamId, qcaSessionsAfterKick);
+
+  // 放行侧断言：另一条通道（自建 OpenAI 兼容端点）必须照旧带着工具说明，别把抑制写过头。
+  const local = await startMockUpstream();
+  const localAgent = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小L", role: "对照", api_base_url: `http://127.0.0.1:${local.port}/v1`,
+      api_key: "mock-key-2", model: "mock", context_chars: 8000,
+    },
+  });
+  const localId = localAgent.payload.agent?.id;
+  await call("streams.agents.add", { token: ana, body: { stream_id: qcaRoomId, agent_id: localId } });
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: qcaRoomId, content: "@小L 对照一句", mentions: [{ type: "agent", id: localId }] },
+  });
+  await call("scheduler.tick", { token: ana, method: "GET" });
+  const localSystem = String(local.seen.at(-1)?.messages?.[0]?.content ?? "");
+  check("对照：自建端点那条通道照旧带着工具说明，也没被塞云端须知",
+    localSystem.includes("按需调用对应工具") && localSystem.includes("调用 search_history / read_window 工具")
+    && !localSystem.includes("本次由云端 Agent 作答"), localSystem.slice(0, 200));
+  await local.close();
+
+  // 直连一次：验证一次性会话（压缩用）不落到群里那条 session，也验证中断交出半截正文。
+  const qcaRow = { ...qcaAgentRow, qca_environment_id: null };
+  const sessionsBeforeEphemeral = qca.count("POST", /\/sessions$/);
+  const rowsBeforeEphemeral = (await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id", limit: 20 })).length;
+  const ephemeral = await askCloudAgent({
+    db, agent: qcaRow, streamId: qcaRoomId, pat: PAT,
+    messages: [{ role: "system", content: "压缩成三条要点" }, { role: "user", content: "旧对话" }],
+    persistSession: false,
+  });
+  check("一次性会话照旧能回话", ephemeral.content === qca.state.text && ephemeral.mode === "qca", ephemeral);
+  check("一次性会话不落库（摘要指令不混进群聊历史）",
+    qca.count("POST", /\/sessions$/) === sessionsBeforeEphemeral + 1
+    && (await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id", limit: 20 })).length === rowsBeforeEphemeral,
+    { 出网次数: qca.count("POST", /\/sessions$/) });
+  qca.state.mode = "slow";
+  let interruptSeen = 0;
+  let interrupted = null;
+  try {
+    await askCloudAgent({
+      db, agent: qcaRow, streamId: qcaRoomId, pat: PAT,
+      messages: [{ role: "user", content: "长跑一下" }],
+      onInterrupt: async () => {
+        interruptSeen += 1;
+        return interruptSeen >= 2 ? { by: "human", seq: 99 } : null;
+      },
+    });
+  } catch (error) {
+    interrupted = error;
+  }
+  qca.state.mode = "ok";
+  check("群里插话时云端这轮就地掐断，半截正文交给上层",
+    interrupted instanceof Interrupted && String(interrupted.payload.partial).startsWith("慢0慢1"),
+    { name: interrupted?.name, partial: interrupted?.payload?.partial?.slice(0, 12) });
+
+  // 云端 agent 在自己那边跑工具时，SSE 可以整段静默：这条通道必须也按静默去问要不要停。
+  qca.state.mode = "stall";
+  let stallPolls = 0;
+  let stallStopped = null;
+  const stallStarted = Date.now();
+  try {
+    await completeForAgent({
+      db, agent: qcaRow, streamId: qcaRoomId, key: PAT,
+      messages: [{ role: "user", content: "云端在跑自己的工具，半天不吭声" }],
+      onInterrupt: async () => {
+        stallPolls += 1;
+        return stallPolls >= 2 ? { by: "human", seq: 77 } : null;
+      },
+    });
+  } catch (error) {
+    stallStopped = error;
+  }
+  const stallMs = Date.now() - stallStarted;
+  qca.state.mode = "ok";
+  check("云端整段静默（在自己那边跑工具）时，插话照样在两秒内掐断，不必等 180s 整轮超时",
+    stallStopped instanceof Interrupted && stallStopped.payload.partial === "静默前两句"
+    && stallStopped.payload.seq === 77 && stallMs < 3000,
+    { 报错: stallStopped?.name, 半截: stallStopped?.payload?.partial, 用时ms: stallMs, 轮询次数: stallPolls });
+
+  // 放行侧断言：自建端点那条通道静默时同样掐断——两条后端的 preempt 是同一套口径。
+  const idleMock = await startMockUpstream();
+  let idlePolls = 0;
+  let idleStopped = null;
+  const idleStarted = Date.now();
+  try {
+    await completeForAgent({
+      db,
+      agent: { id: "agent-openai", backend: "openai", model: "mock", api_base_url: `http://127.0.0.1:${idleMock.port}/v1` },
+      key: "mock-key-2",
+      messages: [{ role: "user", content: "静默卡住" }],
+      onInterrupt: async () => {
+        idlePolls += 1;
+        return idlePolls >= 2 ? { by: "human", seq: 78 } : null;
+      },
+    });
+  } catch (error) {
+    idleStopped = error;
+  }
+  const idleMs = Date.now() - idleStarted;
+  await idleMock.close();
+  check("对照：自建端点静默时同样按 800ms 问一次，两条通道的中断语义一致",
+    idleStopped instanceof Interrupted && idleStopped.payload.partial === "半截"
+    && idleStopped.payload.seq === 78 && idleMs < 3000,
+    { 报错: idleStopped?.name, 半截: idleStopped?.payload?.partial, 用时ms: idleMs, 轮询次数: idlePolls });
+  qca.state.mode = "silent";
+  let noReply = null;
+  try {
+    await askCloudAgent({ db, agent: qcaRow, streamId: qcaRoomId, pat: PAT, messages: [{ role: "user", content: "云端一个字都没回" }] });
+  } catch (error) {
+    noReply = error;
+  }
+  qca.state.mode = "ok";
+  check("云端一个字都没回：如实报 qca_no_reply，不产出空回复",
+    noReply instanceof QcaError && noReply.code === "qca_no_reply", noReply?.code);
+
+  const flat = flattenPrompt([
+    { role: "system", content: "S" }, { role: "user", content: "U" }, { role: "assistant", content: "A" },
+  ]);
+  check("压平后的正文按角色分段，顺序不变",
+    flat.indexOf("〔设定与技能说明〕") < flat.indexOf("〔群上下文与本次指令〕")
+    && flat.indexOf("〔群上下文与本次指令〕") < flat.indexOf("〔你之前的回复〕"), flat);
+  let tooLarge = null;
+  try {
+    flattenPrompt([{ role: "user", content: "字".repeat(900001) }]);
+  } catch (error) {
+    tooLarge = error;
+  }
+  check("超长的上下文在出网之前就被挡下",
+    tooLarge instanceof QcaError && tooLarge.code === "qca_prompt_too_large", tooLarge?.code);
+  check("parseAgentId 认裸 id 也认控制台链接",
+    parseAgentId("agent_abc-1") === "agent_abc-1"
+    && parseAgentId(" https://qoder.cn/cloud/agents/agent_00udpumq8ag3kz1958f3?tab=log ") === "agent_00udpumq8ag3kz1958f3");
+
+  const reBindBefore = (await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id", limit: 20 })).length;
+  await call("agents.update", { token: ana, body: { id: qcaId, qca_agent_id: "agent_another01" } });
+  check("改绑云端 Agent 后，旧的 session 缓存全部作废",
+    (await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id", limit: 20 })).length === 0, reBindBefore);
+  const qcaList = await call("agents.list", { token: ana, method: "GET" });
+  const listed = (qcaList.payload.items ?? []).find((row) => row.id === qcaId);
+  check("列表里的云端员工带着后端与新绑的 id", listed?.backend === "qca" && listed?.qca_agent_id === "agent_another01", listed);
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "@小C 改绑之后再答一句", mentions: [{ type: "agent", id: qcaId }] },
+  });
+  const reBindTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("改绑之后用的是新云端 Agent 的会话",
+    (reBindTick.payload.ran ?? []).some((r) => r.status === "done")
+    && (await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id,session_id", limit: 20 })).length === 1,
+    reBindTick.payload.ran);
+  await call("agents.delete", { token: ana, body: { id: qcaId } });
+  check("删云端员工不会留下孤儿 session",
+    (await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id", limit: 20 })).length === 0);
+  await qca.close();
 
   console.log(`\n结果：${passed} 项通过，${failures.length} 项失败`);
   if (failures.length) {

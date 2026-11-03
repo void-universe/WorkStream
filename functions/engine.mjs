@@ -1,5 +1,5 @@
 // 调度与虚拟员工执行引擎：邮箱 FIFO + 按权重的时间片、上下文压缩、MCP 工具回路。
-import { AGENT_COLUMNS, AGENT_SECRET_COLUMNS, Interrupted, chatCompletion, publicAgent } from "./agents.mjs";
+import { AGENT_COLUMNS, AGENT_SECRET_COLUMNS, completeForAgent, publicAgent } from "./agents.mjs";
 import { armInterrupt, disarmInterrupt, fireInterrupt } from "./bus.mjs";
 import { shapeMessage, streamWeight } from "./chat.mjs";
 import { executeTool, INTERNAL_TOOL_NAMES, toolDefinitions } from "./mcp.mjs";
@@ -9,7 +9,7 @@ import { insertMessage, nextSeq } from "./rooms.mjs";
 import { requireMembership } from "./perm.mjs";
 import { skillPrompt } from "./skills.mjs";
 import { closeOrphanSteps, createStepWriter } from "./steps.mjs";
-import { CONTEXT_CHARS_DEFAULT, Halt, json, newId, now, text, truncate, uuid } from "./util.mjs";
+import { CONTEXT_CHARS_DEFAULT, Halt, Interrupted, json, newId, now, text, truncate, uuid } from "./util.mjs";
 
 const TOOL_DEFINITIONS = toolDefinitions();
 
@@ -664,13 +664,18 @@ function buildMessages({ agent, stream, prepared, trigger, skills, steerNote, im
   // 每轮必变的块（本群记忆 notes、触发消息、插话提示）一律压到最后。
   // 转录窗口按字符封顶、只在尾部追加；头部一旦滑动就说明那批记录该进摘要了（同一轮会补投压缩信），
   // 于是两轮之间的公共前缀通常能覆盖到上一轮窗口末尾。
+  const cloud = (agent.backend ?? "openai") === "qca";
   const head = [
     `你是虚拟员工「${agent.name}」（角色：${agent.role}），正在 WorkStream 群「${stream.name}」里工作。`,
-    agent.signature ? `你的个性签名（群里头像旁可见，需要时用 set_signature 更新）：${agent.signature}` : "",
+    // 云端 Agent 用自己的工具集，我们的群工具不在这条通道里；不说清楚它就会照着技能说明
+    // "调用 send_message"，把工具名写进正文，群里看到的是一次假执行。
+    cloud ? "本次由云端 Agent 作答：下面提到的 WorkStream 工具（发消息、群文件、虚拟机、记忆写入等）在这一通道里都调不到，也不要把工具名写进回复。请把结论直接写进正文，需要落地的动作列成待办交给同事。" : "",
+    agent.signature ? `你的个性签名（群里头像旁可见${cloud ? "" : "，需要时用 set_signature 更新"}）：${agent.signature}` : "",
     agent.system_prompt ? `工作守则：${agent.system_prompt}` : "",
     stream.announcement ? `群公告：${stream.announcement}` : "",
-    skills ? `你的技能（按需调用对应工具；细则可用 read_skill 查全文）：\n${skills}` : "",
-    "如需更早的记录，调用 search_history / read_window 工具；回答用群成员能直接用的表述。",
+    skills ? `你的技能（${cloud ? "在这里只是背景知识，细则的全文在本机技能库里" : "按需调用对应工具；细则可用 read_skill 查全文"}）：\n${skills}` : "",
+    cloud ? "如需更早的记录，请说明还需要哪一段，由 WorkStream 侧补给你；回答用群成员能直接用的表述。"
+      : "如需更早的记录，调用 search_history / read_window 工具；回答用群成员能直接用的表述。",
     prepared.common.length ? `你的长期记忆（common）：\n${prepared.common.map((m) => `- ${m.content}`).join("\n")}` : "",
     prepared.summary ? `本群较早内容的压缩摘要（序号 1-${prepared.windowStart}）：\n${prepared.summary}` : "",
     `最近记录：\n${renderTranscript(prepared.window)}`,
@@ -704,10 +709,9 @@ async function compress({ db, env, agent, stream, prepared, key, trace }) {
   // 压缩也是一轮模型调用：记进步骤，后台信为什么没折动摘要才看得见，而不是只在记忆里留一句话。
   const step = await trace.openCompression({ model: agent.model });
   try {
-    const result = await chatCompletion({
-      baseUrl: agent.api_base_url,
-      apiKey: key,
-      model: agent.model,
+    // 摘要是一次性提问：云端后端不为它复用群里的 session，免得"帮我摘要"混进群对话史。
+    const result = await completeForAgent({
+      db, agent, streamId: stream.id, key,
       messages: [
         { role: "system", content: "把下面这段群聊压成不超过 600 字的中文要点摘要，保留结论、待办、数字与人名。" },
         { role: "user", content: renderTranscript(older) },
@@ -715,6 +719,7 @@ async function compress({ db, env, agent, stream, prepared, key, trace }) {
       maxTokens: 400,
       timeoutMs: 30000,
       summary: { lines: older.map((r) => `${r.sender_name}：${r.content}`) },
+      persistSession: false,
     });
     if (result.content) summary = `${prepared.summary ? `${prepared.summary}\n` : ""}${result.content}`.slice(-Math.max(600, budget * 0.1));
     await trace.close(step, {
@@ -761,10 +766,8 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
     const context = { ...contextNote, chars: size(working) };
     let answer;
     try {
-      answer = await chatCompletion({
-        baseUrl: agent.api_base_url,
-        apiKey: key,
-        model: agent.model,
+      answer = await completeForAgent({
+        db, agent, streamId: stream.id, key,
         messages: working,
         tools,
         timeoutMs: 180000,

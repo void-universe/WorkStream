@@ -197,6 +197,17 @@ function isPrivateHost(host) {
 export const maskKey = (value) =>
   value ? `••••${String(value).slice(-4)}` : "";
 
+/** 生成中途被群里插话掐断：带上打断者、新消息序号和已经输出的半截内容。
+ *  放在 util 是因为两条出网路径（自建 OpenAI 兼容端点、云端 Agent）都要抛同一个类，
+ *  引擎按 `instanceof` 判定是掐断还是失败。 */
+export class Interrupted extends Error {
+  constructor(payload) {
+    super("interrupted");
+    this.name = "Interrupted";
+    this.payload = payload;
+  }
+}
+
 export function truncate(value, max) {
   const chars = Array.from(String(value));
   return chars.length > max ? `${chars.slice(0, max).join("")}…` : chars.join("");

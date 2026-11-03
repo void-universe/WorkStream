@@ -1,11 +1,12 @@
 // 虚拟员工：独立 API Key + OpenAI 兼容地址，两级 memory（common 与 per-stream）。
 import { open, seal } from "./sec.mjs";
 import { agentPresence } from "./presence.mjs";
+import { askCloudAgent, checkCloudAccess, parseAgentId } from "./qca.mjs";
 import { installDefaultSkillsFor, skillsForAgent } from "./skills.mjs";
-import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, avatarData, int, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
+import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, Interrupted, avatarData, int, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
 
 export const AGENT_COLUMNS =
-  "id,owner_id,name,role,signature,avatar,api_base_url,api_key_tail,model,system_prompt,context_chars,key_source,color,status,created_at,updated_at";
+  "id,owner_id,name,role,signature,avatar,api_base_url,api_key_tail,model,system_prompt,context_chars,key_source,color,status,backend,qca_agent_id,qca_environment_id,created_at,updated_at";
 
 /** 只有服务端自用：密文列永不出现在任何响应里。 */
 export const AGENT_SECRET_COLUMNS = "id,owner_id,api_key_cipher";
@@ -77,16 +78,21 @@ export const actions = {
   async "agents.create"({ db, user, body, env }) {
     const name = text(body.name, { max: 48, name: "name" });
     const role = text(body.role, { max: 400, name: "role" });
+    const backend = oneOf(body.backend ?? "openai", ["openai", "qca"], "backend");
     const target = safeApiBaseUrl(body.api_base_url, { allowPrivate: privateAllowed(env) });
     const apiKey = text(body.api_key, { max: 400, name: "api_key" });
-    const model = text(body.model, { max: 120, name: "model" });
+    // 云端 Agent 的模型由云上那份定义决定，本地只留一个展示名。
+    const model = backend === "qca"
+      ? text(body.model ?? "云端 Agent", { max: 120, name: "model" })
+      : text(body.model, { max: 120, name: "model" });
+    const qcaAgentId = backend === "qca" ? parseAgentId(body.qca_agent_id) : null;
     const systemPrompt = text(body.system_prompt ?? "", { max: 4000, required: false });
     const signature = text(body.signature ?? "", { max: 120, required: false });
     const avatar = avatarData(body.avatar);
     const contextChars = int(body.context_chars, {
       min: 2000, max: CONTEXT_CHARS_MAX, name: "context_chars", fallback: CONTEXT_CHARS_DEFAULT,
     });
-    if (target.scheme === "demo" && model !== "demo") throw new Halt("demo_needs_demo_model", 400);
+    if (backend === "openai" && target.scheme === "demo" && model !== "demo") throw new Halt("demo_needs_demo_model", 400);
     const sealed = await seal(apiKey, { supabase: db.client, env });
     const id = newId();
     const created = await db.agents.insert({
@@ -103,6 +109,9 @@ export const actions = {
       avatar,
       context_chars: contextChars,
       key_source: sealed.key_source,
+      backend,
+      qca_agent_id: qcaAgentId,
+      qca_environment_id: null,
       color: COLORS[Math.floor(Math.random() * COLORS.length)],
       status: "active",
       created_at: now(),
@@ -138,9 +147,29 @@ export const actions = {
       values.context_chars = int(body.context_chars, { min: 2000, max: CONTEXT_CHARS_MAX, name: "context_chars" });
     }
     if (body.status !== undefined) values.status = oneOf(body.status, ["active", "paused"], "status");
+    if (body.backend !== undefined) {
+      const next = oneOf(body.backend, ["openai", "qca"], "backend");
+      // 换后端等于换一类凭据（sk- 的 Key 和 pt- 的 PAT 不能混用），没给新凭据就挡住，
+      // 别让员工带着错凭据上岗、每轮任务都失败在云端鉴权上。
+      if (next !== (agent.backend ?? "openai") && !body.api_key) throw new Halt("agent_key_required_for_backend", 400);
+      values.backend = next;
+      if (next === "qca") {
+        // 换到云端后端：必须一起有 agent id（没给就沿用已存的），origin 由 api_base_url 那一路校验。
+        values.qca_agent_id = parseAgentId(body.qca_agent_id ?? agent.qca_agent_id);
+      } else {
+        values.qca_agent_id = null;
+        values.qca_environment_id = null;
+      }
+    } else if (body.qca_agent_id !== undefined && (agent.backend ?? "openai") === "qca") {
+      values.qca_agent_id = parseAgentId(body.qca_agent_id);
+      // 改挂另一个云端 agent：environment 与 session 缓存都是围着旧 agent 建的，一起作废。
+      values.qca_environment_id = null;
+    }
     if (body.api_base_url !== undefined) {
       const target = safeApiBaseUrl(body.api_base_url, { allowPrivate: privateAllowed(env) });
       values.api_base_url = target.url;
+      // 换了 API 地址等于换了云端账号所在的那套服务，缓存的 environment/session 都不再适用。
+      if ((agent.backend ?? "openai") === "qca") values.qca_environment_id = null;
     }
     if (body.api_key) {
       const apiKey = text(body.api_key, { max: 400, name: "api_key" });
@@ -148,9 +177,16 @@ export const actions = {
       values.api_key_cipher = sealed.cipher;
       values.api_key_tail = maskKey(apiKey);
       values.key_source = sealed.key_source;
+      // PAT 换了，云端那侧的 session 归属可能就变了；缓存一律作废，下一轮重新建。
+      if ((agent.backend ?? "openai") === "qca") values.qca_environment_id = null;
     }
     const updated = await db.agents.claim([["id", agent.id], ["owner_id", user.id]], values);
     if (!updated) throw new Halt("agent_update_failed", 503);
+    const cleared = values.backend === "openai" || values.qca_agent_id !== undefined
+      || values.api_base_url !== undefined || values.api_key_cipher !== undefined;
+    if ((agent.backend ?? "openai") === "qca" && cleared) {
+      await db.qca_sessions.removeAll([["agent_id", agent.id]]);
+    }
     const row = await db.agents.byId(agent.id, { columns: AGENT_COLUMNS });
     return json({ ok: true, agent: publicAgent(row) });
   },
@@ -164,18 +200,27 @@ export const actions = {
     await db.slice_prefs.patch([["agent_id", agent.id]], { weight: 1, updated_at: now() });
     const links = await db.agent_skills.list([["agent_id", agent.id]], { columns: "id", limit: 100 });
     for (const link of links) await db.agent_skills.remove([["id", link.id]]);
+    // 云端 session 是按 (员工,群) 缓存的对话上下文：员工没了留着只会让下一个同 id 档案串台。
+    await db.qca_sessions.removeAll([["agent_id", agent.id]]);
     const removed = await db.agents.remove([["id", agent.id], ["owner_id", user.id]]);
     if (!removed) throw new Halt("agent_delete_failed", 503);
     return json({ ok: true, id: agent.id });
   },
 
-  /** 连接自检：向所选 OpenAI 兼容端点发一条极短对话，返回状态与耗时。 */
+  /** 连接自检：自建端点发一条极短对话；云端 Agent 只验 PAT 与地址成对（不建 session，不动用量）。 */
   async "agents.test"({ db, user, body, env }) {
     const agent = await ownedAgent(db, user, body.id);
     const secret = await db.agents.byId(agent.id, { columns: AGENT_SECRET_COLUMNS });
     const key = await open(secret?.api_key_cipher, { supabase: db.client, env });
     const started = Date.now();
     try {
+      if ((agent.backend ?? "openai") === "qca") {
+        const check = await checkCloudAccess({ origin: agent.api_base_url, pat: key });
+        return json({
+          ok: true,
+          result: { reachable: true, ms: Date.now() - started, mode: "qca", note: `云端可达，可见模型 ${check.models} 个。` },
+        });
+      }
       const result = await chatCompletion({
         baseUrl: agent.api_base_url,
         apiKey: key,
@@ -195,7 +240,9 @@ export const actions = {
           reachable: false,
           ms: Date.now() - started,
           error: upstreamCode(error),
-          note: "上游未接受该请求；Key、模型名与 base URL 需一致。",
+          note: (agent.backend ?? "openai") === "qca"
+            ? "云端没接受这次自检；检查个人访问令牌是否有效、API 地址是否与你所在区域一致。"
+            : "上游未接受该请求；Key、模型名与 base URL 需一致。",
         },
       });
     }
@@ -260,6 +307,8 @@ const privateAllowed = (env) => env?.("WORKSTREAM_DEV") === "1";
 function upstreamCode(error) {
   const name = error?.name === "TimeoutError" ? "upstream_timeout" : null;
   if (name) return name;
+  // 云端 Agent 的失败自带环节（PAT 被拒 / 找不到 agent / 限流），比笼统的 upstream_* 有用。
+  if (error?.qcaCode) return String(error.qcaCode);
   if (typeof error?.status === "number") {
     if (error.status === 401 || error.status === 403) return "upstream_unauthorized";
     if (error.status === 404) return "upstream_not_found";
@@ -315,6 +364,20 @@ export async function chatCompletion({
     throw error;
   }
   return readUpstreamStream(response.body, { onInterrupt, started });
+}
+
+/**
+ * 一轮模型调用的分流口：员工挂的是云端 Agent 就走 QCA，否则走 OpenAI 兼容端点。
+ * 返回值形状一致（content/reasoning/usage/finish_reason/mode），引擎与轨迹不用关心后端。
+ * 云端那条路径不吃 tools：工具在云端 agent 自己那边，我们的群工具不注入。
+ */
+export async function completeForAgent({
+  db, agent, streamId, key, messages, tools, maxTokens, timeoutMs, summary, onInterrupt,
+}) {
+  if ((agent.backend ?? "openai") === "qca") {
+    return askCloudAgent({ db, agent, streamId, pat: key, messages, timeoutMs, onInterrupt });
+  }
+  return chatCompletion({ baseUrl: agent.api_base_url, apiKey: key, model: agent.model, messages, tools, maxTokens, timeoutMs, summary, onInterrupt });
 }
 
 const IDLE_MS = 800;
@@ -427,15 +490,6 @@ async function readUpstreamStream(stream, { onInterrupt, started }) {
     })),
     usage,
   };
-}
-
-/** 生成中途被群里插话掐断：带上打断者、新消息序号和已经输出的半截内容。 */
-export class Interrupted extends Error {
-  constructor(payload) {
-    super("interrupted");
-    this.name = "Interrupted";
-    this.payload = payload;
-  }
 }
 
 /** 内置演示模型：有工具请求就先“查询”，否则基于上下文给出可核对的摘要式回复。 */

@@ -33,6 +33,8 @@ type AgentDetail = {
   queue: MailItem[];
 };
 
+type Backend = "openai" | "qca";
+
 type Draft = {
   id?: string;
   name: string;
@@ -46,7 +48,33 @@ type Draft = {
   system_prompt: string;
   context_chars: number;
   status: "active" | "paused";
+  backend: Backend;
+  qca_agent_id: string;
+  /** 切到云端之前那个自建端点地址，切回来时还给他，不用重新手打。 */
+  prev_openai_url: string;
 };
+
+/** 云端 Agent 的默认 API 地址（CN 区）；换区或私有部署就在字段里改成对应 origin。 */
+const QCA_ORIGIN = "https://api.qoder.com.cn";
+
+/** 切后端只换该换的：演示地址与云端地址互相预置，令牌一律留空让用户重填——
+ *  两种后端的凭据不是一类东西，服务端也会拦"换了后端却没给新凭据"。 */
+function switchBackend(current: Draft, next: Backend): Draft {
+  if (next === current.backend) return current;
+  const toQca = next === "qca";
+  return {
+    ...current,
+    backend: next,
+    // 切到云端就填 Cloud Agents 的 origin：留着自建端点的地址只会让人拿 PAT 去打 deepseek。
+    // 切回自建时把切走前那个地址还回去，没存过才回演示端点。
+    api_base_url: toQca ? QCA_ORIGIN : (current.prev_openai_url || "demo://local"),
+    prev_openai_url: toQca ? current.api_base_url : "",
+    model: toQca
+      ? "云端 Agent"
+      : current.model === "云端 Agent" || !current.model ? "demo" : current.model,
+    api_key: "",
+  };
+}
 
 const EMPTY: Draft = {
   name: "",
@@ -59,6 +87,9 @@ const EMPTY: Draft = {
   system_prompt: "",
   context_chars: 200000,
   status: "active",
+  backend: "openai",
+  qca_agent_id: "",
+  prev_openai_url: "demo://local",
 };
 
 /** 搜索结果里的一个可装条目：本地行和远端条目归成同一个形状，装的动作各自走自己的接口。 */
@@ -171,6 +202,9 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
       system_prompt: agent.system_prompt,
       context_chars: agent.context_chars,
       status: agent.status,
+      backend: agent.backend === "qca" ? "qca" : "openai",
+      qca_agent_id: agent.qca_agent_id ?? "",
+      prev_openai_url: agent.backend === "qca" ? "" : agent.api_base_url,
     });
     void (async () => {
       try {
@@ -327,6 +361,8 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         context_chars: Number(draft.context_chars),
         api_base_url: draft.api_base_url.trim(),
         status: draft.status,
+        backend: draft.backend,
+        ...(draft.backend === "qca" ? { qca_agent_id: draft.qca_agent_id.trim() } : {}),
       };
       if (draft.id) {
         body.id = draft.id;
@@ -335,7 +371,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         toast.success("已保存");
       } else {
         if (!draft.api_key.trim()) {
-          toast.error("新建虚拟员工要有 Key；想先试流程就用演示端点。");
+          toast.error(draft.backend === "qca" ? "云端 Agent 要配个人访问令牌（PAT）才能建档。" : "新建虚拟员工要有 Key；想先试流程就用演示端点。");
           return;
         }
         body.api_key = draft.api_key.trim();
@@ -485,7 +521,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-sm">{agent.name}</span>
                 <span className="block truncate font-mono text-[11px] text-muted-foreground">
-                  {agent.model} · {agent.status === "paused" ? "已暂停" : "在岗"}
+                  {agent.backend === "qca" ? "云端 Agent" : agent.model} · {agent.status === "paused" ? "已暂停" : "在岗"}
                 </span>
                 {agent.signature ? (
                   <span className="block truncate text-[11px] text-muted-foreground">「{agent.signature}」</span>
@@ -539,21 +575,64 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
               <Field label="岗位描述" htmlFor="agent-role" hint="写清 ta 负责什么、交付什么，群里 @ ta 时这就是任务背景。">
                 <TextInput id="agent-role" value={draft.role} maxLength={400} onChange={(event) => setDraft({ ...draft, role: event.target.value })} placeholder="如：负责验收清单整理与回归项跟踪" className="h-8 text-xs" />
               </Field>
-              <Field label="OpenAI 兼容 base URL" htmlFor="agent-base" hint="线上必须是 https，且不能指向内网/元数据地址。">
+              <Field label="模型来源" htmlFor="agent-backend" hint="自建端点走 OpenAI 兼容接口；云端 Agent 挂 Qoder Cloud Agents 上已有的那个 agent。">
+                <NativeSelect
+                  id="agent-backend"
+                  className="h-8 text-xs"
+                  value={draft.backend}
+                  onChange={(event) => setDraft((current) => switchBackend(current, event.target.value as Backend))}
+                >
+                  <NativeSelectOption value="openai">自建 OpenAI 兼容端点</NativeSelectOption>
+                  <NativeSelectOption value="qca">Qoder 云端 Agent</NativeSelectOption>
+                </NativeSelect>
+              </Field>
+              {draft.backend === "qca" ? (
+                <Field label="云端 Agent ID" htmlFor="agent-qca" hint="控制台 /cloud/agents/agent_xxx 里的那个 id；直接粘整条链接也会取出 id。">
+                  <TextInput id="agent-qca" value={draft.qca_agent_id} onChange={(event) => setDraft({ ...draft, qca_agent_id: event.target.value })} placeholder="agent_…" className="h-8 font-mono text-xs" />
+                </Field>
+              ) : null}
+              <Field
+                label={draft.backend === "qca" ? "云端 API 地址" : "OpenAI 兼容 base URL"}
+                htmlFor="agent-base"
+                hint={draft.backend === "qca"
+                  ? "要和 PAT 同一区域的 Cloud Agents 地址；线上只收 https，本机调试才放行内网。"
+                  : "线上必须是 https，且不能指向内网/元数据地址。"}
+              >
                 <TextInput id="agent-base" value={draft.api_base_url} onChange={(event) => setDraft({ ...draft, api_base_url: event.target.value })} className="h-8 font-mono text-xs" />
               </Field>
-              <Field label="模型名" htmlFor="agent-model" hint="演示端点（demo://local）固定填 demo，可在没 Key 时把整条流程跑通。">
+              <Field
+                label={draft.backend === "qca" ? "展示用模型名" : "模型名"}
+                htmlFor="agent-model"
+                hint={draft.backend === "qca"
+                  ? "云端 agent 用它自己定义的模型，这里只影响档案与轨迹里怎么标这一轮。"
+                  : "演示端点（demo://local）固定填 demo，可在没 Key 时把整条流程跑通。"}
+              >
                 <TextInput id="agent-model" value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} className="h-8 font-mono text-xs" />
               </Field>
-              <Field label="API Key" htmlFor="agent-key" hint="AES-GCM 加密后入库，接口与浏览器都拿不到原文；留空表示不更换。">
-                <Input id="agent-key" type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder={draft.id ? "留空保持原 Key" : "sk-…"} className="h-8 text-xs" />
+              <Field
+                label={draft.backend === "qca" ? "个人访问令牌（PAT）" : "API Key"}
+                htmlFor="agent-key"
+                hint={draft.backend === "qca"
+                  ? "Qoder 设置 → 个人访问令牌 里新建；AES-GCM 加密入库，接口与浏览器都拿不到原文，留空表示不更换。"
+                  : "AES-GCM 加密后入库，接口与浏览器都拿不到原文；留空表示不更换。"}
+              >
+                <Input id="agent-key" type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder={draft.backend === "qca" ? "pt-…" : draft.id ? "留空保持原 Key" : "sk-…"} className="h-8 text-xs" />
               </Field>
               <Field label="上下文预算（字符）" htmlFor="agent-context" hint="单轮能带进模型的字符上限，和群预算取较小值。中文约 1 字≈1 token、英文约 4 字符≈1 token：256K 窗口的模型填 20 万，百万窗口的可以拉到 200 万。">
                 <Input id="agent-context" type="number" min={2000} max={2000000} step={20000} value={draft.context_chars} onChange={(event) => setDraft({ ...draft, context_chars: Number(event.target.value) })} className="h-8 text-xs" />
               </Field>
             </div>
 
-            <Field label="个性签名" htmlFor="agent-signature" hint="群里头像旁的一行小字；员工自己也能用 set_signature 工具改。留空则不显示。">
+            {draft.backend === "qca" ? (
+              <Notice tone="info">
+                云端 Agent 用它自己的提示词与工具集：WorkStream 的记忆、群聊转录和技能说明会压成一条正文送过去，
+                但我们的群工具（发消息、群文件、虚拟机）对它不可见，回群里的那一段只有正文——思考链照旧不进群。
+              </Notice>
+            ) : null}
+
+            <Field label="个性签名" htmlFor="agent-signature" hint={draft.backend === "qca"
+              ? "群里头像旁的一行小字；云端 Agent 调不到我们的工具，改签名要回这里改。留空则不显示。"
+              : "群里头像旁的一行小字；员工自己也能用 set_signature 工具改。留空则不显示。"}>
               <TextInput
                 id="agent-signature"
                 value={draft.signature}
@@ -564,7 +643,9 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
               />
             </Field>
 
-            <Field label="系统提示词" htmlFor="agent-system" hint="决定 ta 的语气、边界和什么时候该用 MCP 回查历史。">
+            <Field label="系统提示词" htmlFor="agent-system" hint={draft.backend === "qca"
+              ? "决定 ta 的语气与边界；云端 Agent 用它自己的提示词，这段会跟着正文一起递过去。"
+              : "决定 ta 的语气、边界和什么时候该用 MCP 回查历史。"}>
               <Textarea id="agent-system" rows={3} value={draft.system_prompt} onChange={(event) => setDraft({ ...draft, system_prompt: event.target.value })} className="text-xs" />
             </Field>
 
@@ -576,15 +657,17 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                 </NativeSelect>
               </Field>
               <div className="flex items-end gap-2 pb-0.5">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-8 text-xs"
-                  onClick={() => setDraft({ ...draft, api_base_url: "demo://local", model: "demo", api_key: draft.api_key || "demo" })}
-                >
-                  用演示端点填空
-                </Button>
-                {draft.id ? <p className="text-xs text-muted-foreground">Key 尾号 {draft.api_key_tail ?? "—"}</p> : null}
+                {draft.backend === "qca" ? null : (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-8 text-xs"
+                    onClick={() => setDraft({ ...draft, api_base_url: "demo://local", model: "demo", api_key: draft.api_key || "demo" })}
+                  >
+                    用演示端点填空
+                  </Button>
+                )}
+                {draft.id ? <p className="text-xs text-muted-foreground">{draft.api_key ? "换了后端：要重新粘贴这份凭据" : `凭据尾号 ${draft.api_key_tail ?? "—"}`}</p> : null}
               </div>
             </div>
           </CardContent>

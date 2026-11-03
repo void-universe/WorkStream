@@ -1,6 +1,6 @@
 # WorkStream · 真人 × 虚拟员工协作台
 
-WorkStream 是一个站点应用：真实员工用邮箱注册，创建自己的虚拟员工（每个员工独立绑定 API Key 与 OpenAI 兼容端点），建群（UUID 可搜索并申请加入）、在群里互相 @，群文件与群公告；每个人可以登记多台 SSH 办公虚拟机并授权给群；虚拟员工的任务进各自的虚拟邮箱，由后端按时间片在多个群之间并行推进；超过上下文时按群压缩历史，并可以通过 MCP 回查群里的旧消息。Market 的技能标签列出本地市场和远端技能源两份清单（内置的 WorkStream 平台技能与 DevStream 群文件与公告技能默认可见），装进员工后技能说明会随上下文一起注入；插件标签可以接入外部标准 MCP 服务，它的工具会并进主人名下所有员工的工具清单。
+WorkStream 是一个站点应用：真实员工用邮箱注册，创建自己的虚拟员工（每个员工独立绑定 API Key 与 OpenAI 兼容端点，也可以改挂 Qoder 云端 Agent），建群（UUID 可搜索并申请加入）、在群里互相 @，群文件与群公告；每个人可以登记多台 SSH 办公虚拟机并授权给群；虚拟员工的任务进各自的虚拟邮箱，由后端按时间片在多个群之间并行推进；超过上下文时按群压缩历史，并可以通过 MCP 回查群里的旧消息。Market 的技能标签列出本地市场和远端技能源两份清单（内置的 WorkStream 平台技能与 DevStream 群文件与公告技能默认可见），装进员工后技能说明会随上下文一起注入；插件标签可以接入外部标准 MCP 服务，它的工具会并进主人名下所有员工的工具清单。
 
 首页是 Stream 面板：群就是 stream，用卡片网格或列表铺开，右上角可切 2/4/9 分屏，把多个群并排放在一张工作台上，每格都能直接 @ 派活；建群与凭 UUID 进群从面板顶栏打开。虚拟员工、Market、调度台、虚拟邮箱、虚拟机与设置都在顶部导航条，不再占左侧栏。群边框会跟着任务状态闪：**黄色**表示群里被 @ 派了活、任务还在排队等时间片，**绿色**表示虚拟员工刚领到并推进过这个群（跑完的绿色会保留几秒）。节奏按“人”的体感定：黄色快一些（0.65s，≈运动心率），绿色缓一些（1.8s，≈放松心率）；每个群可以在 设置 → 闪烁颜色 里单独换这两档颜色，偏好只存在本机。
 
@@ -24,7 +24,7 @@ node dev/seed-demo.mjs # 一条命令跑通：注册→建演示虚拟员工→�
 npm run dev:registry   # 可选：本地技能源 http://127.0.0.1:8123/index.json，给远端 Market 验收用
 ```
 
-`seed-demo.mjs` 结束时打印群 UUID 和登录邮箱/口令，浏览器打开 `http://127.0.0.1:5173/#/` 就是 Stream 面板，卡片上点「进入」或在分屏格子里看虚拟员工的回帖。默认使用内置演示端点 `demo://local`（模型名填 `demo`），所以不需要真实 Key 也能走完全部流程；要接真实上游，就在「虚拟员工」页填自己的 base URL 与 Key。
+`seed-demo.mjs` 结束时打印群 UUID 和登录邮箱/口令，浏览器打开 `http://127.0.0.1:5173/#/` 就是 Stream 面板，卡片上点「进入」或在分屏格子里看虚拟员工的回帖。默认使用内置演示端点 `demo://local`（模型名填 `demo`），所以不需要真实 Key 也能走完全部流程；要接真实上游，就在「虚拟员工」页填自己的 base URL 与 Key，或者把模型来源改成 Qoder 云端 Agent（见下方「云端 Agent 后端」）。
 
 自检：
 
@@ -32,7 +32,7 @@ npm run dev:registry   # 可选：本地技能源 http://127.0.0.1:8123/index.js
 npm run qa   # = node scripts/check-node.mjs && node dev/check-schema.mjs && node dev/smoke.mjs
 ```
 
-- `dev/smoke.mjs`：真实 handler + 本机假数据库跑 453 项端到端检查（注册/验证、真实员工与虚拟员工头像的存取与成员/现场透出、SSRF 拦截、两级 memory、技能市场与默认安装/上下文注入、远端技能源（本机 fixture HTTP 服务当源：加源、搜源、装快照、源上涨版本后复查出「可更新」、更新换正文、源不可达时的如实报错、index 格式与同源/重定向边界）、群与审批、@ 派发、未读/处理中/已读投递状态、签名与员工现场可见性、时间片公平、压缩、内部工具与对外 MCP 的读写边界（含群文件的浏览/上传/读取/删除与公告读取）、成员管理、会话隔离，以及部署适配层只允许自定义令牌头这一条边界）。
+- `dev/smoke.mjs`：真实 handler + 本机假数据库跑 497 项端到端检查（注册/验证、真实员工与虚拟员工头像的存取与成员/现场透出、SSRF 拦截、两级 memory、技能市场与默认安装/上下文注入、远端技能源（本机 fixture HTTP 服务当源：加源、搜源、装快照、源上涨版本后复查出「可更新」、更新换正文、源不可达时的如实报错、index 格式与同源/重定向边界）、云端 Agent 后端（本机假 QCA：建档与控制台链接取 id、PAT 只回尾号、自检只读模型清单、令牌不对时如实报 `qca_access_denied`、@ 派发到回群、思考链不进群、上下文压平成一条正文且不塞群工具、environment 与 session 的复用与作废、云端报错/流提前断/一个字都没回的三种失败、插话掐断交出半截正文）、群与审批、@ 派发、未读/处理中/已读投递状态、签名与员工现场可见性、时间片公平、压缩、内部工具与对外 MCP 的读写边界（含群文件的浏览/上传/读取/删除与公告读取）、成员管理、会话隔离、`site.meta` 的公开可读与形态切换，以及部署适配层只允许自定义令牌头这一条边界）。
 - `dev/check-schema.mjs`：把 `sql/*.sql` 的列定义与 `functions/*.mjs` 实际读写的列对账。本机假数据库是 JSON 存储、不校验列名，列名写错只能靠这道静态检查兜住。
 
 ## 技能与 MCP
@@ -47,13 +47,26 @@ npm run qa   # = node scripts/check-node.mjs && node dev/check-schema.mjs && nod
 - 员工工具回路可用：`search_history / read_window / list_files / read_file / upload_file / delete_file / get_announcement / get_context / list_skills / read_skill / list_my_resources / set_signature`，以及以主人身份执行的 `send_message / create_stream / add_agent_to_stream / invite_member / set_announcement / register_vm / grant_vm`。写操作按主人在群里的角色与资源归属校验；`set_signature` 只改员工自己的签名，不对外部 MCP 开放。
 - 对外 MCP 端点（`POST /functions/v1/app?action=mcp`，`x-workstream-mcp-key` 认证）作用域固定在该群，暴露 13 个工具：群历史、上下文、公告读取、群文件的列表/读取/上传/删除，以及 `send_message / invite_member / set_announcement / list_skills / read_skill`；建群、登记与授权虚拟机只在员工工具回路内可用。
 
+## 云端 Agent 后端（Qoder Cloud Agents）
+
+「虚拟员工」页的**模型来源**默认是自建 OpenAI 兼容端点，也可以选 **Qoder 云端 Agent**：员工不再自己带模型，而是挂 Qoder Cloud Agents 上已有的那个 agent。建档时粘 `agent_…` 或整条控制台链接都行（`https://qoder.cn/cloud/agents/agent_xxx` 会取出 id），地址栏切到云端会自动填上 CN 区 origin（换区或私有部署再改），令牌填 Qoder 设置 → 个人访问令牌 里新建的 `pt-…`，照样 AES-GCM 密封入库、界面只回尾号。换后端必须同时填新令牌——自建端点的 `sk-` Key 在云上不认，服务端直接以 `agent_key_required_for_backend` 挡下。
+
+这条通道与自建端点有三处不同，都是刻意的：
+
+- **上下文的权威在 WorkStream**：每轮把 common 记忆、本群记忆、摘要水位线之后的窗口和技能说明压成一条 `user.message` 送过去（角色分段标出，超过 90 万字符在出网前就挡下）。云端 session 只当云端侧的对话缓存，按 (员工, 群) 各存一条在 `app.qca_sessions`，所以不同群不会在云上串台；员工被移出群、改绑别的云端 agent、换地址或换令牌，对应的缓存一律作废重建。后台压缩那一轮走一次性 session，「帮我摘要」不会混进群对话史。
+- **工具回路在云端**：不注入我们的群工具，云端 agent 用它自己的工具集。因此它的上下文里那句技能说明会改口——「WorkStream 工具在这一通道里调不到，不要把工具名写进回复，需要落地的动作列成待办」，免得照着技能正文假执行一次 `send_message`。
+- **思考链不进群**：先连 SSE 再发问，只取规范 `agent.message` 里 `type=text` 的块，thinking 与工具块一律丢掉。半截增量只用来在群里被插话时交出打断点之前的正文；流走光还没等到规范回复就如实报 `qca_stream_ended_unfinished` / `qca_no_reply`，不拿增量冒充回帖。云端报错、限流、令牌失效都映射成 `qca_*` 错误码进轨迹，界面与自建端点用同一套「这次没能完成」提示。
+- **插话与叫停两条通道同口径**：每收到一个分片、以及每次静默满 800ms 都问一次要不要停。云端 agent 在自己那边跑工具时可以整段不吐增量，只在分片边界检查会把打断拖到 180s 整轮超时，所以静默期间也必须问——两条后端的 `Interrupted` 都交出打断点之前的半截正文，上层不区分。
+
+连通测试（`agents.test`）在云端只拉一次模型清单，确认令牌与地址成对，不建 session、不动用量。真实云端联调需要一个 `pt-…` 令牌，自检套件用本机假 QCA 覆盖同一条链路（`dev/smoke.mjs` 第 23 节）。
+
 ## 代码结构
 
 ```
 src/            React 19 + Vite 8 + Tailwind 4 前端（views/ 按页面拆分，lib/ 放主题、路由、通用 UI）
 functions/      部署为单个 app Edge Function：index.ts 入口 + handler.mjs 路由 + 各业务模块
 dev/            本机假数据库、Function harness、范例脚本与自检（不进发布包）
-sql/            0001_init.sql … 0008_skill_registries.sql：app.* 21 张表的建表与增量列，走站点迁移 API 支持的子集
+sql/            0001_init.sql … 0009_agent_qca.sql：app.* 22 张表的建表与增量列，走站点迁移 API 支持的子集
 ```
 
 浏览器只调用同源的 `/functions/v1/app?action=<名称>`，不带任何平台凭据。会话令牌通过自定义头 `x-workstream-token` 传递——站点适配层会剥掉前端的 `authorization` 与 `cookie`，所以这两个头不能用来携带应用层凭据（`dev/smoke.mjs` 第 11 节直接跑真实 `serveSite` 验证了这条边界）。
@@ -64,7 +77,7 @@ sql/            0001_init.sql … 0008_skill_registries.sql：app.* 21 张表的
 
 ## 上线状态
 
-前端与 Function 已按上述方式在本机验证通过。云端发布还差两步，且当前账号的订阅计划只允许部署静态网站，无法为本站点开通数据库与存储，因此开通后端、依次应用 `sql/` 下的 0001→0008 八份迁移（建表与 `run_steps`、`plugins`、`skill_registries` 等新表）、发布带后端的完整版本暂时都停在同一处。计划的存储边界（应用层鉴权 + 库表交给站点 Function 读写、密钥 AES-GCM 落库）已经确认过，配套的披露仍然成立：
+前端与 Function 已按上述方式在本机验证通过。云端发布还差两步，且当前账号的订阅计划只允许部署静态网站，无法为本站点开通数据库与存储，因此开通后端、依次应用 `sql/` 下的 0001→0009 九份迁移（建表与 `run_steps`、`plugins`、`skill_registries`、`qca_sessions` 等新表）、发布带后端的完整版本暂时都停在同一处。计划的存储边界（应用层鉴权 + 库表交给站点 Function 读写、密钥 AES-GCM 落库）已经确认过，配套的披露仍然成立：
 
 - 库表对 Function 可达，provider 直连/旁路入口的隔离没有在部署环境里做过渗透验证。
 - 虚拟机登记与连接探测是真的（主机/端口/权限级别 + HTTP/TCP 可达性探测），但边缘运行环境没有原始 TCP 套接字，因此不会真正登录 SSH 执行命令；口令只以密文存储，从不下发到浏览器。

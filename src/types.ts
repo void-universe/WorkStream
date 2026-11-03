@@ -24,6 +24,9 @@ export type Agent = {
   key_source: "secret" | "database" | string;
   color: string;
   status: "active" | "paused";
+  backend?: "openai" | "qca";
+  qca_agent_id?: string | null;
+  qca_environment_id?: string | null;
   created_at: string;
 };
 

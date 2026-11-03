@@ -502,6 +502,11 @@ export const actions = {
       });
     }
     await db.members.remove([["id", membership.id]]);
+    // 云端 session 是按 (员工,群) 缓存的对话上下文：员工被移出群就把缓存扔掉，
+    // 否则他再进群时会带着上一段的云端历史继续聊。
+    if (membership.principal_type === "agent") {
+      await db.qca_sessions.removeAll([["agent_id", membership.principal_id], ["stream_id", streamId]]);
+    }
     await insertMessage(db, {
       streamId, senderType: "system", senderId: user.id, senderName: "系统",
       content: `${membership.principal_type === "agent" ? "虚拟员工" : "成员"}已被移出群。`,
@@ -539,6 +544,7 @@ export const actions = {
     // 读路径按“有没有成员行”放行，所以成员关系必须真删；写 role="removed" 没有读者，等于没停用。
     await db.members.removeAll([["stream_id", streamId]]);
     await db.slice_prefs.removeAll([["stream_id", streamId]]);
+    await db.qca_sessions.removeAll([["stream_id", streamId]]);
     await db.stream_vms.removeAll([["stream_id", streamId]]);
     // 正文一律清空：系统提示里也带着文件名与公告正文，按 kind 只清聊天会漏出内容。
     await db.messages.patch([["stream_id", streamId]], {
