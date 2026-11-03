@@ -11,3 +11,7 @@ dist/
 # 本机假数据库（演示账号、会话与测试消息），不入库
 dev/.wsdb.json
 dev/.wsdb.json.*
+
+# 本机调试产物：Function 日志与截图验证输出
+dev/.server.log
+dev/_shots/

@@ -3,10 +3,12 @@ import { AGENT_COLUMNS, AGENT_SECRET_COLUMNS, Interrupted, chatCompletion, publi
 import { armInterrupt, disarmInterrupt, fireInterrupt } from "./bus.mjs";
 import { shapeMessage, streamWeight } from "./chat.mjs";
 import { executeTool, INTERNAL_TOOL_NAMES, toolDefinitions } from "./mcp.mjs";
+import { connectorToolDefs } from "./plugins.mjs";
 import { open } from "./sec.mjs";
 import { insertMessage, nextSeq } from "./rooms.mjs";
 import { requireMembership } from "./perm.mjs";
 import { skillPrompt } from "./skills.mjs";
+import { closeOrphanSteps, createStepWriter } from "./steps.mjs";
 import { CONTEXT_CHARS_DEFAULT, Halt, json, newId, now, text, truncate, uuid } from "./util.mjs";
 
 const TOOL_DEFINITIONS = toolDefinitions();
@@ -98,9 +100,13 @@ export const actions = {
         status: "running", started_at: now(), slice_count: Number(mail.slice_count ?? 0) + 1,
       });
       if (!claimed) return;
-      const outcome = await runTask({ db, env, mailId: mail.id }).catch((error) => ({
-        status: "failed", error: error?.error ?? "task_failed",
-      }));
+      const outcome = await runTask({ db, env, mailId: mail.id }).catch(async (error) => {
+        const code = String(error?.error ?? "task_failed");
+        // runTask 自己抛出来时邮箱还停在 running：不落 failed 并合上步骤，时间线会一直闪"处理中"，
+        // 这封信也要等 5 分钟才被 reapStale 回收。
+        await finish(db, mail.id, "failed", code);
+        return { status: "failed", error: code };
+      });
       ran.push({ mail_id: mail.id, agent_id: mail.agent_id, stream_id: mail.stream_id, ...outcome });
     }));
     const left = await db.mail.list([
@@ -274,6 +280,7 @@ export async function reapStale(db) {
     const claimed = await db.mail.claim([["id", row.id], ["status", "running"]], {
       status: "failed", error: "slice_interrupted", finished_at: now(),
     });
+    if (claimed) await closeOrphanSteps(db, row.id, { error: "slice_interrupted" });
     const pending = row.meta?.interrupt;
     if (claimed && pending?.message_id) {
       await db.mail.insert({
@@ -310,6 +317,8 @@ export async function runTask({ db, env, mailId }) {
     return { status: "failed", error: "agent_key_missing" };
   }
   const key = await open(secret.api_key_cipher, { supabase: db.client, env });
+  // 一次运行一份写入器：seq 从 1 密排在这封 mail 上，跨运行绝不共享计数器。
+  const trace = createStepWriter(db, { mailId, agentId: agent.id, streamId: stream.id });
 
   let currentTrigger = trigger;
 
@@ -323,7 +332,7 @@ export async function runTask({ db, env, mailId }) {
     });
     let folded;
     try {
-      folded = await compress({ db, env, agent, stream, prepared, key });
+      folded = await compress({ db, env, agent, stream, prepared, key, trace });
     } catch (error) {
       const code = error?.code ?? error?.status ?? "compress_failed";
       await db.memories.insert({
@@ -383,8 +392,13 @@ export async function runTask({ db, env, mailId }) {
   for (let steer = 0; ; steer += 1) {
     try {
       reply = await withTools({
-        db, env, agent, stream, key, messages, watch,
-        maxChars: streamBudget(stream, agent) - used,
+        db, env, agent, stream, key, messages, watch, trace,
+        contextNote: {
+          from: prepared.window[0]?.seq ?? null,
+          to: prepared.window.at(-1)?.seq ?? null,
+          summary_through: prepared.windowStart,
+          blocks: messages.length,
+        },
       });
       break;
     } catch (error) {
@@ -555,6 +569,9 @@ async function buildContext({ db, agent, stream, prepared, trigger, skills, stee
 async function finish(db, mailId, status, error) {
   disarmInterrupt(mailId);
   await db.mail.claim([["id", mailId]], { status, error, finished_at: now() }, { stamp: false });
+  // 收尾顺带结掉这轮没合上的步骤：正常路径已经没有（模型步/工具步各自合），
+  // 剩下的都是崩在中间或掐断时留下的，不结就会在时间线上一直闪"处理中"。
+  await closeOrphanSteps(db, mailId, { error: error ?? "step_unfinished" });
 }
 
 /** 上下文组成：common memory + 本群记忆 + 摘要 + 摘要之后的窗口。
@@ -676,7 +693,7 @@ function buildMessages({ agent, stream, prepared, trigger, skills, steerNote, im
 /** 压缩：把窗口里较老的一半折叠进摘要，写入该 stream 的记忆并记录覆盖到的序号。
  *  前提：prepared.window 是从水位线往后连续取的那一段（anchor=head），
  *  这样 older 就是水位线之后的一个真前缀，covered 不会把没被读过的记录算成已覆盖。 */
-async function compress({ db, env, agent, stream, prepared, key }) {
+async function compress({ db, env, agent, stream, prepared, key, trace }) {
   const budget = streamBudget(stream, agent);
   const rows = prepared.window;
   if (rows.length < 4) return { summary: prepared.summary, windowStart: prepared.windowStart };
@@ -684,6 +701,8 @@ async function compress({ db, env, agent, stream, prepared, key }) {
   const older = rows.slice(0, keepFrom);
   const kept = rows.slice(keepFrom);
   let summary = prepared.summary;
+  // 压缩也是一轮模型调用：记进步骤，后台信为什么没折动摘要才看得见，而不是只在记忆里留一句话。
+  const step = await trace.openCompression({ model: agent.model });
   try {
     const result = await chatCompletion({
       baseUrl: agent.api_base_url,
@@ -698,8 +717,20 @@ async function compress({ db, env, agent, stream, prepared, key }) {
       summary: { lines: older.map((r) => `${r.sender_name}：${r.content}`) },
     });
     if (result.content) summary = `${prepared.summary ? `${prepared.summary}\n` : ""}${result.content}`.slice(-Math.max(600, budget * 0.1));
-  } catch {
-    summary = `${prepared.summary}\n（${older.length} 条较早记录压缩失败，已折叠出上下文窗口）`.trim();
+    await trace.close(step, {
+      status: "done",
+      detail: {
+        reasoning: result.reasoning ?? "",
+        content: result.content ?? "",
+        note: `折叠 ${older.length} 条较早记录`,
+      },
+      usage: result.usage,
+      firstTokenMs: result.first_token_ms,
+    });
+  } catch (error) {
+    const code = error?.name === "TimeoutError" ? "upstream_timeout" : error?.code ?? error?.status ?? "compress_failed";
+    await trace.close(step, { status: "failed", error: String(code), detail: { note: `折叠 ${older.length} 条较早记录` } });
+    summary = `${prepared.summary}\n（${older.length} 条较早记录压缩失败：${code}，已折叠出上下文窗口）`.trim();
   }
   const covered = Number(older.at(-1)?.seq ?? prepared.windowStart);
   const existing = await db.memories.list([
@@ -714,28 +745,65 @@ async function compress({ db, env, agent, stream, prepared, key }) {
   return { summary, windowStart: covered, window: kept };
 }
 
-/** 工具回路：最多两轮，工具执行都走内部 MCP 实现，作用域锁死在 (agent, stream, owner)。 */
-async function withTools({ db, env, agent, stream, key, messages, watch }) {
+/** 工具回路：最多两轮，工具执行都走内部 MCP 实现，作用域锁死在 (agent, stream, owner)。
+ *  每一轮模型调用和每一次工具调用都落一条 run_steps，员工详情页的时间线读的就是它。 */
+async function withTools({ db, env, agent, stream, key, messages, watch, trace, contextNote }) {
   const started = Date.now();
+  // 主人启用中的插件工具并进这一轮的清单；重名时内置优先，插件被挤掉。
+  const externalDefs = await connectorToolDefs(db, agent.owner_id, INTERNAL_TOOL_NAMES);
+  const externalNames = new Set(externalDefs.map((definition) => definition.function.name));
+  const tools = externalDefs.length ? [...TOOL_DEFINITIONS, ...externalDefs] : TOOL_DEFINITIONS;
   let working = [...messages];
   let last;
   for (let round = 0; round < 2; round += 1) {
-    last = await chatCompletion({
-      baseUrl: agent.api_base_url,
-      apiKey: key,
-      model: agent.model,
-      messages: working,
-      tools: TOOL_DEFINITIONS,
-      timeoutMs: 180000,
-      onInterrupt: watch,
+    const modelStep = await trace.openModel({ model: agent.model });
+    // 这一轮喂给模型的东西：只留口径（转录区间、块数、字符数），正文留在群里本来就能翻。
+    const context = { ...contextNote, chars: size(working) };
+    let answer;
+    try {
+      answer = await chatCompletion({
+        baseUrl: agent.api_base_url,
+        apiKey: key,
+        model: agent.model,
+        messages: working,
+        tools,
+        timeoutMs: 180000,
+        onInterrupt: watch,
+      });
+    } catch (error) {
+      const preempted = error instanceof Interrupted;
+      await trace.close(modelStep, {
+        status: preempted ? "cancelled" : "failed",
+        error: preempted ? "interrupted" : String(error?.name === "TimeoutError" ? "upstream_timeout" : error?.code ?? error?.status ?? "upstream_unreachable"),
+        detail: {
+          content: preempted ? (error.payload?.partial ?? "") : "",
+          context,
+          note: preempted ? "生成到一半被群里的插话掐断" : "",
+        },
+      });
+      throw error;
+    }
+    await trace.close(modelStep, {
+      status: "done",
+      detail: {
+        reasoning: answer.reasoning ?? "",
+        content: answer.content ?? "",
+        context,
+        tool_names: (answer.tool_calls ?? []).map((call) => call?.function?.name).join(", "),
+        note: answer.mode === "demo" ? "演示模型：不回报思考链与用量" : `finish_reason：${answer.finish_reason ?? "—"}`,
+      },
+      usage: answer.usage,
+      firstTokenMs: answer.first_token_ms,
     });
+    last = answer;
     if (!last.tool_calls?.length) break;
     const stop = await watch?.();
     if (stop) throw new Interrupted({ ...stop, partial: last.content ?? "" });
     const results = [];
     for (const call of last.tool_calls.slice(0, 4)) {
       const name = String(call?.function?.name ?? "");
-      if (!INTERNAL_TOOL_NAMES.includes(name)) {
+      if (!INTERNAL_TOOL_NAMES.includes(name) && !externalNames.has(name)) {
+        await trace.recordRejected({ name, callId: call.id, reason: "tool_not_allowed", raw: call?.function?.arguments });
         results.push({ call_id: call.id, name, output: "tool_not_allowed" });
         continue;
       }
@@ -743,11 +811,12 @@ async function withTools({ db, env, agent, stream, key, messages, watch }) {
       try {
         args = JSON.parse(String(call?.function?.arguments ?? "{}"));
       } catch {
+        await trace.recordRejected({ name, callId: call.id, reason: "invalid_arguments", raw: call?.function?.arguments });
         results.push({ call_id: call.id, name, output: "invalid_arguments" });
         continue;
       }
-      const scope = { agentId: agent.id, streamId: stream.id, ownerId: agent.owner_id };
-      const output = await executeTool(db, scope, name, args, env)
+      const scope = { agentId: agent.id, streamId: stream.id, ownerId: agent.owner_id, trace };
+      const output = await executeTool(db, scope, name, args, env, { callId: call.id })
         .catch((error) => ({ error: error?.error ?? "tool_failed" }));
       results.push({ call_id: call.id, name, output });
     }

@@ -1,6 +1,7 @@
 // 现场状态：邮箱里正在处理哪条、还排着多少、头像旁的个性签名。
 // 群聊（messages.list 的 presence）和员工详情页（agents.presence）共用这里的查询。
 import { truncate } from "./util.mjs";
+import { lightSteps } from "./steps.mjs";
 
 const MAIL_COLUMNS =
   "id,agent_id,stream_id,message_id,trigger_seq,status,priority,created_at,started_at,finished_at,error,slice_count";
@@ -106,6 +107,14 @@ export async function agentPresence(db, agentId, { streamIds = null } = {}) {
     : [];
   const streamName = new Map(streams.map((row) => [row.id, row.name]));
   const messages = await messageIndex(db, mail.map((row) => row.message_id));
+  // 轨迹轻列：时间线把每封信展开成若干步骤，正文(detail)不在这里给，点开某步再取。
+  const stepRows = await lightSteps(db, mail.map((row) => row.id));
+  const stepsByMail = new Map();
+  for (const row of stepRows) {
+    const bucket = stepsByMail.get(row.mail_id) ?? [];
+    bucket.push(row);
+    stepsByMail.set(row.mail_id, bucket);
+  }
   const active = mail.filter((row) => row.status === "queued" || row.status === "running");
   return {
     profile: agent,
@@ -138,6 +147,7 @@ export async function agentPresence(db, agentId, { streamIds = null } = {}) {
         finished_at: row.finished_at,
         error: row.error,
         slice_count: row.slice_count,
+        steps: (stepsByMail.get(row.id) ?? []).sort((left, right) => Number(left.seq) - Number(right.seq)),
       };
     }),
   };

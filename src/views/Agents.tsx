@@ -8,8 +8,17 @@ import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import { describeError, get, post, type Agent } from "../api";
-import type { AgentPresenceDetail, MailItem, Memory, Skill, Stream } from "../types";
+import { describeCode, describeError, get, post, type Agent } from "../api";
+import type {
+  AgentPresenceDetail,
+  MailItem,
+  Memory,
+  RemoteSkill,
+  Skill,
+  SkillUpdateIssue,
+  SkillUpdateRow,
+  Stream,
+} from "../types";
 import { shortUuid, timeAgo } from "../lib/format";
 import { navigate } from "../lib/route";
 import { AvatarPicker, Field, Notice, PersonAvatar, SectionTitle, TextInput } from "../lib/ui";
@@ -52,6 +61,18 @@ const EMPTY: Draft = {
   status: "active",
 };
 
+/** 搜索结果里的一个可装条目：本地行和远端条目归成同一个形状，装的动作各自走自己的接口。 */
+type SkillHit = {
+  key: string;
+  name: string;
+  summary: string;
+  category: string;
+  version: string;
+  origin: string;
+  installedHere: boolean;
+  install: () => Promise<void>;
+};
+
 export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => Promise<void>; focusAgentId?: string }) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [listLoaded, setListLoaded] = useState(false);
@@ -63,7 +84,12 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
   const [memories, setMemories] = useState<Memory[]>([]);
   const [streams, setStreams] = useState<Stream[]>([]);
   const [marketSkills, setMarketSkills] = useState<Skill[]>([]);
-  const [installSkillId, setInstallSkillId] = useState("");
+  const [remoteHits, setRemoteHits] = useState<RemoteSkill[]>([]);
+  const [skillSearch, setSkillSearch] = useState("");
+  const [updates, setUpdates] = useState<SkillUpdateRow[]>([]);
+  const [updateIssues, setUpdateIssues] = useState<SkillUpdateIssue[]>([]);
+  const [updateCheckedAt, setUpdateCheckedAt] = useState("");
+  const [skillBusy, setSkillBusy] = useState("");
   const [busy, setBusy] = useState(false);
   const [memoryDraft, setMemoryDraft] = useState("");
   const [memoryScope, setMemoryScope] = useState<"common" | "stream">("common");
@@ -157,11 +183,66 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
   }, [selected, agents]);
 
   const streamNames = useMemo(() => new Map(streams.map((stream) => [stream.id, stream.name])), [streams]);
-  const installable = useMemo(
-    () => marketSkills.filter((skill) => !skill.always_on
-      && !(detail?.skills ?? []).some((item) => item.id === skill.id)),
-    [marketSkills, detail],
+  const installedIds = useMemo(
+    () => new Set((detail?.skills ?? []).map((skill) => skill.id)),
+    [detail],
   );
+  const hasRemoteSkills = useMemo(
+    () => (detail?.skills ?? []).some((skill) => skill.source_registry_id),
+    [detail],
+  );
+  const updateById = useMemo(() => new Map(updates.map((row) => [row.skill_id, row])), [updates]);
+
+  // 技能区搜索：本地市场在内存里过滤，远端源要现拉，所以起词后才发请求。
+  useEffect(() => {
+    const needle = skillSearch.trim();
+    if (needle.length < 2) {
+      setRemoteHits([]);
+      return;
+    }
+    let alive = true;
+    const timer = window.setTimeout(() => {
+      void get<{ ok: true; items: RemoteSkill[] }>("skills.remoteList", { q: needle })
+        .then((result) => {
+          if (alive) setRemoteHits(result.items);
+        })
+        .catch((error) => {
+          if (alive) toast.error(describeError(error));
+        });
+    }, 400);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [skillSearch]);
+
+  // 装了远端快照就自动比一次版本，界面上才知道该不该冒「更新」按钮。
+  const checkUpdates = useCallback(async (agentId: string) => {
+    setSkillBusy("check");
+    try {
+      const result = await get<{ ok: true; items: SkillUpdateRow[]; unavailable: SkillUpdateIssue[]; checked_at: string }>(
+        "skills.checkUpdates",
+        { agent_id: agentId },
+      );
+      setUpdates(result.items);
+      setUpdateIssues(result.unavailable);
+      setUpdateCheckedAt(result.checked_at);
+    } catch (error) {
+      toast.error(describeError(error));
+    } finally {
+      setSkillBusy("");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!selected || !hasRemoteSkills) {
+      setUpdates([]);
+      setUpdateIssues([]);
+      setUpdateCheckedAt("");
+      return;
+    }
+    void checkUpdates(selected);
+  }, [selected, hasRemoteSkills, detail, checkUpdates]);
 
   async function loadMemories(agentId: string, scope?: "common" | "stream", streamId?: string): Promise<Memory[]> {
     const result = await get<{ ok: true; items: Memory[] }>("agents.memory.list", {
@@ -170,6 +251,63 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
       stream_id: streamId,
     });
     return result.items;
+  }
+
+  const skillHits: SkillHit[] = useMemo(() => {
+    const needle = skillSearch.trim().toLowerCase();
+    if (needle.length < 2) return [];
+    // 远端源搜到的条目优先：同一源+slug 的本地快照不再单独列，否则一条技能出现两行、装的还是不同版本。
+    const remoteKeys = new Set(remoteHits.map((item) => `${item.registry_id}:${item.slug}`));
+    const local = marketSkills
+      .filter((skill) => !skill.always_on
+        && !remoteKeys.has(`${skill.source_registry_id}:${skill.source_slug}`)
+        && [skill.name, skill.summary, skill.category]
+          .some((value) => String(value ?? "").toLowerCase().includes(needle)))
+      .map((skill): SkillHit => ({
+        key: `local:${skill.id}`,
+        name: skill.name,
+        summary: skill.summary,
+        category: skill.category,
+        version: skill.version ?? "",
+        origin: skill.source === "remote" ? "本地快照" : skill.is_public ? "本地市场" : "仅自己",
+        installedHere: installedIds.has(skill.id),
+        install: async () => {
+          const result = await post<{ ok: true; added?: number; already?: number; duplicate?: boolean }>(
+            "skills.install", { skill_id: skill.id, agent_id: selected });
+          toast.success(result.duplicate || result.added === 0 ? `${skill.name} 已经在这位员工身上` : `已装上 ${skill.name}`);
+        },
+      }));
+    const remote = remoteHits.map((item): SkillHit => ({
+      key: `remote:${item.registry_id}:${item.slug}`,
+      name: item.name,
+      summary: item.summary,
+      category: item.category,
+      version: item.version,
+      origin: item.registry_name,
+      installedHere: Boolean(item.installed_skill_id) && installedIds.has(item.installed_skill_id as string),
+      install: async () => {
+        const result = await post<{ ok: true; skill: Skill }>("skills.remoteInstall", {
+          registry_id: item.registry_id, slug: item.slug, agent_id: selected,
+        });
+        toast.success(`已抄成快照装上 ${result.skill.name} v${result.skill.version ?? "—"}`);
+      },
+    }));
+    return [...local, ...remote];
+  }, [skillSearch, marketSkills, remoteHits, installedIds, selected]);
+
+  async function runInstall(hit: SkillHit) {
+    if (!selected || hit.installedHere) return;
+    setSkillBusy(hit.key);
+    try {
+      await hit.install();
+      await refreshDetail();
+      setSkillSearch("");
+      setRemoteHits([]);
+    } catch (error) {
+      toast.error(describeError(error));
+    } finally {
+      setSkillBusy("");
+    }
   }
 
   async function save() {
@@ -275,29 +413,28 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
     }
   }
 
-  async function installSkill() {
-    if (!selected || !installSkillId) return;
+  async function uninstallSkill(skill: Skill) {
+    if (!selected) return;
     try {
-      const result = await post<{ ok: true; duplicate?: boolean }>("skills.install", {
-        skill_id: installSkillId,
-        agent_id: selected,
-      });
-      toast.success(result.duplicate ? "已经装过这个技能" : "技能已安装");
-      setInstallSkillId("");
+      await post<{ ok: true }>("skills.uninstall", { skill_id: skill.id, agent_id: selected });
+      toast.success("技能已卸载");
       await refreshDetail();
     } catch (error) {
       toast.error(describeError(error));
     }
   }
 
-  async function uninstallSkill(skill: Skill) {
-    if (!selected) return;
+  async function updateSkill(skill: Skill) {
+    setSkillBusy(skill.id);
     try {
-      await post("skills.uninstall", { skill_id: skill.id, agent_id: selected });
-      toast.success("技能已卸载");
+      const result = await post<{ ok: true; skill: Skill; from_version: string; to_version: string }>(
+        "skills.remoteUpdate", { skill_id: skill.id });
+      toast.success(`${skill.name}：v${result.from_version || "—"} → v${result.to_version || "—"}`);
       await refreshDetail();
     } catch (error) {
       toast.error(describeError(error));
+    } finally {
+      setSkillBusy("");
     }
   }
 
@@ -539,66 +676,146 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
               <Notice>
                 技能会作为操作说明写进这个员工的上下文；内置的「WorkStream 平台技能」与
                 「DevStream 群文件与公告」始终启用，
-                带「默认」标记的公共技能在建档时已自动安装。
+                带「默认」标记的公共技能在建档时已自动安装。这里搜到的技能只装给当前这一位。
               </Notice>
-              <div className="flex flex-wrap items-end gap-2">
-                <Field label="安装新技能">
-                  <NativeSelect
-                    className="h-8 w-56 text-xs"
-                    value={installSkillId}
-                    onChange={(event) => setInstallSkillId(event.target.value)}
+              <div className="flex flex-wrap items-center gap-2">
+                <Input
+                  value={skillSearch}
+                  onChange={(event) => setSkillSearch(event.target.value)}
+                  placeholder="搜本地市场和远端技能源…"
+                  className="h-8 w-60 text-xs"
+                />
+                {hasRemoteSkills ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-8 rounded-full text-xs"
+                    disabled={skillBusy === "check"}
+                    onClick={() => void checkUpdates(selected)}
                   >
-                    <NativeSelectOption value="">从市场选择…</NativeSelectOption>
-                    {installable.map((skill) => (
-                      <NativeSelectOption key={skill.id} value={skill.id}>
-                        {skill.name}{skill.is_public ? "" : "（仅自己）"}
-                      </NativeSelectOption>
-                    ))}
-                  </NativeSelect>
-                </Field>
-                <Button
-                  size="sm"
-                  className="h-8 text-xs"
-                  disabled={!installSkillId}
-                  onClick={() => void installSkill()}
-                >
-                  安装
-                </Button>
-                <a href="#/skills" className="text-xs text-signal hover:underline">去 Skill Market →</a>
+                    {skillBusy === "check" ? "比对中…" : "复查版本"}
+                  </Button>
+                ) : null}
+                {updateCheckedAt ? (
+                  <span className="font-mono text-[11px] text-muted-foreground">
+                    版本自查于 {timeAgo(updateCheckedAt)}
+                  </span>
+                ) : null}
+                <a href="#/market/skills" className="ml-auto text-xs text-signal hover:underline">
+                  要装给多个员工 → Market
+                </a>
               </div>
-              <div className="grid gap-1.5">
-                {(detail.skills ?? []).map((skill) => (
-                  <div key={skill.id} className="flex flex-wrap items-center gap-2 rounded-md border px-2.5 py-2">
-                    <span className="min-w-0 flex-1">
-                      <span className="flex items-center gap-1.5 text-sm">
-                        <span className="truncate">{skill.name}</span>
-                        {skill.always_on ? (
-                          <Badge variant="secondary" className="rounded-full bg-signal/12 px-1.5 py-0 text-[10px] leading-4 font-normal text-signal">
-                            内置
-                          </Badge>
-                        ) : skill.is_default ? (
+
+              {skillSearch.trim().length >= 2 && skillHits.length === 0 ? (
+                <p className="text-xs text-muted-foreground">
+                  本地市场和远端技能源里都没有「{skillSearch.trim()}」。换个关键词，或到 Market
+                  的远端技能源里先加一个源。
+                </p>
+              ) : null}
+              {skillHits.length > 0 ? (
+                <div className="ws-surface grid gap-1.5 rounded-xl bg-card p-3">
+                  <p className="text-[11px] font-medium text-muted-foreground">
+                    搜索结果 · 只装给 {detail.agent.name}
+                  </p>
+                  {skillHits.map((hit) => (
+                    <div key={hit.key} className="flex flex-wrap items-center gap-2 rounded-md border px-2.5 py-2">
+                      {/* overflow-hidden 让 nowrap 的摘要不再把栅格列撑出视口。 */}
+                      <span className="min-w-0 flex-1 overflow-hidden">
+                        <span className="flex flex-wrap items-center gap-1.5 text-sm">
+                          <span className="truncate">{hit.name}</span>
+                          {hit.version ? (
+                            <span className="shrink-0 font-mono text-[10px] text-muted-foreground">v{hit.version}</span>
+                          ) : null}
                           <Badge variant="secondary" className="rounded-full px-1.5 py-0 text-[10px] leading-4 font-normal">
-                            默认
+                            {hit.origin}
                           </Badge>
-                        ) : null}
+                        </span>
+                        <span className="line-clamp-2 text-[11px] text-muted-foreground">{hit.summary}</span>
                       </span>
-                      <span className="block truncate text-[11px] text-muted-foreground">{skill.summary}</span>
-                    </span>
-                    <span className="font-mono text-[11px] text-muted-foreground">{skill.category}</span>
-                    {skill.always_on ? (
-                      <span className="text-[11px] text-muted-foreground">始终启用</span>
-                    ) : (
                       <Button
                         size="sm"
-                        variant="ghost"
-                        className="h-7 px-2 text-xs text-destructive"
-                        onClick={() => void uninstallSkill(skill)}
+                        variant="outline"
+                        className="h-7 rounded-full px-2.5 text-[11px]"
+                        disabled={hit.installedHere || (skillBusy !== "" && skillBusy !== "check")}
+                        onClick={() => void runInstall(hit)}
                       >
-                        卸载
+                        {hit.installedHere ? "已装" : skillBusy === hit.key ? "安装中…" : "安装"}
                       </Button>
-                    )}
-                  </div>
-                ))}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              {updateIssues.length > 0 ? (
+                <Notice tone="warn">
+                  {updateIssues.map((issue) => `${issue.name}（${describeCode(issue.reason)}）`).join("；")}
+                  —— 这些远端技能暂时比不了版本，源恢复后再复查。
+                </Notice>
+              ) : null}
+
+              <div className="grid gap-1.5">
+                {(detail.skills ?? []).map((skill) => {
+                  const row = updateById.get(skill.id);
+                  return (
+                    <div key={skill.id} className="flex flex-wrap items-center gap-2 rounded-md border px-2.5 py-2">
+                      <span className="min-w-0 flex-1 overflow-hidden">
+                        <span className="flex flex-wrap items-center gap-1.5 text-sm">
+                          <span className="truncate">{skill.name}</span>
+                          {skill.always_on ? (
+                            <Badge variant="secondary" className="rounded-full bg-signal/12 px-1.5 py-0 text-[10px] leading-4 font-normal text-signal">
+                              内置
+                            </Badge>
+                          ) : skill.is_default ? (
+                            <Badge variant="secondary" className="rounded-full px-1.5 py-0 text-[10px] leading-4 font-normal">
+                              默认
+                            </Badge>
+                          ) : null}
+                          {skill.source === "remote" ? (
+                            <Badge variant="secondary" className="rounded-full px-1.5 py-0 text-[10px] leading-4 font-normal">
+                              远端快照
+                            </Badge>
+                          ) : null}
+                          {row?.update_available ? (
+                            <Badge variant="secondary" className="rounded-full bg-machine-soft px-1.5 py-0 text-[10px] leading-4 font-normal text-machine">
+                              可更新 v{row.latest_version}
+                            </Badge>
+                          ) : null}
+                        </span>
+                        <span className="line-clamp-2 text-[11px] text-muted-foreground">{skill.summary}</span>
+                      </span>
+                      <span className="font-mono text-[11px] text-muted-foreground">{skill.category}</span>
+                      {skill.version ? (
+                        <span className="font-mono text-[11px] text-muted-foreground">v{skill.version}</span>
+                      ) : null}
+                      {skill.always_on ? (
+                        <span className="text-[11px] text-muted-foreground">始终启用</span>
+                      ) : (
+                        <span className="flex items-center gap-1">
+                          {row?.update_available && skill.source_registry_id ? (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-7 rounded-full px-2.5 text-[11px]"
+                              disabled={skillBusy !== "" && skillBusy !== "check"}
+                              onClick={() => void updateSkill(skill)}
+                            >
+                              {skillBusy === skill.id ? "更新中…" : "更新"}
+                            </Button>
+                          ) : null}
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 px-2 text-xs text-destructive"
+                            disabled={skillBusy === skill.id}
+                            onClick={() => void uninstallSkill(skill)}
+                          >
+                            卸载
+                          </Button>
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </TabsContent>
 

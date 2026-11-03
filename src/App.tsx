@@ -12,7 +12,7 @@ import { AuthView, VerifyView } from "./views/Auth";
 import { ChatView } from "./views/chat/ChatView";
 import { StreamsView } from "./views/Streams";
 import { AgentsView } from "./views/Agents";
-import { SkillsView } from "./views/Skills";
+import { MarketView } from "./views/Market";
 import { SchedulerView } from "./views/Scheduler";
 import { InboxView } from "./views/Inbox";
 import { VmsView } from "./views/Vms";
@@ -134,8 +134,8 @@ export default function App() {
     <ChatView key={streamId} streamId={streamId} user={user} myAgents={agents} myVms={vms} />
   ) : section === "agents" ? (
     <AgentsView onChanged={refreshAll} focusAgentId={focusAgentId} />
-  ) : section === "skills" ? (
-    <SkillsView />
+  ) : section === "market" ? (
+    <MarketView tab={route.segments[1] ?? ""} userId={user.id} />
   ) : section === "scheduler" ? (
     <SchedulerView />
   ) : section === "inbox" ? (
@@ -175,7 +175,7 @@ export default function App() {
         <nav className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
           <TopNavLink href="/" label="Stream" active={!section || !!streamId} />
           <TopNavLink href="/agents" label="虚拟员工" count={agents.length} active={section === "agents"} />
-          <TopNavLink href="/skills" label="Skill Market" active={section === "skills"} />
+          <TopNavLink href="/market" label="Market" active={section === "market"} />
           <TopNavLink href="/scheduler" label="调度台" active={section === "scheduler"} />
           <TopNavLink href="/inbox" label="虚拟邮箱" count={unread} active={section === "inbox"} />
           <TopNavLink href="/vms" label="办公虚拟机" count={vms.length} active={section === "vms"} />

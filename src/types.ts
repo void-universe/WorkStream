@@ -44,7 +44,8 @@ export type Skill = {
   name: string;
   summary: string;
   category: string;
-  source: "builtin" | "public" | "upload" | string;
+  source: "builtin" | "public" | "upload" | "remote" | string;
+  version: string | null;
   is_public: boolean;
   is_default: boolean;
   always_on: boolean;
@@ -53,6 +54,105 @@ export type Skill = {
   created_at: string;
   updated_at: string;
   body?: string;
+  /** 远端快照的回指：源被删掉后仍能看出这条是从哪个 registry 的哪个 slug 抄来的。 */
+  source_registry_id?: string | null;
+  source_slug?: string | null;
+};
+
+/** 一次安装的结果：加了几个链接、几个员工本来就有。 */
+export type InstallOutcome = {
+  installed: boolean;
+  scope: "agent" | "all_agents" | string;
+  agents: { agent_id: string; agent_name?: string; duplicate?: boolean }[];
+  added: number;
+  already: number;
+  always_on?: boolean;
+};
+
+/** 主人添加的一个远端技能源：一个可公开访问的 index JSON。 */
+export type SkillRegistry = {
+  id: string;
+  owner_id: string;
+  name: string;
+  index_url: string;
+  skill_count: number;
+  last_error: string | null;
+  skills_at: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type RegistrySkipped = { slug: string; reason: string };
+
+export type RegistryProbe = {
+  items: number;
+  skipped: RegistrySkipped[];
+  skills_at: string | null;
+  error: string | null;
+};
+
+/** skills.remoteList 回带的按源汇总：连不上时只有这个源为空，别的源照常出条目。 */
+export type RegistrySummary = {
+  id: string;
+  name: string;
+  index_url: string;
+  enabled: boolean;
+  error: string | null;
+  skill_count: number;
+  skills_at: string | null;
+  skipped: RegistrySkipped[];
+};
+
+export type RemoteSkill = {
+  slug: string;
+  name: string;
+  summary: string;
+  category: string;
+  version: string;
+  updated_at: string;
+  size: number | null;
+  body_url: string;
+  registry_id: string;
+  registry_name: string;
+  installed_skill_id: string | null;
+  installed_version: string;
+  update_available: boolean;
+};
+
+/** skills.checkUpdates 的单行：某个已装远端快照的版本差。 */
+export type SkillUpdateRow = {
+  skill_id: string;
+  name: string;
+  registry_name: string;
+  current_version: string;
+  latest_version: string;
+  update_available: boolean;
+};
+
+export type SkillUpdateIssue = { skill_id: string; name: string; reason: string };
+
+export type PluginTool = {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+};
+
+/** 一个外部 MCP 连接器：tools 是最近一次 tools/list 的缓存，服务端在模型回路里读的就是它。 */
+export type Plugin = {
+  id: string;
+  owner_id: string;
+  name: string;
+  endpoint: string;
+  auth_tail: string;
+  tools: PluginTool[];
+  tool_count: number;
+  tools_at: string | null;
+  status: "untested" | "ready" | "error" | string;
+  last_error: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
 };
 
 export type Stream = {
@@ -137,6 +237,44 @@ export type AgentPresence = {
   current: PresenceCurrent | null;
 };
 
+/** 轨迹一步的原文。轻列没有这个字段，点开某一步时由 agents.trajectory 带回。 */
+export type RunStepDetail = {
+  model?: string;
+  reasoning?: string;
+  content?: string;
+  context?: string;
+  tool_names?: string;
+  note?: string;
+  args?: string;
+  result?: string;
+  reasoning_clipped?: number;
+  content_clipped?: number;
+  args_clipped?: number;
+  result_clipped?: number;
+  [key: string]: string | number | undefined;
+};
+
+export type RunStep = {
+  id: string;
+  mail_id: string;
+  seq: number;
+  kind: "model" | "tool";
+  status: "running" | "done" | "failed" | "cancelled";
+  name: string | null;
+  call_id: string | null;
+  chars: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  reasoning_tokens: number | null;
+  cached_tokens: number | null;
+  first_token_ms: number | null;
+  duration_ms: number | null;
+  error: string | null;
+  started_at: string;
+  finished_at: string | null;
+  detail?: RunStepDetail;
+};
+
 export type AgentProfileMail = {
   id: string;
   stream_id: string;
@@ -151,6 +289,8 @@ export type AgentProfileMail = {
   finished_at: string | null;
   error: string | null;
   slice_count: number;
+  /** 时间线用的轻列（不含 detail），按 seq 升序。 */
+  steps: RunStep[];
 };
 
 export type AgentPresenceDetail = {
@@ -171,6 +311,24 @@ export type AgentPresenceDetail = {
   streams: { stream_id: string; name: string; role: string; weight: number; queued: number; running: number }[];
   current: PresenceCurrent | null;
   queue: AgentProfileMail[];
+};
+
+export type TrajectoryResponse = {
+  ok: true;
+  mail: {
+    id: string;
+    agent: { id: string; name: string; role: string } | null;
+    stream: { id: string; name: string };
+    status: "queued" | "running" | "done" | "failed" | "cancelled";
+    error: string | null;
+    trigger_seq: number;
+    slice_count: number;
+    started_at: string | null;
+    finished_at: string | null;
+    trigger_preview: string;
+  };
+  steps: RunStep[];
+  schemas: { name: string; parameters: Record<string, unknown> }[];
 };
 
 export type GroupFile = {

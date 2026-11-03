@@ -280,8 +280,14 @@ function upstreamCode(error) {
 export async function chatCompletion({
   baseUrl, apiKey, model, messages, tools, maxTokens, timeoutMs = 120000, summary, onInterrupt,
 }) {
-  if (baseUrl === "demo://local") return demoComplete({ messages, tools, summary, onInterrupt });
-  const body = { model, messages, stream: true };
+  if (baseUrl === "demo://local") {
+    // 演示模型不联网：没有真实思考链和用量，字段一律留空，前端据此标注"演示模型不回报"，
+    // 而不是编一个数字让轨迹看起来像真的。
+    const result = demoComplete({ messages, tools, summary });
+    return { reasoning: "", usage: null, finish_reason: null, first_token_ms: null, ...result };
+  }
+  const started = Date.now();
+  const body = { model, messages, stream: true, stream_options: { include_usage: true } };
   if (maxTokens) body.max_tokens = maxTokens;
   if (tools?.length) {
     body.tools = tools;
@@ -308,18 +314,35 @@ export async function chatCompletion({
     error.code = "upstream_bad_json";
     throw error;
   }
-  return readUpstreamStream(response.body, { onInterrupt });
+  return readUpstreamStream(response.body, { onInterrupt, started });
 }
 
 const IDLE_MS = 800;
 
+/** OpenAI 用量对象 → 我们要落库的四个数；缺字段就留 null，不拿 0 冒充"没用 token"。 */
+function normalizeUsage(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const pick = (...values) => values.find((value) => Number.isFinite(Number(value))) ?? null;
+  return {
+    input: pick(raw.prompt_tokens),
+    output: pick(raw.completion_tokens),
+    total: pick(raw.total_tokens),
+    cached: pick(raw.prompt_tokens_details?.cached_tokens),
+    reasoning: pick(raw.completion_tokens_details?.reasoning_tokens),
+  };
+}
+
 /** 解析 `data:` 分片，累加正文与按 index 拼接的工具参数；每次拿到数据或上游静默时检查插话。 */
-async function readUpstreamStream(stream, { onInterrupt }) {
+async function readUpstreamStream(stream, { onInterrupt, started }) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   const toolCalls = new Map();
   let buffer = "";
   let content = "";
+  let reasoning = "";
+  let usage = null;
+  let finishReason = null;
+  let firstTokenMs = null;
   let inflight = null;
   const ensureRead = () => {
     if (!inflight) inflight = reader.read().then((result) => { inflight = null; return result; });
@@ -344,8 +367,18 @@ async function readUpstreamStream(stream, { onInterrupt }) {
       error.status = Number(parsed.error.code) >= 100 && Number(parsed.error.code) < 600 ? Number(parsed.error.code) : 502;
       throw error;
     }
-    const delta = parsed?.choices?.[0]?.delta;
+    const choice = parsed?.choices?.[0];
+    const delta = choice?.delta;
+    // 首字延迟按“第一个有用增量”算：思考链模型的增量先于正文，正文之前的等待同样是用户等到的延迟。
+    const thinking = typeof delta?.reasoning_content === "string"
+      ? delta.reasoning_content
+      : (typeof delta?.reasoning === "string" ? delta.reasoning : "");
+    const token = (typeof delta?.content === "string" ? delta.content.length : 0) + thinking.length;
+    if (firstTokenMs === null && token > 0) firstTokenMs = Date.now() - started;
     if (typeof delta?.content === "string") content += delta.content;
+    reasoning += thinking;
+    if (choice?.finish_reason) finishReason = choice.finish_reason;
+    if (parsed?.usage) usage = normalizeUsage(parsed.usage);
     for (const call of delta?.tool_calls ?? []) {
       const index = Number(call?.index ?? 0);
       const slot = toolCalls.get(index) ?? { id: "", name: "", arguments: "" };
@@ -384,12 +417,15 @@ async function readUpstreamStream(stream, { onInterrupt }) {
   return {
     mode: "openai",
     content,
+    reasoning,
+    finish_reason: finishReason,
+    first_token_ms: firstTokenMs,
     tool_calls: calls.map((slot) => ({
       id: slot.id || `call_${newId().slice(0, 8)}`,
       type: "function",
       function: { name: slot.name, arguments: slot.arguments || "{}" },
     })),
-    usage: null,
+    usage,
   };
 }
 

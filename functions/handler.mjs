@@ -4,18 +4,22 @@ import { actions as agents } from "./agents.mjs";
 import { actions as chat } from "./chat.mjs";
 import { actions as engine } from "./engine.mjs";
 import { handleMcp } from "./mcp.mjs";
+import { actions as plugins } from "./plugins.mjs";
+import { actions as registries } from "./registries.mjs";
 import { actions as rooms } from "./rooms.mjs";
 import { bindEnv, readEnv, smtpEndpoint } from "./runtime.mjs";
 import { actions as skills } from "./skills.mjs";
 import { store } from "./store.mjs";
+import { actions as trajectory } from "./trajectory.mjs";
 import { Halt, fail, json, now, sha256Hex, text } from "./util.mjs";
 import { actions as vms } from "./vms.mjs";
 
+// auth.resend 要用调用者自己的身份重发验证信，不能当公开路由（公开时 user 为空，直接 500）。
 const PUBLIC = new Set([
-  "auth.register", "auth.verify", "auth.login", "auth.resend", "mcp", "site.meta",
+  "auth.register", "auth.verify", "auth.login", "mcp", "site.meta",
 ]);
 
-const ROUTES = { ...accounts, ...agents, ...rooms, ...chat, ...engine, ...vms, ...skills };
+const ROUTES = { ...accounts, ...agents, ...rooms, ...chat, ...engine, ...vms, ...skills, ...registries, ...plugins, ...trajectory };
 
 async function siteMeta({ db, env }) {
   void db;

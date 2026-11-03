@@ -3,9 +3,10 @@
 import { Halt, json, newId, now, text, truncate, uuid } from "./util.mjs";
 
 export const SKILL_COLUMNS =
-  "id,owner_id,name,summary,category,source,is_public,is_default,always_on,downloads,installs,created_at,updated_at";
+  "id,owner_id,name,summary,category,source,version,is_public,is_default,always_on,downloads,installs,created_at,updated_at,source_registry_id,source_slug";
 const SKILL_FULL_COLUMNS = `${SKILL_COLUMNS},body`;
-const MAX_BODY = 20000;
+/** 技能正文的字符上限；远端快照也走同一个闸，超了就拒收而不是截断。 */
+export const MAX_BODY = 20000;
 
 /** 内置平台技能：固定 id，永远可用、不可卸载、不占市场表。 */
 export const PLATFORM_SKILL = {
@@ -236,12 +237,13 @@ export async function skillPrompt(db, agentId, maxChars = 6000) {
   return parts.join("\n\n");
 }
 
-/** 新员工建档时自动安装所有 is_default 的公共技能。 */
+/** 新员工建档时自动安装默认技能：公共默认技能 + 主人自己标成默认的那些（含远端快照）。 */
 export async function installDefaultSkillsFor(db, agentId, userId) {
   await ensureSeedSkills(db);
-  const defaults = await db.skills.list([["is_public", true], ["is_default", true]], {
-    columns: "id,installs", limit: 50,
+  const rows = await db.skills.list([["is_default", true]], {
+    columns: "id,owner_id,is_public,installs", limit: 100,
   });
+  const defaults = rows.filter((row) => row.is_public || row.owner_id === userId);
   if (!defaults.length) return;
   await db.agent_skills.insertMany(defaults.map((skill) => ({
     id: newId(),
@@ -258,7 +260,8 @@ export async function installDefaultSkillsFor(db, agentId, userId) {
   }
 }
 
-async function ownedAgent(db, userId, agentId) {
+/** 主人对自己的员工才能装/卸技能；员工详情页与 Market 共用这道闸。 */
+export async function ownedAgent(db, userId, agentId) {
   const agent = await db.agents.byId(uuid(agentId, "agent_id"), { columns: "id,owner_id,name" });
   if (!agent) throw new Halt("agent_not_found", 404);
   if (agent.owner_id !== userId) throw new Halt("agent_not_owned", 403);
@@ -274,9 +277,8 @@ async function visibleSkill(db, user, id) {
   return row;
 }
 
-async function linkSkill(db, user, skill, agentId) {
-  if (skill.always_on) return { installed: true, always_on: true };
-  const agent = await ownedAgent(db, user.id, agentId);
+/** 装一个链接，不碰计数：批量安装时要在外层汇总后一次性加，否则多次写会互相覆盖。 */
+async function linkToAgent(db, user, skill, agent) {
   const existing = await db.agent_skills.first([
     ["agent_id", agent.id], ["skill_id", skill.id],
   ], { columns: "id" });
@@ -290,10 +292,65 @@ async function linkSkill(db, user, skill, agentId) {
     updated_at: now(),
   }, { columns: "id" });
   if (!created) throw new Halt("skill_install_failed", 503);
-  await db.skills.patch([["id", skill.id]], {
-    installs: Number(skill.installs ?? 0) + 1, updated_at: now(),
-  });
   return { installed: true, agent_id: agent.id, agent_name: agent.name };
+}
+
+/** 按新增链接数回读一次再累加，避免用调用方手里的旧快照做算术。 */
+async function bumpInstalls(db, skillId, by) {
+  if (!(by > 0)) return;
+  const row = await db.skills.byId(skillId, { columns: "id,installs" });
+  if (!row) return;
+  await db.skills.patch([["id", skillId]], {
+    installs: Number(row.installs ?? 0) + by, updated_at: now(),
+  });
+}
+
+async function linkSkill(db, user, skill, agentId) {
+  if (skill.always_on) return { installed: true, always_on: true };
+  const agent = await ownedAgent(db, user.id, agentId);
+  const result = await linkToAgent(db, user, skill, agent);
+  if (!result.duplicate) await bumpInstalls(db, skill.id, 1);
+  return result;
+}
+
+/**
+ * 安装目标：单个员工，或主人名下全部现有员工。
+ * 内置技能 always_on 本来就对每个员工生效，装与不装是同一个结果。
+ */
+export async function installSkillTargets(db, user, skill, body = {}) {
+  if (skill.always_on) return { installed: true, always_on: true, scope: "all_agents", agents: [], added: 0, already: 0 };
+  const all = Boolean(body.all_agents);
+  const agents = all
+    ? await db.agents.list([["owner_id", user.id]], {
+      columns: "id,name", order: ["created_at", { ascending: true }], limit: 100,
+    })
+    : [await ownedAgent(db, user.id, body.agent_id)];
+  if (!agents.length) throw new Halt("no_agents_to_install", 400);
+  const results = [];
+  for (const agent of agents) results.push(await linkToAgent(db, user, skill, agent));
+  const added = results.filter((result) => !result.duplicate).length;
+  await bumpInstalls(db, skill.id, added);
+  return {
+    installed: true,
+    scope: all ? "all_agents" : "agent",
+    agents: results.map((result, index) => ({
+      agent_id: agents[index].id,
+      agent_name: agents[index].name,
+      duplicate: Boolean(result.duplicate),
+    })),
+    added,
+    already: results.length - added,
+  };
+}
+
+/** "包括未来创建的员工"= 标成该主人的默认技能；建档时 installDefaultSkillsFor 会自动装上。 */
+export async function markFutureDefault(db, user, skill) {
+  if (skill.always_on) return { is_default: true, always_on: true };
+  if (skill.owner_id !== user.id) throw new Halt("skill_not_owned", 403);
+  if (skill.is_default) return { is_default: true, duplicate: true };
+  const patched = await db.skills.patch([["id", skill.id]], { is_default: true, updated_at: now() });
+  if (!patched) throw new Halt("skill_update_failed", 503);
+  return { is_default: true };
 }
 
 export const actions = {
@@ -319,10 +376,11 @@ export const actions = {
     const name = text(body.name, { max: 60, name: "skill_name" });
     const summary = text(body.summary, { max: 300, name: "skill_summary" });
     const category = text(body.category || "协作", { max: 20, name: "skill_category" });
+    const version = text(body.version, { max: 24, name: "skill_version", required: false });
     const content = text(body.body, { max: MAX_BODY, name: "skill_body" });
     const isPublic = Boolean(body.is_public);
-    const isDefault = isPublic && Boolean(body.is_default);
-    if (body.is_default && !isPublic) throw new Halt("invalid_skill_flags", 400);
+    // 默认技能对"以后新建的员工"生效：公共默认影响所有人，私有默认只影响主人自己。
+    const isDefault = Boolean(body.is_default);
     const created = await db.skills.insert({
       id: newId(),
       owner_id: user.id,
@@ -330,6 +388,7 @@ export const actions = {
       summary,
       category,
       body: content,
+      version: version || null,
       source: "upload",
       is_public: isPublic,
       is_default: isDefault,
@@ -340,16 +399,31 @@ export const actions = {
       updated_at: now(),
     }, { columns: SKILL_COLUMNS });
     if (!created) throw new Halt("skill_upload_failed", 503);
-    const installed = body.agent_id
-      ? await linkSkill(db, user, created, body.agent_id)
+    const installed = body.agent_id || body.all_agents
+      ? await installSkillTargets(db, user, created, body)
       : null;
-    return json({ ok: true, skill: created, install: installed });
+    const future = body.include_future ? await markFutureDefault(db, user, created) : null;
+    return json({ ok: true, skill: created, install: installed, future });
   },
 
   async "skills.install"({ db, user, body }) {
     const skill = await visibleSkill(db, user, uuid(body.skill_id, "skill_id"));
-    const install = await linkSkill(db, user, skill, body.agent_id);
-    return json({ ok: true, ...install, skill: { id: skill.id, name: skill.name } });
+    const install = await installSkillTargets(db, user, skill, body);
+    const future = body.include_future ? await markFutureDefault(db, user, skill) : null;
+    return json({ ok: true, ...install, future, skill: { id: skill.id, name: skill.name } });
+  },
+
+  /** 取消"未来员工也装"：把主人自己的技能从默认里摘掉。 */
+  async "skills.setDefault"({ db, user, body }) {
+    const skill = await visibleSkill(db, user, uuid(body.skill_id, "skill_id"));
+    if (skill.always_on) throw new Halt("builtin_skill_locked", 400);
+    if (skill.owner_id !== user.id) throw new Halt("skill_not_owned", 403);
+    const isDefault = Boolean(body.is_default);
+    if (skill.is_default !== isDefault) {
+      const patched = await db.skills.patch([["id", skill.id]], { is_default: isDefault, updated_at: now() });
+      if (!patched) throw new Halt("skill_update_failed", 503);
+    }
+    return json({ ok: true, skill: { ...skill, is_default: isDefault } });
   },
 
   async "skills.uninstall"({ db, user, body }) {

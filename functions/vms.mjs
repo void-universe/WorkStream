@@ -65,7 +65,8 @@ export const actions = {
     const vm = await db.vms.byId(id, { columns: "id,owner_id" });
     if (!vm) throw new Halt("vm_not_found", 404);
     if (vm.owner_id !== user.id) throw new Halt("vm_not_owned", 403);
-    await db.stream_vms.patch([["vm_id", id]], { level: "revoked", updated_at: now() });
+    // 机器没了，各群的授权行一起删掉；留着 level="revoked" 没有读者，只会在列表里挂幽灵行。
+    await db.stream_vms.removeAll([["vm_id", id]]);
     const removed = await db.vms.remove([["id", id], ["owner_id", user.id]]);
     if (!removed) throw new Halt("vm_delete_failed", 503);
     return json({ ok: true, id: removed });

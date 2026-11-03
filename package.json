@@ -17,6 +17,7 @@
     "smoke": "node dev/smoke.mjs",
     "bench": "node dev/bench.mjs",
     "check:schema": "node dev/check-schema.mjs",
+    "dev:registry": "node dev/fixture-registry.mjs",
     "qa": "node scripts/check-node.mjs && node dev/check-schema.mjs && node dev/smoke.mjs",
     "seed": "node dev/seed-demo.mjs"
   },

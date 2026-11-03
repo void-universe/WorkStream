@@ -6,9 +6,12 @@ import { join } from "node:path";
 import { createServer } from "node:http";
 import { makeHandler } from "../functions/handler.mjs";
 import { serveSite } from "../functions/adapter.mjs";
-import { executeTool } from "../functions/mcp.mjs";
+import { executeTool, INTERNAL_TOOL_NAMES } from "../functions/mcp.mjs";
+import { connectorToolDefs } from "../functions/plugins.mjs";
+import { isUpdateAvailable } from "../functions/registries.mjs";
 import { skillPrompt } from "../functions/skills.mjs";
 import { store } from "../functions/store.mjs";
+import { closeOrphanSteps, createStepWriter } from "../functions/steps.mjs";
 import { createFixtureClient } from "./fixture-supabase.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "ws-smoke-"));
@@ -82,12 +85,29 @@ function startMockUpstream() {
         `data: ${JSON.stringify({ id: "mock", choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`,
       );
       const alive = () => !res.destroyed && !res.writableEnded;
+      // 思考链增量 + 只在请求带了 stream_options.include_usage 时才补的用量块：
+      // 两者一起验“我们有发、有收”，不然轨迹里的用量列会悄悄全是空。
+      const think = (text) => { if (alive()) send({ reasoning_content: text }); };
+      const usageChunk = () => {
+        if (!alive() || body.stream_options?.include_usage !== true) return;
+        res.write(`data: ${JSON.stringify({
+          id: "mock",
+          choices: [],
+          usage: {
+            prompt_tokens: 812, completion_tokens: 24, total_tokens: 836,
+            prompt_tokens_details: { cached_tokens: 640 },
+            completion_tokens_details: { reasoning_tokens: 9 },
+          },
+        })}\n\n`);
+      };
       const finish = () => {
         if (!alive()) return;
+        usageChunk();
         res.write("data: [DONE]\n\n");
         res.end();
       };
       const say = async (text, gap = 30) => {
+        think("先想一步再动笔。");
         for (const piece of Array.from(text)) {
           if (!alive()) return;
           send({ content: piece });
@@ -97,6 +117,7 @@ function startMockUpstream() {
       };
       // 除“慢慢写”“插话重答”两条剧本外，其余一次写完，免得自检被人为拖慢。
       const sayFast = (text) => {
+        think("先看上下文，再定结论。");
         send({ content: text });
         send({}, "stop");
         finish();
@@ -108,12 +129,13 @@ function startMockUpstream() {
       const trig = String(system.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "");
       if (trig.includes("突发甲")) { sayFast("回甲已落群"); return; }
       if (trig.includes("突发乙")) { sayFast("回乙已落群"); return; }
-      if (system.includes("慢慢写")) { await say("正在慢慢写这段长正文", 140); return; }
+      if (trig.includes("慢慢写")) { await say("正在慢慢写这段长正文", 140); return; }
       if (Array.isArray(last?.content) && last.content.some((part) => part.type === "image_url")) {
         sayFast("图里是一块红色的方砖。");
         return;
       }
-      if (body.tools?.length && !body.messages.some((m) => m.role === "tool") && system.includes("查历史")) {
+      if (body.tools?.length && !body.messages.some((m) => m.role === "tool") && trig.includes("查历史")) {
+        think("这条要查历史，先调 search_history。");
         send({ tool_calls: [{ index: 0, id: "call_mock_1", type: "function", function: { name: "search_history" } }] });
         await sleep(10);
         for (const piece of ['{"query":', '"发布清单","limit":5}']) {
@@ -124,6 +146,33 @@ function startMockUpstream() {
         finish();
         return;
       }
+      // 模型编出清单外的工具名：第一轮照样发 tool_calls，第二轮才收敛成正文。
+      if (body.tools?.length && !body.messages.some((m) => m.role === "tool") && trig.includes("轨迹越界工具")) {
+        send({ tool_calls: [{ index: 0, id: "call_ghost_1", type: "function", function: { name: "drop_table" } }] });
+        await sleep(5);
+        send({ tool_calls: [{ index: 0, function: { arguments: '{"x":1}' } }] });
+        send({}, "tool_calls");
+        finish();
+        return;
+      }
+      if (trig.includes("轨迹越界工具")) {
+        think("清单里没有这个工具，我直接按现有信息回答。");
+        send({ content: "那个工具不在清单里，我按现有信息回答。" });
+        send({}, "stop");
+        finish();
+        return;
+      }
+      // 主人接了外部插件：第一轮点它带进来的工具，第二轮才成正文。
+      if (body.tools?.length && !body.messages.some((m) => m.role === "tool") && trig.includes("插件天气")) {
+        think("清单里多了个外部工具，先调它。");
+        send({ tool_calls: [{ index: 0, id: "call_plugin_1", type: "function", function: { name: "get_weather" } }] });
+        await sleep(5);
+        send({ tool_calls: [{ index: 0, function: { arguments: '{"city":"杭州"}' } }] });
+        send({}, "tool_calls");
+        finish();
+        return;
+      }
+      if (trig.includes("插件天气")) { sayFast("杭州晴 26 度，已经报回群里。"); return; }
       if (body.tools?.length) { sayFast("查到 3 条历史记录，已按时间排好。"); return; }
       sayFast("收到，我按上下文回应。");
     });
@@ -133,6 +182,181 @@ function startMockUpstream() {
       resolve({
         port: server.address().port,
         seen,
+        close: () => new Promise((done) => { server.close(() => done()); }),
+      });
+    });
+  });
+}
+
+/**
+ * 本机假的外部 MCP 服务：JSON-RPC over HTTP 的 initialize / tools/list / tools/call，
+ * 外加几条坏路径（非 JSON、超大回包、401）和 404，用来验客户端的各条失败分支。
+ * headers / calls 记下真实收到的东西，好让断言落在“对方确实接到了什么”上。
+ */
+function startMockConnector() {
+  const headers = [];
+  const calls = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const reply = (result) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result }));
+      };
+      res.on("error", () => {});
+      const path = new URL(req.url, "http://local").pathname;
+      if (path === "/bad") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("这不是 JSON");
+        return;
+      }
+      if (path === "/huge") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { tools: Array.from({ length: 30 }, (_, i) => ({
+            name: `big_${i}`, description: "字".repeat(25000), inputSchema: { type: "object", properties: {} },
+          })) },
+        }));
+        return;
+      }
+      if (path === "/deny") {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end("{}");
+        return;
+      }
+      if (path !== "/mcp") {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end("{}");
+        return;
+      }
+      let message = null;
+      try {
+        message = JSON.parse(raw);
+      } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end("{}");
+        return;
+      }
+      headers.push(req.headers.authorization ?? "");
+      const params = message.params ?? {};
+      if (message.method === "initialize") {
+        reply({ protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "mock-connector", version: "1" } });
+        return;
+      }
+      if (message.method === "tools/list") {
+        reply({ tools: [
+          { name: "get_weather", description: "查一个城市今天的天气", inputSchema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } },
+          { name: "search_history", description: "和内置工具重名的外部工具", inputSchema: { type: "object", properties: {} } },
+          { name: "long_text", description: "回一段超长正文", inputSchema: { type: "object", properties: {} } },
+          { name: "boom", description: "外部服务自己报错", inputSchema: { type: "object", properties: {} } },
+          { name: "bad name!", description: "名字不合 OpenAI 的规矩", inputSchema: { type: "object", properties: {} } },
+          { name: "no_schema", description: "没有入参声明" },
+          { name: "get_weather", description: "同名再来一次", inputSchema: { type: "object", properties: {} } },
+        ] });
+        return;
+      }
+      if (message.method === "tools/call") {
+        calls.push(params);
+        if (params.name === "boom") { reply({ isError: true, content: [{ type: "text", text: "外部服务炸了" }] }); return; }
+        if (params.name === "long_text") { reply({ content: [{ type: "text", text: "天".repeat(7000) }] }); return; }
+        reply({ content: [
+          { type: "text", text: `${params.arguments?.city ?? "?"}：晴 26 度` },
+          { type: "text", text: "风力 2 级" },
+        ] });
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32601, message: "unknown method" } }));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        port: server.address().port,
+        headers,
+        calls,
+        close: () => new Promise((done) => { server.close(() => done()); }),
+      });
+    });
+  });
+}
+
+/**
+ * 本机假技能源：一个 index JSON 加若干正文，同时覆盖合法条目、各种坏条目和正文层面的坑。
+ * state 可以中途改：改版本号用来验"有更新"，隐藏 slug 用来验"源上已撤下"。
+ */
+function startMockRegistry() {
+  const requests = [];
+  const state = { version: "1.2.0", hidden: [], body: "# 发布前检查\n- 备份\n- 灰度" };
+  const entry = (slug, extra = {}) => ({
+    slug,
+    name: `${slug} 技能`,
+    summary: "一条用于自检的技能",
+    category: "交付",
+    version: state.version,
+    updated_at: "2026-01-02T00:00:00.000Z",
+    body_url: `/skills/${slug}.md`,
+    size: 30,
+    ...extra,
+  });
+  const buildIndex = () => ({
+    schema: 1,
+    name: "社区技能源",
+    skills: [
+      entry("release-check"),
+      entry("Standup Note"), // slug 不合规矩
+      entry("no-name", { name: "" }), // 没有名字
+      entry("elsewhere", { body_url: "https://elsewhere.example.com/x.md" }), // 正文跨了源
+      entry("no-body", { body_url: "" }), // 没有正文地址
+      entry("release-check", { name: "重复一条" }), // 重复 slug
+      entry("too-large", { body_url: "/skills/huge.md" }),
+      entry("empty-body", { body_url: "/skills/empty.md" }),
+      entry("binary-body", { body_url: "/skills/bin.dat" }),
+      entry("long-body", { body_url: "/skills/long.md" }),
+    ].filter((item) => !state.hidden.includes(item.slug)),
+  });
+  const server = createServer((req, res) => {
+    const path = new URL(req.url, "http://local").pathname;
+    requests.push(path);
+    res.on("error", () => {});
+    const send = (type, body) => {
+      res.writeHead(200, { "content-type": type });
+      res.end(body);
+    };
+    if (path === "/index.json") return send("application/json", JSON.stringify(buildIndex()));
+    if (path === "/many.json") {
+      return send("application/json", JSON.stringify({
+        schema: 1,
+        skills: Array.from({ length: 205 }, (_, i) => entry(`many-${i}`)),
+      }));
+    }
+    if (path === "/bad.json") return send("application/json", "这不是 JSON");
+    if (path === "/schema2.json") return send("application/json", JSON.stringify({ schema: 2, skills: [] }));
+    if (path === "/deny.json") {
+      res.writeHead(401, { "content-type": "application/json" });
+      return res.end("{}");
+    }
+    if (path === "/move.json") {
+      res.writeHead(302, { location: "/index.json" });
+      return res.end();
+    }
+    if (path === "/skills/huge.md") return send("text/plain; charset=utf-8", "x".repeat(210000));
+    if (path === "/skills/empty.md") return send("text/plain; charset=utf-8", "   \n  ");
+    if (path === "/skills/bin.dat") return send("application/octet-stream", "一段二进制");
+    if (path === "/skills/long.md") return send("text/plain; charset=utf-8", "字".repeat(20001));
+    if (path.startsWith("/skills/")) return send("text/plain; charset=utf-8", state.body);
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("not found");
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        port: server.address().port,
+        requests,
+        state,
         close: () => new Promise((done) => { server.close(() => done()); }),
       });
     });
@@ -745,6 +969,1023 @@ async function main() {
   const customHeader = await viaSite({ "x-workstream-token": ana });
   check("自定义令牌头能穿过适配层完成鉴权",
     customHeader.payload?.ok === true && customHeader.payload?.user?.email === "ana@example.com", customHeader.payload);
+
+  step("12. 群管理面：改名与进群设置");
+  const g1 = await call("streams.create", { token: ana, body: { name: "临时协调组", agent_ids: [agentId] } });
+  const g1id = g1.payload.stream?.id;
+  check("为管理面测试新建一个群", Boolean(g1id), g1.payload);
+  const x12Rename = await call("streams.rename", { token: ana, body: { stream_id: g1id, name: "改过名字的协调组" } });
+  const x12RenameRead = await call("streams.get", { token: ana, method: "GET", body: { id: g1id } });
+  check("streams.rename：群主改名后详情回读", x12Rename.payload.name === "改过名字的协调组"
+    && x12RenameRead.payload.stream?.name === "改过名字的协调组", x12Rename.payload);
+  const x12Long = await call("streams.rename", { token: ana, body: { stream_id: g1id, name: "长".repeat(21) } });
+  check("streams.rename：名字超限被拒", x12Long.status === 400 && x12Long.payload.error === "invalid_name", x12Long.payload);
+  const x12Outsider = await call("streams.rename", { token: deeToken, body: { stream_id: g1id, name: "外人改名" } });
+  check("streams.rename：非成员改不了群名", x12Outsider.status === 403, x12Outsider.payload);
+  const x12SetByOther = await call("streams.settings", { token: bToken, body: { stream_id: g1id, context_chars: 4000 } });
+  check("streams.settings：只有群主能改（管理员也不行）", x12SetByOther.status === 403
+    && x12SetByOther.payload.error === "owner_only", x12SetByOther.payload);
+  const x12Tiny = await call("streams.settings", { token: ana, body: { stream_id: g1id, context_chars: 1999 } });
+  check("streams.settings：预算低于 2000 被拒", x12Tiny.status === 400
+    && x12Tiny.payload.error === "invalid_context_chars", x12Tiny.payload);
+  const x12Policy = await call("streams.settings", { token: ana, body: { stream_id: g1id, join_policy: "anyone" } });
+  check("streams.settings：非法进群方式被拒", x12Policy.status === 400
+    && x12Policy.payload.error === "invalid_join_policy", x12Policy.payload);
+  const x12Peek = await call("streams.settings", { token: ana, body: { stream_id: g1id } });
+  check("streams.settings：空请求体只回读不改设置", x12Peek.payload.ok === true
+    && x12Peek.payload.context_chars === 200000 && x12Peek.payload.join_policy === undefined, x12Peek.payload);
+  const x12Set = await call("streams.settings", { token: ana, body: { stream_id: g1id, context_chars: 6000, join_policy: "invite_only" } });
+  const x12SetRead = await call("streams.get", { token: ana, method: "GET", body: { id: g1id } });
+  check("streams.settings：预算与进群方式真的落库", x12Set.payload.ok === true
+    && x12SetRead.payload.stream?.context_chars === 6000
+    && x12SetRead.payload.stream?.join_policy === "invite_only", { 写: x12Set.payload, 读: x12SetRead.payload.stream });
+  const x12Apply = await call("streams.apply", { token: deeToken, body: { stream_uuid: g1id } });
+  check("切成仅邀请后，拿 UUID 申请被拒", x12Apply.status === 409 && x12Apply.payload.error === "invite_only", x12Apply.payload);
+
+  step("13. 邀请闭环：待办、接受、拒绝与越权");
+  const cyToken = (await call("auth.login", { body: { email: "cy@example.com", password: "passw0rd-9" } })).payload.token;
+  const x13Invite = await call("streams.invite", { token: ana, body: { stream_id: g1id, email: "bo@example.com" } });
+  check("streams.invite：群主邀请 Bo 进临时群", x13Invite.payload.email === "bo@example.com", x13Invite.payload);
+  const x13Dup = await call("streams.invite", { token: ana, body: { stream_id: g1id, email: "bo@example.com" } });
+  check("streams.invite：重复邀请短路，不落第二封", x13Dup.payload.duplicate === true, x13Dup.payload);
+  const x13BadEmail = await call("streams.invite", { token: ana, body: { stream_id: g1id, email: "not-an-email" } });
+  check("streams.invite：非法邮箱被拒", x13BadEmail.status === 400 && x13BadEmail.payload.error === "invalid_email", x13BadEmail.payload);
+  const x13StrangerInvite = await call("streams.invite", { token: bToken, body: { stream_id: g1id, email: "ed@example.com" } });
+  check("streams.invite：还不是成员的人发不出邀请", x13StrangerInvite.status === 403, x13StrangerInvite.payload);
+  const x13DeeList = await call("streams.invites.mine", { token: deeToken });
+  check("streams.invites.mine：没被邀请的人待办为空", (x13DeeList.payload.items ?? []).length === 0, x13DeeList.payload);
+  const x13BoList = await call("streams.invites.mine", { token: bToken });
+  const boG1Invite = (x13BoList.payload.items ?? []).find((row) => row.stream_id === g1id);
+  check("streams.invites.mine：待办里出现邀请并带上改后的群名", boG1Invite?.stream_name === "改过名字的协调组", x13BoList.payload);
+  const x13Decline = await call("streams.invites.decline", { token: bToken, body: { request_id: boG1Invite?.id } });
+  check("streams.invites.decline：Bo 拒绝邀请", x13Decline.payload.ok === true, x13Decline.payload);
+  const x13AcceptAfterDecline = await call("streams.invites.accept", { token: bToken, body: { request_id: boG1Invite?.id } });
+  check("拒绝之后不能再接受", x13AcceptAfterDecline.status === 409
+    && x13AcceptAfterDecline.payload.error === "request_handled", x13AcceptAfterDecline.payload);
+  const x13BoList2 = await call("streams.invites.mine", { token: bToken });
+  check("拒绝后待办里不再有这封", !(x13BoList2.payload.items ?? []).some((row) => row.id === boG1Invite?.id), x13BoList2.payload);
+  const x13Reinvite = await call("streams.invite", { token: ana, body: { stream_id: g1id, email: "bo@example.com" } });
+  check("拒绝后群主能再邀一次（旧的 rejected 不挡路）", x13Reinvite.payload.ok === true
+    && x13Reinvite.payload.duplicate !== true, x13Reinvite.payload);
+  const boG1Invite2 = (await call("streams.invites.mine", { token: bToken })).payload.items
+    ?.find((row) => row.stream_id === g1id);
+  const x13BoAccept = await call("streams.invites.accept", { token: bToken, body: { request_id: boG1Invite2?.id } });
+  const x13BoRead = await call("streams.get", { token: bToken, method: "GET", body: { id: g1id } });
+  check("streams.invites.accept：Bo 接受后成为成员", x13BoAccept.payload.stream_id === g1id
+    && x13BoRead.payload.my_role === "member", { 接受: x13BoAccept.payload, 读: x13BoRead.payload.my_role });
+  const x13DupAccept = await call("streams.invites.accept", { token: bToken, body: { request_id: boG1Invite2?.id } });
+  check("重复接受被拒", x13DupAccept.status === 409 && x13DupAccept.payload.error === "request_handled", x13DupAccept.payload);
+  const x13Steal = await call("streams.invites.accept", { token: deeToken, body: { request_id: boG1Invite2?.id } });
+  check("别人不能拿他人的邀请进群", x13Steal.status === 404 && x13Steal.payload.error === "invite_not_found", x13Steal.payload);
+  const x13StealDecline = await call("streams.invites.decline", { token: deeToken, body: { request_id: boG1Invite2?.id } });
+  check("别人也不能替他人拒绝邀请", x13StealDecline.status === 404
+    && x13StealDecline.payload.error === "invite_not_found", x13StealDecline.payload);
+  const x13BadId = await call("streams.invites.accept", { token: cyToken, body: { request_id: "not-uuid" } });
+  check("邀请 id 非法时给 400", x13BadId.status === 400 && x13BadId.payload.error === "invalid_request_id", x13BadId.payload);
+  await call("streams.invite", { token: ana, body: { stream_id: g1id, email: "cy@example.com" } });
+  const x13CyList = await call("streams.invites.mine", { token: cyToken });
+  const cyG1 = (x13CyList.payload.items ?? []).find((row) => row.stream_id === g1id);
+  const cyMain = (x13CyList.payload.items ?? []).find((row) => row.stream_id === streamId);
+  check("Cy 的待办同时列出主群与临时群两封邀请", Boolean(cyG1) && Boolean(cyMain), x13CyList.payload);
+  const x13CyAccept = await call("streams.invites.accept", { token: cyToken, body: { request_id: cyG1?.id } });
+  check("streams.invites.accept：Cy 接受临时群邀请", x13CyAccept.payload.ok === true, x13CyAccept.payload);
+  const x13CyMain = await call("streams.invites.accept", { token: cyToken, body: { request_id: cyMain?.id } });
+  const x13CyMainRead = await call("messages.list", { token: cyToken, method: "GET", body: { stream_id: streamId } });
+  check("Cy 接受主群邀请后以普通成员身份能读消息", x13CyMain.payload.ok === true && x13CyMainRead.payload.ok === true,
+    { 接受: x13CyMain.payload, 读: x13CyMainRead.status });
+  // 群已经不在了但邀请还挂着的兜底名：直接用库造一条孤儿邀请。
+  await db.requests.insert({
+    id: crypto.randomUUID(), stream_id: crypto.randomUUID(), kind: "invite", applicant_user_id: null,
+    applicant_email: "dee@example.com", applicant_name: null, agent_id: null, status: "pending",
+    handled_by: null, handled_at: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  }, { columns: "id" });
+  const x13Orphan = await call("streams.invites.mine", { token: deeToken });
+  check("孤儿邀请在待办里显示为「已删除的群」而不是空白", (x13Orphan.payload.items ?? [])
+    .some((row) => row.stream_name === "已删除的群"), x13Orphan.payload);
+
+  step("14. 移交、退群与停用：权限跟着群主一起走");
+  const g1Dir = await call("streams.get", { token: ana, method: "GET", body: { id: g1id } });
+  const anaMembershipG1 = (g1Dir.payload.members ?? []).find((m) => m.type === "human" && m.id === a.payload.user.id);
+  const boMembershipG1 = (g1Dir.payload.members ?? []).find((m) => m.type === "human" && m.email === "bo@example.com");
+  const cyMembershipG1 = (g1Dir.payload.members ?? []).find((m) => m.type === "human" && m.email === "cy@example.com");
+  const agentMembershipG1 = (g1Dir.payload.members ?? []).find((m) => m.type === "agent");
+  const x14TransferDenied = await call("streams.transfer", { token: bToken, body: { stream_id: g1id, membership_id: cyMembershipG1?.membership_id } });
+  check("streams.transfer：非群主不能移交", x14TransferDenied.status === 403
+    && x14TransferDenied.payload.error === "owner_only", x14TransferDenied.payload);
+  const x14Foreign = await call("streams.transfer", { token: ana, body: { stream_id: g1id, membership_id: boMembership?.membership_id } });
+  check("streams.transfer：不能把群主交给别的群的成员", x14Foreign.status === 404
+    && x14Foreign.payload.error === "member_missing", x14Foreign.payload);
+  const x14ToAgent = await call("streams.transfer", { token: ana, body: { stream_id: g1id, membership_id: agentMembershipG1?.membership_id } });
+  check("streams.transfer：不能把群主交给虚拟员工", x14ToAgent.status === 404
+    && x14ToAgent.payload.error === "member_missing", x14ToAgent.payload);
+  const x14Transfer = await call("streams.transfer", { token: ana, body: { stream_id: g1id, membership_id: boMembershipG1?.membership_id } });
+  const g1AfterTransfer = await call("streams.get", { token: bToken, method: "GET", body: { id: g1id } });
+  check("streams.transfer：移交后新群主是 Bo，旧群主降为管理员", x14Transfer.payload.ok === true
+    && g1AfterTransfer.payload.stream?.owner_id === b.payload.user.id
+    && g1AfterTransfer.payload.my_role === "owner"
+    && (g1AfterTransfer.payload.members ?? []).find((m) => m.id === a.payload.user.id)?.role === "admin",
+  { 移交: x14Transfer.payload, 新群主视角: g1AfterTransfer.payload.stream });
+  const x14OwnerLeave = await call("streams.leave", { token: bToken, body: { stream_id: g1id } });
+  check("streams.leave：群主必须先移交才能退群", x14OwnerLeave.status === 409
+    && x14OwnerLeave.payload.error === "owner_must_transfer", x14OwnerLeave.payload);
+  const x14OldAdminSettings = await call("streams.settings", { token: ana, body: { stream_id: g1id, context_chars: 3000 } });
+  check("移交后前群主改不了群设置（权限真的跟着走了）", x14OldAdminSettings.status === 403
+    && x14OldAdminSettings.payload.error === "owner_only", x14OldAdminSettings.payload);
+  const x14Back = await call("streams.transfer", { token: bToken, body: { stream_id: g1id, membership_id: anaMembershipG1?.membership_id } });
+  const g1AfterBack = await call("streams.get", { token: ana, method: "GET", body: { id: g1id } });
+  check("streams.transfer：可以移交给回原群主", x14Back.payload.ok === true
+    && g1AfterBack.payload.stream?.owner_id === a.payload.user.id, g1AfterBack.payload.stream);
+  const x14Leave = await call("streams.leave", { token: cyToken, body: { stream_id: g1id } });
+  check("streams.leave：普通成员可以退群", x14Leave.payload.ok === true, x14Leave.payload);
+  const x14LeaveRead = await call("streams.get", { token: cyToken, method: "GET", body: { id: g1id } });
+  check("退群后读不到这个群", x14LeaveRead.status === 403, x14LeaveRead.payload);
+  const x14LeaveAgain = await call("streams.leave", { token: cyToken, body: { stream_id: g1id } });
+  check("退第二次给明确拒绝而不是静默成功", x14LeaveAgain.status === 403, x14LeaveAgain.payload);
+  const x14Queue = await call("messages.send", {
+    token: ana,
+    body: { stream_id: g1id, content: "@小Q 停群前的一句话", mentions: [{ type: "agent", id: agentId }] },
+  });
+  const x14MailId = (x14Queue.payload.queued ?? [])[0]?.mail_id;
+  check("临时群里先排进一封待办任务", Boolean(x14MailId), x14Queue.payload);
+  const x14Rotate = await call("streams.mcpkey.rotate", { token: ana, body: { stream_id: g1id } });
+  const x14Key = x14Rotate.payload.key;
+  const x14McpBefore = await rawMcp(x14Key, { jsonrpc: "2.0", id: 1, method: "tools/list" });
+  check("停用前这个群的 MCP 钥匙可用", x14McpBefore.status === 200, x14Rotate.payload);
+  const x14DeleteDenied = await call("streams.delete", { token: bToken, body: { stream_id: g1id } });
+  check("streams.delete：管理员删不掉群", x14DeleteDenied.status === 403
+    && x14DeleteDenied.payload.error === "owner_only", x14DeleteDenied.payload);
+  const x14Delete = await call("streams.delete", { token: ana, body: { stream_id: g1id } });
+  check("streams.delete：群主能停用", x14Delete.payload.ok === true, x14Delete.payload);
+  const x14MineAna = await call("streams.mine", { token: ana });
+  const x14MineBo = await call("streams.mine", { token: bToken });
+  check("停用后这个群不再出现在群主与成员的群列表",
+    !(x14MineAna.payload.items ?? []).some((s) => s.id === g1id)
+    && !(x14MineBo.payload.items ?? []).some((s) => s.id === g1id),
+  { Ana: (x14MineAna.payload.items ?? []).map((s) => s.name), Bo: (x14MineBo.payload.items ?? []).map((s) => s.name) });
+  const x14SendAfter = await call("messages.send", { token: ana, body: { stream_id: g1id, content: "停群后还能发？" } });
+  check("停用后群主自己也发不进消息", x14SendAfter.status === 403, x14SendAfter.payload);
+  const x14ReadAfter = await call("streams.get", { token: ana, method: "GET", body: { id: g1id } });
+  check("停用后读不到群详情", x14ReadAfter.status === 404, x14ReadAfter.payload);
+  const x14McpAfter = await rawMcp(x14Key, { jsonrpc: "2.0", id: 2, method: "tools/list" });
+  check("停用后这个群的 MCP 钥匙一起失效", x14McpAfter.status === 403, x14McpAfter.payload);
+  const x14LookupAfter = await call("streams.lookup", { token: cyToken, method: "GET", body: { id: g1id } });
+  check("停用后 UUID 预览入口关闭", x14LookupAfter.status === 404, x14LookupAfter.payload);
+  const x14ApplyAfter = await call("streams.apply", { token: cyToken, body: { stream_uuid: g1id } });
+  check("停用后不能再申请进群（不留无人能批的悬空申请）", x14ApplyAfter.status === 404
+    && x14ApplyAfter.payload.error === "stream_not_found", x14ApplyAfter.payload);
+  const x14MailAfter = await call("mail.list", { token: ana, method: "GET", body: { agent_id: agentId } });
+  const deadMail = (x14MailAfter.payload.items ?? []).find((row) => row.id === x14MailId);
+  check("停用把队列里的待办标成 cancelled，不留悄悄跑不了的任务",
+    deadMail?.status === "cancelled" && deadMail?.error === "stream_closed", deadMail);
+  const x14Tick = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("停用后调度轮询不崩，也不再跑这个群的活", x14Tick.payload.ok === true
+    && (x14Tick.payload.ran ?? []).every((row) => row.stream_id !== g1id), x14Tick.payload);
+  const x14DeleteAgain = await call("streams.delete", { token: ana, body: { stream_id: g1id } });
+  check("重复停用给 404 而不是假装成功", x14DeleteAgain.status === 404, x14DeleteAgain.payload);
+
+  step("15. 群文件：列表、上传人回显与删除权限");
+  const x15List = await call("files.list", { token: ana, method: "GET", body: { stream_id: streamId } });
+  const x15AnnounceFile = (x15List.payload.items ?? []).find((row) => row.name === "发布清单.md");
+  check("files.list：列出群文件并回显上传人", x15AnnounceFile?.uploaded_name === "Ana", x15List.payload);
+  const x15StrangerList = await call("files.list", { token: deeToken, method: "GET", body: { stream_id: streamId } });
+  check("files.list：非成员看不到群文件", x15StrangerList.status === 403, x15StrangerList.payload);
+  const x15BadStream = await call("files.list", { token: ana, method: "GET", body: { stream_id: "not-uuid" } });
+  check("files.list：群 id 非法给 400", x15BadStream.status === 400
+    && x15BadStream.payload.error === "invalid_stream_id", x15BadStream.payload);
+  const x15BoFile = await call("files.upload", { token: bToken, body: { stream_id: streamId, name: "Bo的笔记.md", content: "# Bo 的笔记" } });
+  const x15List2 = await call("files.list", { token: ana, method: "GET", body: { stream_id: streamId } });
+  check("files.upload：成员能上传且列表回显为 Bo", Boolean(x15BoFile.payload.file?.id)
+    && (x15List2.payload.items ?? []).find((row) => row.name === "Bo的笔记.md")?.uploaded_name === "Bo", x15BoFile.payload);
+  const x15StrangerGet = await call("files.get", { token: deeToken, method: "GET", body: { id: file.payload.file?.id } });
+  check("files.get：非成员预览被拒", x15StrangerGet.status === 403, x15StrangerGet.payload);
+  const x15CrossDelete = await call("files.delete", { token: cyToken, body: { id: file.payload.file?.id } });
+  check("files.delete：普通成员删不掉别人的文件", x15CrossDelete.status === 403
+    && x15CrossDelete.payload.error === "permission_denied", x15CrossDelete.payload);
+  const x15CyFile = await call("files.upload", { token: cyToken, body: { stream_id: streamId, name: "Cy的草稿.md", content: "自己传的" } });
+  const x15CyDelete = await call("files.delete", { token: cyToken, body: { id: x15CyFile.payload.file?.id } });
+  check("files.delete：上传者能删自己的文件", x15CyDelete.payload.id === x15CyFile.payload.file?.id, x15CyDelete.payload);
+  const x15AfterDelete = await call("files.list", { token: ana, method: "GET", body: { stream_id: streamId } });
+  check("删除后文件列表里不再有它", !(x15AfterDelete.payload.items ?? []).some((row) => row.name === "Cy的草稿.md"), x15AfterDelete.payload);
+  const x15DeleteAgain = await call("files.delete", { token: cyToken, body: { id: x15CyFile.payload.file?.id } });
+  check("再删一次给 404", x15DeleteAgain.status === 404
+    && x15DeleteAgain.payload.error === "file_not_found", x15DeleteAgain.payload);
+  const x15BadDelete = await call("files.delete", { token: cyToken, body: { id: "not-uuid" } });
+  check("files.delete：非法 id 给 400", x15BadDelete.status === 400 && x15BadDelete.payload.error === "invalid_id", x15BadDelete.payload);
+  const x15Cleanup = await call("files.upload", { token: ana, body: { stream_id: streamId, name: "待清理.md", content: "占位" } });
+  const x15AdminDelete = await call("files.delete", { token: bToken, body: { id: x15Cleanup.payload.file?.id } });
+  check("files.delete：管理员可以替成员清理", x15AdminDelete.payload.ok === true, x15AdminDelete.payload);
+
+  step("16. 账号：重发验证、改口令与收件箱已读");
+  const ed = await call("auth.register", { body: { email: "ed@example.com", password: "passw0rd-5", display_name: "Ed" } });
+  const edToken = (await call("auth.login", { body: { email: "ed@example.com", password: "passw0rd-5" } })).payload.token;
+  check("Ed 注册并登录（尚未验证邮箱）", Boolean(edToken) && ed.payload.user?.email_verified === false, ed.payload);
+  const x16Resend = await call("auth.resend", { token: edToken, body: {} });
+  check("auth.resend：未验证账号能重发验证链接", x16Resend.status === 200 && x16Resend.payload.ok === true
+    && String(x16Resend.payload.verify_link).includes("token="), x16Resend.payload);
+  const x16NoToken = await call("auth.resend", { body: {} });
+  check("auth.resend：没登录时要求登录而不是 500", x16NoToken.status === 401, x16NoToken.payload);
+  const x16Verify0 = await call("auth.verify", { body: { token: decodeURIComponent((ed.payload.verify_link ?? "").split("token=")[1] ?? "") } });
+  check("原始注册链接仍可验证", x16Verify0.payload.ok === true, x16Verify0.payload);
+  const x16ResendTwice = await call("auth.resend", { token: edToken, body: {} });
+  check("auth.resend：已验证账号提示 already_verified", x16ResendTwice.status === 200
+    && x16ResendTwice.payload.error === "already_verified", x16ResendTwice.payload);
+  const x16Token1 = decodeURIComponent((x16Resend.payload.verify_link ?? "").split("token=")[1] ?? "");
+  const x16Verify1 = await call("auth.verify", { body: { token: x16Token1 } });
+  const x16Verify2 = await call("auth.verify", { body: { token: x16Token1 } });
+  check("重发的链接可用且一次性（第二次 410 link_used）",
+    x16Verify1.payload.ok === true && x16Verify2.status === 410 && x16Verify2.payload.error === "link_used",
+  { 第一次: x16Verify1.payload, 第二次: x16Verify2.payload });
+  const x16VerifyBad = await call("auth.verify", { body: { token: "x".repeat(40) } });
+  check("陌生验证链接给 404 link_invalid", x16VerifyBad.status === 404
+    && x16VerifyBad.payload.error === "link_invalid", x16VerifyBad.payload);
+  const x16Inbox = await call("inbox.list", { token: edToken, method: "GET" });
+  const x16MailItem = (x16Inbox.payload.items ?? []).find((row) => row.kind === "verify" && !row.read_at);
+  check("inbox.list：Ed 的开发态收件箱里有验证信", Boolean(x16MailItem), x16Inbox.payload);
+  const x16Read = await call("inbox.read", { token: edToken, body: { id: x16MailItem?.id } });
+  const x16Inbox2 = await call("inbox.list", { token: edToken, method: "GET" });
+  check("inbox.read：标记已读后回读带 read_at", x16Read.payload.ok === true
+    && (x16Inbox2.payload.items ?? []).find((row) => row.id === x16MailItem?.id)?.read_at != null, x16Read.payload);
+  const x16ReadOther = await call("inbox.read", { token: ana, body: { id: x16MailItem?.id } });
+  check("inbox.read：不能替别人标记已读", x16ReadOther.status === 404
+    && x16ReadOther.payload.error === "message_missing", x16ReadOther.payload);
+  const x16ReadBad = await call("inbox.read", { token: edToken, body: { id: "not-uuid" } });
+  check("inbox.read：非法 id 给 400", x16ReadBad.status === 400 && x16ReadBad.payload.error === "invalid_id", x16ReadBad.payload);
+  const x16PwdWrong = await call("auth.password", { token: edToken, body: { current_password: "wrong-pass", new_password: "passw0rd-55" } });
+  check("auth.password：旧口令不对被拒", x16PwdWrong.status === 401
+    && x16PwdWrong.payload.error === "bad_credentials", x16PwdWrong.payload);
+  const x16PwdShort = await call("auth.password", { token: edToken, body: { current_password: "passw0rd-5", new_password: "short" } });
+  check("auth.password：新口令太短被拒", x16PwdShort.status === 400
+    && x16PwdShort.payload.error === "invalid_new_password", x16PwdShort.payload);
+  const x16Pwd = await call("auth.password", { token: edToken, body: { current_password: "passw0rd-5", new_password: "passw0rd-55" } });
+  const x16OldSession = await call("auth.me", { token: edToken, method: "GET" });
+  const x16OldLogin = await call("auth.login", { body: { email: "ed@example.com", password: "passw0rd-5" } });
+  const x16NewLogin = await call("auth.login", { body: { email: "ed@example.com", password: "passw0rd-55" } });
+  check("auth.password：改口令后旧会话与旧口令一起作废", x16Pwd.payload.ok === true
+    && x16OldSession.status === 401 && x16OldLogin.status === 401 && Boolean(x16NewLogin.payload.token),
+  { 改: x16Pwd.payload, 旧会话: x16OldSession.status, 旧口令: x16OldLogin.status });
+  const x16MeAna = await call("auth.me", { token: ana, method: "GET" });
+  check("改口令只踢自己设备的会话，不影响别人", x16MeAna.payload.ok === true, x16MeAna.payload);
+
+  step("17. 虚拟机：归属、更新、授权撤销与 MCP 钥匙清理");
+  const x17BoVm = await call("vms.create", {
+    token: bToken,
+    body: { label: "Bo 的测试机", host: "bo.internal.example", port: 22, username: "bo", auth_kind: "key", secret: "bo-secret-text" },
+  });
+  const boVmId = x17BoVm.payload.vm?.id;
+  check("vms.create：Bo 能登记自己的机器", Boolean(boVmId) && x17BoVm.payload.vm?.auth_kind === "key", x17BoVm.payload);
+  check("vms.create：响应不回显凭据", !JSON.stringify(x17BoVm.payload).includes("bo-secret-text"), x17BoVm.payload);
+  const x17BadPort = await call("vms.create", { token: bToken, body: { label: "x", host: "a.example", port: 70000, username: "u", auth_kind: "password", secret: "s3cret-long" } });
+  check("vms.create：端口越界被拒", x17BadPort.status === 400 && x17BadPort.payload.error === "invalid_port", x17BadPort.payload);
+  const x17BadHost = await call("vms.create", { token: bToken, body: { label: "x", host: "not a host", port: 22, username: "u", auth_kind: "password", secret: "s3cret-long" } });
+  check("vms.create：主机名非法被拒", x17BadHost.status === 400 && x17BadHost.payload.error === "invalid_host", x17BadHost.payload);
+  const x17BadAuth = await call("vms.create", { token: bToken, body: { label: "x", host: "a.example", port: 22, username: "u", auth_kind: "telepathy", secret: "s3cret-long" } });
+  check("vms.create：未知凭据类型被拒", x17BadAuth.status === 400 && x17BadAuth.payload.error === "invalid_auth_kind", x17BadAuth.payload);
+  const x17CrossUpdate = await call("vms.update", { token: ana, body: { id: boVmId, label: "改成 Ana 的" } });
+  check("vms.update：别人改不了我的机器", x17CrossUpdate.status === 403 && x17CrossUpdate.payload.error === "vm_not_owned", x17CrossUpdate.payload);
+  const x17CrossDelete = await call("vms.delete", { token: ana, body: { id: boVmId } });
+  check("vms.delete：别人删不了我的机器", x17CrossDelete.status === 403 && x17CrossDelete.payload.error === "vm_not_owned", x17CrossDelete.payload);
+  const x17Update = await call("vms.update", { token: bToken, body: { id: boVmId, label: "Bo 的构建机", port: 2222, workdir: "/home/bo/app" } });
+  check("vms.update：主人能改标签、端口与工作目录", x17Update.payload.vm?.label === "Bo 的构建机"
+    && x17Update.payload.vm?.port === 2222 && x17Update.payload.vm?.workdir === "/home/bo/app", x17Update.payload);
+  const x17UpdateBadPort = await call("vms.update", { token: bToken, body: { id: boVmId, port: 70000 } });
+  check("vms.update：端口越界被拒", x17UpdateBadPort.status === 400 && x17UpdateBadPort.payload.error === "invalid_port", x17UpdateBadPort.payload);
+  const x17UpdateMissing = await call("vms.update", { token: bToken, body: { id: crypto.randomUUID(), label: "不存在" } });
+  check("vms.update：不存在的机器给 404", x17UpdateMissing.status === 404 && x17UpdateMissing.payload.error === "vm_not_found", x17UpdateMissing.payload);
+  const x17UpdateRotate = await call("vms.update", { token: bToken, body: { id: boVmId, secret: "bo-secret-v2" } });
+  check("vms.update：换凭据后仍不回显明文", x17UpdateRotate.payload.ok === true
+    && !JSON.stringify(x17UpdateRotate.payload).includes("bo-secret-v2"), x17UpdateRotate.payload);
+  const x17BoList = await call("vms.list", { token: bToken });
+  check("vms.list：只列自己的机器且不返回密文",
+    (x17BoList.payload.items ?? []).length === 1 && (x17BoList.payload.items ?? [])[0]?.id === boVmId
+    && !JSON.stringify(x17BoList.payload).includes("bo-secret") && !JSON.stringify(x17BoList.payload).includes("s3cret")
+    && !("secret_cipher" in ((x17BoList.payload.items ?? [])[0] ?? {})), x17BoList.payload);
+  const x17AnaList = await call("vms.list", { token: ana });
+  check("vms.list：Ana 的授权清单里能看到已授权的机器",
+    (x17AnaList.payload.items ?? []).some((row) => row.id === vm.payload.vm?.id
+      && (row.granted_to ?? []).some((g) => g.stream_id === streamId)), x17AnaList.payload);
+  const x17GrantByBo = await call("streams.vms.grant", { token: bToken, body: { stream_id: streamId, vm_id: boVmId, level: "sudo" } });
+  check("streams.vms.grant：管理员把自有机器授权进群", Boolean(x17GrantByBo.payload.grant_id), x17GrantByBo.payload);
+  const x17MineBo = await call("streams.mine.vms", { token: bToken, method: "GET", body: { stream_id: streamId } });
+  check("streams.mine.vms：成员能看到本群授权并带上级别与机器资料",
+    (x17MineBo.payload.items ?? []).some((row) => row.vm_id === boVmId && row.level === "sudo" && row.vm?.label === "Bo 的构建机"), x17MineBo.payload);
+  const x17MineStranger = await call("streams.mine.vms", { token: deeToken, method: "GET", body: { stream_id: streamId } });
+  check("streams.mine.vms：非成员看不到本群机器", x17MineStranger.status === 403, x17MineStranger.payload);
+  const x17GrantForeignVm = await call("streams.vms.grant", { token: ana, body: { stream_id: streamId, vm_id: boVmId } });
+  check("streams.vms.grant：不能把别人的机器授权进群", x17GrantForeignVm.status === 403
+    && x17GrantForeignVm.payload.error === "vm_not_owned", x17GrantForeignVm.payload);
+  const x17GrantDenied = await call("streams.vms.grant", { token: cyToken, body: { stream_id: streamId, vm_id: vm.payload.vm?.id } });
+  check("streams.vms.grant：普通成员没有授权权限", x17GrantDenied.status === 403
+    && x17GrantDenied.payload.error === "permission_denied", x17GrantDenied.payload);
+  const x17Revoke = await call("streams.vms.revoke", { token: bToken, body: { stream_id: streamId, grant_id: x17GrantByBo.payload.grant_id } });
+  check("streams.vms.revoke：管理员能撤销本群授权", x17Revoke.payload.removed === x17GrantByBo.payload.grant_id, x17Revoke.payload);
+  const x17RevokeAgain = await call("streams.vms.revoke", { token: bToken, body: { stream_id: streamId, grant_id: x17GrantByBo.payload.grant_id } });
+  check("重复撤销给 404 grant_not_found", x17RevokeAgain.status === 404
+    && x17RevokeAgain.payload.error === "grant_not_found", x17RevokeAgain.payload);
+  const x17MineAna = await call("streams.mine.vms", { token: ana, method: "GET", body: { stream_id: streamId } });
+  const buildGrant = (x17MineAna.payload.items ?? []).find((row) => row.vm_id === vm.payload.vm?.id);
+  check("streams.mine.vms：Ana 的构建机仍在本群授权里", Boolean(buildGrant), x17MineAna.payload);
+  const x17DeleteVm = await call("vms.delete", { token: ana, body: { id: vm.payload.vm?.id } });
+  check("vms.delete：主人能删自己的机器", x17DeleteVm.payload.id === vm.payload.vm?.id, x17DeleteVm.payload);
+  const x17MineAfter = await call("streams.mine.vms", { token: ana, method: "GET", body: { stream_id: streamId } });
+  check("删机后本群授权清单里没有幽灵行",
+    !(x17MineAfter.payload.items ?? []).some((row) => row.vm === null || row.vm_id === vm.payload.vm?.id), x17MineAfter.payload);
+  const x17DetailAfter = await call("streams.get", { token: ana, method: "GET", body: { id: streamId } });
+  check("群详情的虚拟机列表也不再挂 revoked/已删除记录",
+    (x17DetailAfter.payload.vms ?? []).every((row) => row.level !== "revoked" && row.label !== "已删除的虚拟机"),
+  x17DetailAfter.payload.vms);
+  const x17DeleteAgain = await call("vms.delete", { token: ana, body: { id: vm.payload.vm?.id } });
+  check("重复删机器给 404", x17DeleteAgain.status === 404 && x17DeleteAgain.payload.error === "vm_not_found", x17DeleteAgain.payload);
+  const x17RotateDenied = await call("streams.mcpkey.rotate", { token: bToken, body: { stream_id: streamId } });
+  check("streams.mcpkey.rotate：只有群主能换钥匙", x17RotateDenied.status === 403
+    && x17RotateDenied.payload.error === "owner_only", x17RotateDenied.payload);
+  const x17Rotate = await call("streams.mcpkey.rotate", { token: ana, body: { stream_id: streamId } });
+  const x17NewKey = x17Rotate.payload.key;
+  check("换钥匙后旧钥匙立刻失效", x17NewKey !== mcpKey
+    && (await rawMcp(mcpKey, { jsonrpc: "2.0", id: 3, method: "tools/list" })).status === 403
+    && (await rawMcp(x17NewKey, { jsonrpc: "2.0", id: 4, method: "tools/list" })).status === 200, x17Rotate.payload);
+  const x17ClearDenied = await call("streams.mcpkey.clear", { token: bToken, body: { stream_id: streamId } });
+  check("streams.mcpkey.clear：管理员不能清钥匙", x17ClearDenied.status === 403
+    && x17ClearDenied.payload.error === "owner_only", x17ClearDenied.payload);
+  const x17Clear = await call("streams.mcpkey.clear", { token: ana, body: { stream_id: streamId } });
+  check("streams.mcpkey.clear：群主清空后外部 MCP 进不来", x17Clear.payload.ok === true
+    && (await rawMcp(x17NewKey, { jsonrpc: "2.0", id: 5, method: "tools/list" })).status === 403, x17Clear.payload);
+  const x17ClearRead = await call("streams.get", { token: ana, method: "GET", body: { id: streamId } });
+  check("清空后群详情里 mcp_key_set 回到 false", x17ClearRead.payload.stream?.mcp_key_set === false, x17ClearRead.payload.stream);
+  const x17BoVmDelete = await call("vms.delete", { token: bToken, body: { id: boVmId } });
+  check("vms.delete：Bo 删掉自己的机器收尾", x17BoVmDelete.payload.ok === true, x17BoVmDelete.payload);
+
+  step("18. 技能与记忆：可见性、计数、卸载与归属");
+  const builtinId = market.payload.items?.[0]?.id;
+  const x18Get = await call("skills.get", { token: ana, method: "GET", body: { id: builtinId } });
+  check("skills.get：内置技能能读到正文且标 always_on", x18Get.payload.skill?.always_on === true
+    && String(x18Get.payload.skill?.body).includes("create_stream"), x18Get.payload);
+  const x18BadId = await call("skills.get", { token: ana, method: "GET", body: { id: "not-uuid" } });
+  check("skills.get：非法 id 给 400", x18BadId.status === 400 && x18BadId.payload.error === "invalid_id", x18BadId.payload);
+  const x18Missing = await call("skills.get", { token: ana, method: "GET", body: { id: crypto.randomUUID() } });
+  check("skills.get：不存在的技能给 404", x18Missing.status === 404
+    && x18Missing.payload.error === "skill_not_found", x18Missing.payload);
+  const x18Priv = await call("skills.upload", {
+    token: ana,
+    body: { name: "Ana 的私有手册", summary: "只给自家员工用", category: "内部", body: "# 私有\n不外传", is_public: false },
+  });
+  const privSkillId = x18Priv.payload.skill?.id;
+  check("skills.upload：可以上传不公开的技能", x18Priv.payload.skill?.is_public === false, x18Priv.payload);
+  const x18PrivGet = await call("skills.get", { token: bToken, method: "GET", body: { id: privSkillId } });
+  check("skills.get：别人读不到私有技能", x18PrivGet.status === 403
+    && x18PrivGet.payload.error === "skill_forbidden", x18PrivGet.payload);
+  const x18MarketBo = await call("skills.market", { token: bToken, method: "GET" });
+  check("skills.market：私有技能不进别人的市场",
+    !(x18MarketBo.payload.items ?? []).some((row) => row.id === privSkillId), x18MarketBo.payload);
+  const x18DefaultFlag = await call("skills.upload", {
+    token: ana, body: { name: "私有默认", summary: "只给自家新员工", body: "私有默认正文。", is_default: true },
+  });
+  const x18DefaultId = x18DefaultFlag.payload.skill?.id;
+  check("skills.upload：私有技能也能标成默认，供主人以后的员工自动装",
+    x18DefaultFlag.payload.skill?.is_default === true && x18DefaultFlag.payload.skill?.is_public === false, x18DefaultFlag.payload);
+  const x18DefaultOff = await call("skills.setDefault", { token: bToken, body: { skill_id: x18DefaultId, is_default: true } });
+  check("skills.setDefault：别人改不了你的默认标记", x18DefaultOff.status === 403
+    && x18DefaultOff.payload.error === "skill_forbidden", x18DefaultOff.payload);
+  const x18DefaultUnset = await call("skills.setDefault", { token: ana, body: { skill_id: x18DefaultId, is_default: false } });
+  check("skills.setDefault：主人能把默认取消掉", x18DefaultUnset.payload.skill?.is_default === false, x18DefaultUnset.payload);
+  const x18BuiltinDownload = await call("skills.download", { token: ana, body: { id: builtinId } });
+  check("skills.download：内置技能不占计数", x18BuiltinDownload.payload.skill?.downloads === 0, x18BuiltinDownload.payload);
+  const x18DownloadForbidden = await call("skills.download", { token: bToken, body: { id: privSkillId } });
+  check("skills.download：别人下载私有技能被拒", x18DownloadForbidden.status === 403, x18DownloadForbidden.payload);
+  const x18D1 = await call("skills.download", { token: ana, body: { id: uploaded.payload.skill?.id } });
+  const x18D2 = await call("skills.download", { token: ana, body: { id: uploaded.payload.skill?.id } });
+  check("skills.download：上传的技能每次下载 +1", Number(x18D1.payload.skill?.downloads) === 1
+    && Number(x18D2.payload.skill?.downloads) === 2, { 第一次: x18D1.payload.skill?.downloads, 第二次: x18D2.payload.skill?.downloads });
+  const x18Install = await call("skills.install", { token: ana, body: { skill_id: privSkillId, agent_id: mockAgentId } });
+  check("skills.install：私有技能能装到自家员工", x18Install.payload.installed === true, x18Install.payload);
+  const x18InstallsBefore = (await call("skills.get", { token: ana, method: "GET", body: { id: privSkillId } })).payload.skill?.installs;
+  const x18Locked = await call("skills.uninstall", { token: ana, body: { agent_id: agentId, skill_id: builtinId } });
+  check("skills.uninstall：内置技能卸不掉", x18Locked.status === 400
+    && x18Locked.payload.error === "builtin_skill_locked", x18Locked.payload);
+  const x18Foreign = await call("skills.uninstall", { token: bToken, body: { agent_id: mockAgentId, skill_id: privSkillId } });
+  check("skills.uninstall：不能卸别人员工的技能", x18Foreign.status === 403
+    && x18Foreign.payload.error === "agent_not_owned", x18Foreign.payload);
+  const x18Uninstall = await call("skills.uninstall", { token: ana, body: { agent_id: mockAgentId, skill_id: privSkillId } });
+  const x18InstalledAfter = await call("skills.installed", { token: ana, method: "GET", body: { agent_id: mockAgentId } });
+  check("skills.uninstall：卸载后已安装列表里没有它", x18Uninstall.payload.ok === true
+    && !(x18InstalledAfter.payload.items ?? []).some((row) => row.name === "Ana 的私有手册"), x18InstalledAfter.payload);
+  const x18InstallsAfter = (await call("skills.get", { token: ana, method: "GET", body: { id: privSkillId } })).payload.skill?.installs;
+  check("卸载后安装数 -1", Number(x18InstallsAfter) === Number(x18InstallsBefore) - 1, { before: x18InstallsBefore, after: x18InstallsAfter });
+  const x18UninstallAgain = await call("skills.uninstall", { token: ana, body: { agent_id: mockAgentId, skill_id: privSkillId } });
+  check("重复卸载给 404 skill_not_installed", x18UninstallAgain.status === 404
+    && x18UninstallAgain.payload.error === "skill_not_installed", x18UninstallAgain.payload);
+  const x18MemDelete = await call("agents.memory.delete", { token: ana, body: { agent_id: agentId, id: mem.payload.id } });
+  check("agents.memory.delete：主人能删自己的记忆", x18MemDelete.payload.id === mem.payload.id, x18MemDelete.payload);
+  const x18MemList = await call("agents.memory.list", { token: ana, method: "GET", body: { agent_id: agentId, scope: "common" } });
+  check("删除后记忆列表里不再有它", !(x18MemList.payload.items ?? []).some((row) => row.id === mem.payload.id), x18MemList.payload);
+  const x18MemAgain = await call("agents.memory.delete", { token: ana, body: { agent_id: agentId, id: mem.payload.id } });
+  check("重复删记忆给 404 memory_missing", x18MemAgain.status === 404
+    && x18MemAgain.payload.error === "memory_missing", x18MemAgain.payload);
+  const x18Mem2 = await call("agents.memory.put", { token: ana, body: { agent_id: agentId, scope: "common", content: "第二条待删记忆。" } });
+  const x18MemForeign = await call("agents.memory.delete", { token: bToken, body: { agent_id: agentId, id: x18Mem2.payload.id } });
+  check("别人删不掉你员工的记忆", x18MemForeign.status === 403
+    && x18MemForeign.payload.error === "agent_not_owned", x18MemForeign.payload);
+  const x18MemCross = await call("agents.memory.delete", { token: ana, body: { agent_id: mockAgentId, id: x18Mem2.payload.id } });
+  check("按员工过滤：不能借另一个员工 id 删记忆", x18MemCross.status === 404
+    && x18MemCross.payload.error === "memory_missing", x18MemCross.payload);
+  await call("agents.memory.delete", { token: ana, body: { agent_id: agentId, id: x18Mem2.payload.id } });
+
+  step("19. MCP 内部工具面：上下文、历史窗口、资源清单、拉人、公告、授权与 @ 触发");
+  // 与 engine.mjs 的调用包装保持一致：参数校验抛出的 Halt 会转成 { error }，而不是打断任务。
+  const toolSafe = async (toolScope, name, args) => {
+    try {
+      return await executeTool(db, toolScope, name, args, (key) => process.env[key]);
+    } catch (error) {
+      return { error: error?.error ?? "tool_failed", thrown: true };
+    }
+  };
+  const anaId = a.payload.user.id;
+  const boId = b.payload.user.id;
+  const x19Scope = { agentId, streamId, ownerId: anaId };
+  const x19Seqs = await db.messages.list([["stream_id", streamId]], {
+    columns: "seq", limit: 500, order: ["seq", { ascending: true }],
+  });
+
+  const x19Ctx = await toolSafe(x19Scope, "get_context", {});
+  check("get_context：回群名、群 UUID 与当前公告",
+    x19Ctx.stream?.name === "上线前定稿" && x19Ctx.stream?.uuid === streamId
+      && x19Ctx.stream?.announcement === "周五 18:00 前定稿，逾期顺延。", x19Ctx.stream);
+  check("get_context：真人与虚拟员工分类型列进成员表，被移出群的员工不再出现",
+    (x19Ctx.members ?? []).some((m) => m.type === "human" && m.name === "Ana")
+      && (x19Ctx.members ?? []).some((m) => m.type === "agent" && m.name === "小M")
+      && !(x19Ctx.members ?? []).some((m) => m.name === "小Q"), x19Ctx.members);
+  check("get_context：授权虚拟机带级别与 workdir，且不泄露密文",
+    (x19Ctx.vms ?? []).some((row) => row.label === "技能登记机" && row.level === "member"
+      && row.host === "ci@skill.example.com:22" && row.workdir === "")
+      && !JSON.stringify(x19Ctx).includes("pw-123456"), x19Ctx.vms);
+  check("get_context：带上员工在本群的压缩摘要记忆",
+    (x19Ctx.stream_memory ?? []).some((row) => row.kind === "summary"
+      && Number(row.covers_through_seq) > 0), x19Ctx.stream_memory);
+  const x19CtxGhost = await toolSafe({ agentId, streamId: crypto.randomUUID(), ownerId: anaId }, "get_context", {});
+  check("get_context：群不存在给 stream_not_found", x19CtxGhost.error === "stream_not_found", x19CtxGhost);
+  const x19CtxExternal = await toolSafe({ streamId, ownerId: anaId }, "get_context", {});
+  check("get_context：对外 MCP（没有员工身份）能读群与成员，但不带员工记忆",
+    x19CtxExternal.stream?.uuid === streamId && (x19CtxExternal.members ?? []).length > 0
+      && (x19CtxExternal.stream_memory ?? []).length === 0, x19CtxExternal);
+
+  const x19Win = await toolSafe(x19Scope, "read_window", { from_seq: x19Seqs[0].seq, to_seq: x19Seqs[2].seq });
+  check("read_window：按 seq 升序返回整段原文",
+    (x19Win.messages ?? []).length === 3 && x19Win.messages.every((m) => m.seq != null && m.content != null)
+      && x19Win.messages.map((m) => m.seq).join(",") === "1,2,3", x19Win.messages?.map((m) => m.seq));
+  const x19WinBackward = await toolSafe(x19Scope, "read_window", { from_seq: 10, to_seq: 9 });
+  check("read_window：区间倒挂给 invalid_window", x19WinBackward.error === "invalid_window", x19WinBackward);
+  const x19WinNaN = await toolSafe(x19Scope, "read_window", { from_seq: "abc", to_seq: 8 });
+  check("read_window：非整数 seq 给 invalid_window", x19WinNaN.error === "invalid_window", x19WinNaN);
+  const x19WinCap = await toolSafe(x19Scope, "read_window", { from_seq: 1, to_seq: 500 });
+  check("read_window：一次最多翻到 from+60，长历史要靠翻页而不是一次灌满上下文",
+    x19Seqs.length > 61 && (x19WinCap.messages ?? []).length === 61
+      && x19WinCap.messages.every((m) => m.seq <= 61),
+    { 群里总条数: x19Seqs.length, 取回条数: (x19WinCap.messages ?? []).length });
+
+  const x19Res = await toolSafe(x19Scope, "list_my_resources", {});
+  check("list_my_resources：列出主人名下员工（带 id 与状态）",
+    (x19Res.agents ?? []).some((row) => row.id === agentId && row.status === "active")
+      && (x19Res.agents ?? []).some((row) => row.id === mockAgentId), x19Res.agents);
+  check("list_my_resources：列出主人名下虚拟机与所在群（不含密文）",
+    (x19Res.vms ?? []).some((row) => row.label === "技能登记机" && row.username === "ci")
+      && (x19Res.streams ?? []).some((row) => row.stream_id === streamId && row.role === "owner")
+      && !JSON.stringify(x19Res).includes("secret_cipher"), x19Res.vms);
+  check("list_my_resources：已删除的群不再出现在主人清单里",
+    !(x19Res.streams ?? []).some((row) => row.stream_id === g1id), x19Res.streams);
+  const x19ResExternal = await toolSafe({ streamId, ownerId: anaId }, "list_my_resources", {});
+  check("list_my_resources：对外部 MCP 关闭（internal_only）",
+    x19ResExternal.error === "internal_only", x19ResExternal);
+  const x19ResNoOwner = await toolSafe({ agentId, streamId }, "list_my_resources", {});
+  check("list_my_resources：没有主人身份给 owner_missing", x19ResNoOwner.error === "owner_missing", x19ResNoOwner);
+  const x19Unknown = await toolSafe(x19Scope, "drop_table", {});
+  check("未注册的工具名一律 tool_not_allowed", x19Unknown.error === "tool_not_allowed", x19Unknown);
+
+  const x19FreshAgent = await call("agents.create", {
+    token: ana,
+    body: { name: "小N", role: "外接", api_base_url: "demo://local", api_key: "demo-key-n", model: "demo" },
+  });
+  const x19FreshId = x19FreshAgent.payload.agent?.id;
+  const x19Add = await toolSafe(x19Scope, "add_agent_to_stream", { agent_id: x19FreshId });
+  check("add_agent_to_stream：主人把自己另一个员工拉进群",
+    x19Add.ok === true && x19Add.duplicate !== true && x19Add.stream_id === streamId, x19Add);
+  const x19AddAgain = await toolSafe(x19Scope, "add_agent_to_stream", { agent_id: x19FreshId });
+  check("add_agent_to_stream：重复拉人只回 duplicate，不插第二行成员",
+    x19AddAgain.ok === true && x19AddAgain.duplicate === true, x19AddAgain);
+  const x19AddDir = await call("streams.get", { token: ana, method: "GET", body: { id: streamId } });
+  check("拉进来的员工在群成员里只出现一次",
+    (x19AddDir.payload.members ?? []).filter((m) => m.type === "agent" && m.agent?.id === x19FreshId).length === 1,
+    (x19AddDir.payload.members ?? []).filter((m) => m.type === "agent").map((m) => m.agent?.name));
+  const x19BoAgent = await call("agents.create", {
+    token: bToken,
+    body: { name: "Bo的助理", role: "外接", api_base_url: "demo://local", api_key: "demo-key-bo", model: "demo" },
+  });
+  const x19Foreign = await toolSafe(x19Scope, "add_agent_to_stream", { agent_id: x19BoAgent.payload.agent?.id });
+  check("add_agent_to_stream：不能拉别人的员工", x19Foreign.error === "agent_not_owned", x19Foreign);
+  const x19GhostAgent = await toolSafe(x19Scope, "add_agent_to_stream", { agent_id: crypto.randomUUID() });
+  check("add_agent_to_stream：不存在的员工给 agent_not_found", x19GhostAgent.error === "agent_not_found", x19GhostAgent);
+  const x19NotMember = await toolSafe({ agentId, streamId, ownerId: dee.payload.user.id },
+    "add_agent_to_stream", { agent_id: x19FreshId });
+  check("add_agent_to_stream：主人不是群成员时拒绝", x19NotMember.error === "not_stream_member", x19NotMember);
+  const x19BadAgentId = await toolSafe(x19Scope, "add_agent_to_stream", { agent_id: "not-uuid" });
+  check("add_agent_to_stream：非法 id 抛错也被转成错误码",
+    x19BadAgentId.error === "invalid_agent_id" && x19BadAgentId.thrown === true, x19BadAgentId);
+
+  const x19AnnDenied = await toolSafe({ agentId, streamId, ownerId: c.payload.user.id },
+    "set_announcement", { content: "普通成员写的公告" });
+  check("set_announcement：普通成员改公告被拒", x19AnnDenied.error === "permission_denied", x19AnnDenied);
+  const x19Ann = await toolSafe(x19Scope, "set_announcement", { content: "公告已由内部工具改写。" });
+  check("set_announcement：群主写入公告并回显", x19Ann.ok === true
+    && x19Ann.announcement === "公告已由内部工具改写。", x19Ann);
+  const x19AnnRead = await toolSafe({ streamId, ownerId: anaId }, "get_announcement", {});
+  check("set_announcement 之后 get_announcement 读到新值",
+    x19AnnRead.announcement === "公告已由内部工具改写。", x19AnnRead);
+  const x19AnnView = await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } });
+  check("改公告在群里落的系统消息同时带 system 标记（正文与转录前缀一致）",
+    (x19AnnView.payload.items ?? []).some((m) => m.kind === "system"
+      && m.sender_type === "system"
+      && String(m.content).includes("公告已由内部工具改写")),
+    (x19AnnView.payload.items ?? []).slice(-3).map((m) => ({ kind: m.kind, sender_type: m.sender_type, content: m.content })));
+  const x19AnnTooLong = await toolSafe(x19Scope, "set_announcement", { content: "长".repeat(4001) });
+  check("set_announcement：超长公告被参数校验挡下", x19AnnTooLong.error === "invalid_content", x19AnnTooLong);
+  const x19AnnClear = await toolSafe(x19Scope, "set_announcement", { content: "" });
+  check("set_announcement：空串即清空公告", x19AnnClear.ok === true && x19AnnClear.announcement === "", x19AnnClear);
+
+  const x19Vm = await call("vms.create", {
+    token: ana,
+    body: { label: "MCP授权机", host: "mcp.internal.example", port: 22, username: "deploy",
+      auth_kind: "key", secret: "private-key-material", workdir: "/srv/mcp" },
+  });
+  const x19BoVm = await call("vms.create", {
+    token: bToken,
+    body: { label: "Bo的机器", host: "bo.internal.example", port: 22, username: "bo",
+      auth_kind: "password", secret: "bo-secret" },
+  });
+  const x19Grant = await toolSafe(x19Scope, "grant_vm", { vm_id: x19Vm.payload.vm?.id, level: "sudo" });
+  check("grant_vm：群主把自己机器授权成 sudo", x19Grant.ok === true && x19Grant.level === "sudo", x19Grant);
+  const x19GrantAgain = await toolSafe(x19Scope, "grant_vm", { vm_id: x19Vm.payload.vm?.id, level: "member" });
+  check("grant_vm：重复授权改级别而不是再加一行",
+    x19GrantAgain.ok === true && x19GrantAgain.grant_id === x19Grant.grant_id
+      && x19GrantAgain.level === "member", x19GrantAgain);
+  const x19GrantRows = await db.stream_vms.list([["stream_id", streamId], ["vm_id", x19Vm.payload.vm?.id]], {
+    columns: "id,level", limit: 10,
+  });
+  check("改级别后群里只有一条授权行", x19GrantRows.length === 1 && x19GrantRows[0].level === "member", x19GrantRows);
+  const x19GrantMember = await toolSafe({ agentId, streamId, ownerId: c.payload.user.id },
+    "grant_vm", { vm_id: x19Vm.payload.vm?.id });
+  check("grant_vm：普通成员不能把机器授权给群", x19GrantMember.error === "permission_denied", x19GrantMember);
+  const x19GrantForeign = await toolSafe(x19Scope, "grant_vm", { vm_id: x19BoVm.payload.vm?.id });
+  check("grant_vm：不能授权别人的机器", x19GrantForeign.error === "vm_not_owned", x19GrantForeign);
+  const x19GrantGhost = await toolSafe(x19Scope, "grant_vm", { vm_id: crypto.randomUUID() });
+  check("grant_vm：机器不存在给 vm_not_found", x19GrantGhost.error === "vm_not_found", x19GrantGhost);
+  const x19GrantBadLevel = await toolSafe(x19Scope, "grant_vm", { vm_id: x19Vm.payload.vm?.id, level: "root" });
+  check("grant_vm：level 只收 member/sudo", x19GrantBadLevel.error === "invalid_level", x19GrantBadLevel);
+  const x19CtxGranted = await toolSafe(x19Scope, "get_context", {});
+  check("授权后 get_context 立刻能看到这台机器",
+    (x19CtxGranted.vms ?? []).some((row) => row.label === "MCP授权机" && row.workdir === "/srv/mcp"
+      && row.host === "deploy@mcp.internal.example:22")
+      && !JSON.stringify(x19CtxGranted).includes("private-key-material"), x19CtxGranted.vms);
+
+  const x19Send = await toolSafe({ agentId: mockAgentId, streamId, ownerId: anaId },
+    "send_message", { content: "@Bo 看下 MCP 面，@小M 自己不该再起任务。" });
+  const x19SentId = (await db.messages.first([["stream_id", streamId], ["seq", x19Send.seq]], { columns: "id" }))?.id;
+  const x19Mailed = await db.mail.list([["message_id", x19SentId]], { columns: "agent_id,status", limit: 20 });
+  check("内部 send_message：@ 到的人与员工都记进 mentions",
+    Number(x19Send.seq) > 0 && (x19Send.mentions ?? []).length === 2, x19Send);
+  check("内部 send_message：发起者自己 @ 自己不另起任务", x19Mailed.length === 0, x19Mailed);
+  const x19Outbox = await db.outbox.list([["stream_id", streamId], ["user_id", boId]], {
+    columns: "id,kind,subject", limit: 20,
+  });
+  check("内部 send_message：被 @ 的真人拿到通知",
+    x19Outbox.some((row) => row.kind === "mention" && String(row.subject).includes("MCP 面")), x19Outbox);
+  const x19SendEmpty = await toolSafe(x19Scope, "send_message", { content: "" });
+  check("内部 send_message：空正文被参数校验挡下", x19SendEmpty.error === "invalid_content", x19SendEmpty);
+
+  const x19VmCleanup = await call("vms.delete", { token: ana, body: { id: x19Vm.payload.vm?.id } });
+  const x19CtxAfterDelete = await toolSafe(x19Scope, "get_context", {});
+  check("删掉机器后 get_context 里不再有它（也不留 revoked 幽灵行）",
+    x19VmCleanup.payload.ok === true
+      && (x19CtxAfterDelete.vms ?? []).every((row) => row.label !== "MCP授权机"), x19CtxAfterDelete.vms);
+  await call("vms.delete", { token: bToken, body: { id: x19BoVm.payload.vm?.id } });
+
+  step("\n§20 轨迹：步骤落库、原文截断与读取权限");
+  const mock20 = await startMockUpstream();
+  await call("agents.update", {
+    token: ana, body: { id: mockAgentId, api_base_url: `http://127.0.0.1:${mock20.port}/v1` },
+  });
+  const zed = await call("auth.register", { body: { email: "zed@example.com", password: "passw0rd-12", display_name: "Zed" } });
+  const zedToken = (await call("auth.login", { body: { email: "zed@example.com", password: "passw0rd-12" } })).payload.token;
+  const newestMail = async () => (await db.mail.list([["agent_id", mockAgentId]], {
+    columns: "id,status,message_id", order: ["created_at", { ascending: false }], limit: 1,
+  }))[0]?.id;
+  const sendFor = async (content) => {
+    await call("messages.send", {
+      token: ana, body: { stream_id: streamId, content, mentions: [{ type: "agent", id: mockAgentId }] },
+    });
+    await call("scheduler.tick", { token: ana, method: "GET" });
+    return newestMail();
+  };
+
+  const x20Mail = await sendFor("@小M 查历史里的发布清单（轨迹样本）");
+  const x20Traj = await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: x20Mail } });
+  const x20Steps = x20Traj.payload.steps ?? [];
+  check("一次带工具的运行落成 模型→工具→模型 三步", x20Traj.payload.ok === true
+    && x20Steps.map((row) => row.kind).join(",") === "model,tool,model", x20Steps.map((row) => row.kind));
+  check("步骤序号在同一封运行里密排", x20Steps.map((row) => row.seq).join(",") === "1,2,3", x20Steps.map((row) => row.seq));
+  check("每一步都带起止与耗时且已合上", x20Steps.every((row) => row.status === "done"
+    && Number(row.duration_ms) >= 0 && row.started_at && row.finished_at), x20Steps);
+  check("思考链增量真的被抓进 model 步", String(x20Steps[0]?.detail?.reasoning ?? "").includes("search_history"), x20Steps[0]?.detail);
+  check("模型步记下本轮上下文的口径", Number(JSON.parse(String(x20Steps[0]?.detail?.context ?? "{}")).blocks) === 2
+    && Number(JSON.parse(String(x20Steps[0]?.detail?.context ?? "{}")).chars) > 0, x20Steps[0]?.detail?.context);
+  check("请求带了 stream_options，用量四列才落得下来", Number(x20Steps[0]?.input_tokens) === 812
+    && Number(x20Steps[0]?.output_tokens) === 24 && Number(x20Steps[0]?.cached_tokens) === 640
+    && Number(x20Steps[0]?.reasoning_tokens) === 9, x20Steps[0]);
+  check("首字延迟被单独记成一个数", x20Steps[0]?.first_token_ms !== null
+    && Number.isFinite(Number(x20Steps[0]?.first_token_ms)), x20Steps[0]?.first_token_ms);
+  check("工具步把参数与结果原文都留在轨迹里", x20Steps[1]?.name === "search_history"
+    && String(x20Steps[1]?.detail?.args ?? "").includes("发布清单")
+    && String(x20Steps[1]?.detail?.result ?? "").includes("hits"), x20Steps[1]);
+  check("工具步与模型调用按 call_id 成对", String(x20Steps[1]?.call_id ?? "").startsWith("call_mock_"), x20Steps[1]?.call_id);
+  check("轨迹响应带出工具的入参 Schema，检视器才有 Schema 页",
+    (x20Traj.payload.schemas ?? []).some((row) => row.name === "search_history" && row.parameters?.properties?.query),
+    x20Traj.payload.schemas);
+  const x20Presence = await call("agents.presence", { token: ana, method: "GET", body: { agent_id: mockAgentId } });
+  const x20LaneMail = (x20Presence.payload.queue ?? []).find((row) => row.id === x20Mail);
+  check("现场状态把步骤一起带回，时间线不必逐封再问", x20LaneMail?.steps?.length === 3, x20Mail);
+  check("时间线用的轻列不含正文，点开某一步才取 detail",
+    (x20LaneMail?.steps ?? []).every((row) => row.detail === undefined)
+    && x20Steps.every((row) => row.detail !== undefined), x20LaneMail?.steps?.[0]);
+
+  const x20GhostMail = await sendFor("@小M 轨迹越界工具试一下");
+  const x20GhostSteps = (await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: x20GhostMail } })).payload.steps ?? [];
+  const x20Rejected = x20GhostSteps.find((row) => row.name === "drop_table");
+  check("模型编出来的工具名也留一条失败步骤，而不是悄悄消失",
+    x20Rejected?.status === "failed" && x20Rejected?.error === "tool_not_allowed"
+    && String(x20Rejected?.detail?.args ?? "").includes("\"x\""), x20Rejected);
+  check("越界工具不拖垮这轮：最终仍回一条", (await db.mail.byId(x20GhostMail, { columns: "status" }))?.status === "done", x20GhostMail);
+
+  const x20NoTrace = await call("agents.trajectory", { token: zedToken, method: "GET", body: { mail_id: x20Mail } });
+  check("非主人且非群成员读不到轨迹", x20NoTrace.status === 403 && x20NoTrace.payload.error === "trajectory_forbidden", x20NoTrace.payload);
+  const x20Member = await call("agents.trajectory", { token: bToken, method: "GET", body: { mail_id: x20Mail } });
+  check("同群成员能看这封运行的轨迹", x20Member.payload.ok === true
+    && x20Member.payload.mail?.agent?.name === "小M", x20Member.payload);
+  const x20GhostId = await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: crypto.randomUUID() } });
+  check("没有这封运行给 mail_not_found", x20GhostId.payload.error === "mail_not_found", x20GhostId.payload);
+  const x20BadId = await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: "not-a-uuid" } });
+  check("mail_id 非法直接挡下", x20BadId.payload.error === "invalid_mail_id", x20BadId.payload);
+
+  // 单步上限：直接在管道上验，不靠模型凑出超长正文。
+  const x20ProbeMail = crypto.randomUUID();
+  const x20Probe = createStepWriter(db, { mailId: x20ProbeMail, agentId: mockAgentId, streamId });
+  const x20TraceScope = { agentId: mockAgentId, streamId, ownerId: anaId, trace: x20Probe };
+  await toolSafe(x20TraceScope, "upload_file", { name: "轨迹大文件.txt", content: "字".repeat(13000) });
+  const x20Uploaded = await toolSafe(x20TraceScope, "read_file", { name: "轨迹大文件.txt" });
+  const x20ProbeSteps = await db.run_steps.list([["mail_id", x20ProbeMail]], {
+    columns: "seq,kind,name,status,detail,chars", order: ["seq", { ascending: true }],
+  });
+  const x20Args = x20ProbeSteps[0]?.detail ?? {};
+  check("超上限的参数截到上限并记下原文长度",
+    String(x20Args.args ?? "").length === 2000 && Number(x20Args.args_clipped) > 13000, { clipped: x20Args.args_clipped });
+  const x20Result = x20ProbeSteps[1]?.detail ?? {};
+  check("超上限的结果同样截断并留 digest", String(x20Result.result ?? "").length === 8000
+    && Number(x20Result.result_clipped) > 8000 && Number(x20ProbeSteps[1]?.chars) > 12000, {
+    len: String(x20Result.result ?? "").length, clipped: x20Result.result_clipped,
+  });
+  check("截断只发生在轨迹里，工具本身照常把结果还给模型", x20Uploaded.name === "轨迹大文件.txt"
+    && String(x20Uploaded.content ?? "").length > 8000, { name: x20Uploaded.name, contentLength: String(x20Uploaded.content ?? "").length });
+  const x20ProbeBefore = await db.run_steps.total([["mail_id", x20ProbeMail]]);
+  await toolSafe({ agentId: mockAgentId, streamId, ownerId: anaId }, "get_announcement", {});
+  check("外部 MCP（作用域里没有 trace）不落步骤",
+    (await db.run_steps.total([["mail_id", x20ProbeMail]])) === x20ProbeBefore, x20ProbeBefore);
+  const x20Orphan = await x20Probe.openModel({ model: "mock" });
+  const x20Reaped = await closeOrphanSteps(db, x20ProbeMail, { error: "slice_interrupted" });
+  const x20OrphanRow = await db.run_steps.byId(x20Orphan.id, { columns: "status,error,finished_at" });
+  check("没合上的步骤会被结掉，时间线不留假高光", x20Reaped === 1 && x20OrphanRow?.status === "cancelled"
+    && x20OrphanRow?.error === "slice_interrupted" && Boolean(x20OrphanRow?.finished_at), x20OrphanRow);
+  await mock20.close();
+
+  step("\n§21 插件：外部 MCP 连接器的接入、隔离与调用");
+  const mock21 = await startMockConnector();
+  const pluginBase = `http://127.0.0.1:${mock21.port}`;
+  const x21Scope = { agentId: mockAgentId, streamId, ownerId: anaId };
+  const x21Add = await call("plugins.add", {
+    token: ana, body: { name: "天气插件", endpoint: `${pluginBase}/mcp`, token: "sk-weather-1234" },
+  });
+  const x21Id = x21Add.payload.plugin?.id;
+  check("接入连接器：探通并把工具缓存进库里", x21Add.payload.ok === true
+    && x21Add.payload.plugin?.status === "ready" && x21Add.payload.plugin?.tool_count === 4, x21Add.payload);
+  check("不合规矩的工具如实记成 skipped，不做静默改名",
+    (x21Add.payload.probe?.skipped ?? []).map((row) => row.reason).join(",") === "invalid_name,no_schema,duplicate_name",
+    x21Add.payload.probe?.skipped);
+  check("令牌只回尾号，密文列从不出现在响应里",
+    x21Add.payload.plugin?.auth_tail === "••••1234" && !JSON.stringify(x21Add.payload).includes("auth_cipher"), x21Add.payload.plugin);
+  check("探测真的带上 Bearer 头",
+    mock21.headers.length >= 2 && mock21.headers.every((row) => row === "Bearer sk-weather-1234"), mock21.headers);
+  check("清单里带出状态与工具数",
+    (await call("plugins.list", { token: ana, method: "GET" })).payload.items
+      ?.some((row) => row.id === x21Id && row.status === "ready" && row.tool_count === 4), x21Id);
+  check("未登录读不到插件清单", (await call("plugins.list", { method: "GET" })).status === 401);
+
+  const x21BoList = await call("plugins.list", { token: bToken, method: "GET" });
+  check("别人的连接器不出现在我的清单", (x21BoList.payload.items ?? []).every((row) => row.id !== x21Id), x21BoList.payload.items);
+  check("别人探测我的连接器给 plugin_not_owned",
+    (await call("plugins.probe", { token: bToken, body: { id: x21Id } })).payload.error === "plugin_not_owned");
+  check("别人改不了我的连接器",
+    (await call("plugins.update", { token: bToken, body: { id: x21Id, enabled: false } })).payload.error === "plugin_not_owned");
+  check("别人删不掉我的连接器",
+    (await call("plugins.remove", { token: bToken, body: { id: x21Id } })).payload.error === "plugin_not_owned");
+  check("查不到的连接器给 plugin_not_found",
+    (await call("plugins.probe", { token: ana, body: { id: crypto.randomUUID() } })).payload.error === "plugin_not_found");
+
+  const x21Insecure = await call("plugins.add", { token: ana, body: { name: "内网", endpoint: "http://127.0.0.1:9/mcp" }, entry: prodHandler });
+  check("生产形态拒掉 http 明文地址", x21Insecure.payload.error === "insecure_api_base_url", x21Insecure.payload);
+  const x21Meta = await call("plugins.add", { token: ana, body: { name: "元数据", endpoint: "https://169.254.169.254/mcp" }, entry: prodHandler });
+  check("生产形态连 https 的链路本地地址也挡", x21Meta.payload.error === "private_api_base_url", x21Meta.payload);
+  const x21Demo = await call("plugins.add", { token: ana, body: { name: "演示", endpoint: "demo://local" } });
+  check("内置演示端点不是插件地址", x21Demo.payload.error === "invalid_api_base_url", x21Demo.payload);
+  const x21Creds = await call("plugins.add", { token: ana, body: { name: "带凭据", endpoint: "https://u:p@example.com/mcp" }, entry: prodHandler });
+  check("URL 里塞用户名密码直接拒", x21Creds.payload.error === "invalid_api_base_url", x21Creds.payload);
+  const x21LongName = await call("plugins.add", { token: ana, body: { name: "名".repeat(41), endpoint: `${pluginBase}/mcp` } });
+  check("插件名超 40 字挡下", x21LongName.payload.error === "invalid_plugin_name", x21LongName.payload);
+  check("被挡下的地址一行都没落库", (await call("plugins.list", { token: ana, method: "GET" })).payload.items?.length === 1);
+
+  const x21Dead = await call("plugins.add", { token: ana, body: { name: "死服务", endpoint: "http://127.0.0.1:1/mcp" } });
+  check("连不上也留下行并标 error，用户能就地重测", x21Dead.payload.ok === true
+    && x21Dead.payload.plugin?.status === "error" && x21Dead.payload.probe_error === "plugin_unreachable"
+    && x21Dead.payload.plugin?.last_error === "plugin_unreachable", x21Dead.payload);
+  const x21Bad = await call("plugins.add", { token: ana, body: { name: "乱回", endpoint: `${pluginBase}/bad` } });
+  check("非 JSON 回包判 plugin_bad_response", x21Bad.payload.probe_error === "plugin_bad_response", x21Bad.payload);
+  const x21Huge = await call("plugins.add", { token: ana, body: { name: "超大", endpoint: `${pluginBase}/huge` } });
+  check("回包超过 512KB 直接判失败，不把库里塞满", x21Huge.payload.probe_error === "plugin_too_large", x21Huge.payload);
+  const x21Deny = await call("plugins.add", { token: ana, body: { name: "要鉴权", endpoint: `${pluginBase}/deny` } });
+  check("401 判 plugin_unauthorized", x21Deny.payload.probe_error === "plugin_unauthorized", x21Deny.payload);
+  for (const id of [x21Dead, x21Bad, x21Huge, x21Deny].map((row) => row.payload.plugin?.id)) {
+    await call("plugins.remove", { token: ana, body: { id } });
+  }
+  check("删除后清单回到一条", (await call("plugins.list", { token: ana, method: "GET" })).payload.items?.length === 1);
+
+  const zedId = zed.payload.user?.id;
+  const stamp = new Date().toISOString();
+  for (let i = 0; i < 12; i += 1) {
+    await db.plugins.insert({
+      id: crypto.randomUUID(), owner_id: zedId, name: `占位${i}`, endpoint: `${pluginBase}/mcp`,
+      auth_cipher: null, auth_tail: "", tools: [], tools_at: null, status: "untested",
+      last_error: null, enabled: true, created_at: stamp, updated_at: stamp,
+    });
+  }
+  const x21HeadersBefore = mock21.headers.length;
+  const x21Full = await call("plugins.add", { token: zedToken, body: { name: "第 13 条", endpoint: `${pluginBase}/mcp` } });
+  check("每人最多接 12 条连接器", x21Full.payload.error === "too_many_plugins", x21Full.payload);
+  check("超量这条在出网之前就被挡下", mock21.headers.length === x21HeadersBefore, {
+    before: x21HeadersBefore, after: mock21.headers.length,
+  });
+  await db.plugins.removeAll([["owner_id", zedId]]);
+  const x21Zed = await call("plugins.add", { token: zedToken, body: { name: "Zed 自己的", endpoint: `${pluginBase}/mcp`, token: "zed-7777" } });
+  check("腾出额度后能再接，且各人的连接器互不进对方的清单", x21Zed.payload.plugin?.status === "ready"
+    && (await connectorToolDefs(db, anaId, INTERNAL_TOOL_NAMES)).every((row) => row.function.name !== "zed_only"), x21Zed.payload);
+
+  const x21Defs = await connectorToolDefs(db, anaId, INTERNAL_TOOL_NAMES);
+  check("主人启用中连接器的工具并进员工清单",
+    x21Defs.some((row) => row.function.name === "get_weather") && x21Defs.some((row) => row.function.name === "long_text"),
+    x21Defs.map((row) => row.function.name));
+  check("与内置重名的外部工具让位，不出现两份",
+    !x21Defs.some((row) => row.function.name === "search_history"), x21Defs.map((row) => row.function.name));
+
+  await call("plugins.update", { token: ana, body: { id: x21Id, enabled: false } });
+  check("停用后外部声明立刻从清单消失", (await connectorToolDefs(db, anaId, INTERNAL_TOOL_NAMES)).length === 0);
+  check("停用中的连接器工具调用被拒", (await toolSafe(x21Scope, "get_weather", { city: "杭州" })).error === "tool_not_allowed");
+  const x21Re = await call("plugins.update", { token: ana, body: { id: x21Id, enabled: true } });
+  check("重新启用后名字与开关都如实回显", x21Re.payload.plugin?.name === "天气插件" && x21Re.payload.plugin?.enabled === true, x21Re.payload);
+  const x21Call = await toolSafe(x21Scope, "get_weather", { city: "杭州" });
+  check("员工调用外部工具拿到拼接后的文本", x21Call.ok === true
+    && String(x21Call.text).includes("杭州：晴 26 度") && String(x21Call.text).includes("风力 2 级"), x21Call);
+  check("调用带上解密出来的同一个令牌", mock21.headers.at(-1) === "Bearer sk-weather-1234", mock21.headers.at(-1));
+  check("工具名与参数原样发给外部服务", mock21.calls.at(-1)?.name === "get_weather"
+    && mock21.calls.at(-1)?.arguments?.city === "杭州", mock21.calls.at(-1));
+  const x21Capped = await toolSafe(x21Scope, "long_text", {});
+  check("外部结果超过 6000 字截到 6000，不撑爆上下文", x21Capped.ok === true && x21Capped.text?.length === 6000, { len: x21Capped.text?.length });
+  const x21Boom = await toolSafe(x21Scope, "boom", {});
+  check("外部工具自己报错如实传成错误，不装成成功", x21Boom.error === "plugin_tool_failed" && String(x21Boom.text).includes("炸了"), x21Boom);
+  check("对外 MCP 那条路（作用域里没有 agentId）碰不到插件工具",
+    (await toolSafe({ streamId, ownerId: anaId }, "get_weather", { city: "杭州" })).error === "tool_not_allowed");
+
+  const x21Moved = await call("plugins.update", { token: ana, body: { id: x21Id, name: "改名插件", endpoint: `${pluginBase}/other` } });
+  check("换端点先清掉旧工具缓存，再如实重测", x21Moved.payload.plugin?.name === "改名插件"
+    && x21Moved.payload.plugin?.tools?.length === 0 && x21Moved.payload.plugin?.status === "error"
+    && x21Moved.payload.probe_error === "plugin_rejected", x21Moved.payload);
+  const x21Token = await call("plugins.update", { token: ana, body: { id: x21Id, token: "sk-weather-9999" } });
+  check("换令牌只回新尾号，密文不外泄", x21Token.payload.plugin?.auth_tail === "••••9999"
+    && !JSON.stringify(x21Token.payload).includes("auth_cipher"), x21Token.payload.plugin);
+  const x21Back = await call("plugins.update", { token: ana, body: { id: x21Id, endpoint: `${pluginBase}/mcp` } });
+  check("换回可用端点会重新探通并回填工具", x21Back.payload.plugin?.status === "ready"
+    && x21Back.payload.plugin?.tool_count === 4, x21Back.payload.plugin);
+
+  const mock21b = await startMockUpstream();
+  await call("agents.update", { token: ana, body: { id: mockAgentId, api_base_url: `http://127.0.0.1:${mock21b.port}/v1` } });
+  const x21Mail = await sendFor("@小M 用插件查一下杭州天气（插件天气）");
+  const x21ReqTools = mock21b.seen[0]?.tools ?? [];
+  check("发给模型的清单里并进了外部工具", x21ReqTools.some((row) => row.function?.name === "get_weather"), x21ReqTools.map((row) => row.function?.name));
+  check("内置与外部同名的工具只发一份", x21ReqTools.filter((row) => row.function?.name === "search_history").length === 1);
+  const x21Traj = await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: x21Mail } });
+  const x21Steps = x21Traj.payload.steps ?? [];
+  check("插件调用走同一条管道：模型→工具→模型", x21Steps.map((row) => row.kind).join(",") === "model,tool,model", x21Steps.map((row) => row.kind));
+  check("外部工具的参数与结果都落进轨迹", x21Steps[1]?.name === "get_weather"
+    && String(x21Steps[1]?.detail?.args ?? "").includes("杭州") && String(x21Steps[1]?.detail?.result ?? "").includes("晴 26 度"), x21Steps[1]);
+  check("检视器的 Schema 页也拿得到外部工具的入参声明",
+    (x21Traj.payload.schemas ?? []).some((row) => row.name === "get_weather" && row.parameters?.properties?.city), x21Traj.payload.schemas);
+  check("外部服务慢或报错都不拖垮这轮：最终仍回一条",
+    (await db.mail.byId(x21Mail, { columns: "status" }))?.status === "done", x21Mail);
+  await mock21b.close();
+  await call("plugins.remove", { token: zedToken, body: { id: x21Zed.payload.plugin?.id } });
+  await call("plugins.remove", { token: ana, body: { id: x21Id } });
+  check("清空后插件清单是空的", (await call("plugins.list", { token: ana, method: "GET" })).payload.items?.length === 0);
+  await mock21.close();
+
+  step("\n§22 远端技能市场：技能源、快照安装、版本自查与更新");
+  const mock22 = await startMockRegistry();
+  const regBase = `http://127.0.0.1:${mock22.port}`;
+  const x22Insecure = await call("registries.add", { token: ana, body: { name: "明文源", index_url: `${regBase}/index.json` }, entry: prodHandler });
+  check("生产形态拒掉 http 明文的技能源", x22Insecure.payload.error === "insecure_api_base_url", x22Insecure.payload);
+  const x22Meta = await call("registries.add", { token: ana, body: { name: "元数据源", index_url: "https://169.254.169.254/index.json" }, entry: prodHandler });
+  check("生产形态连 https 的链路本地地址也挡", x22Meta.payload.error === "private_api_base_url", x22Meta.payload);
+  const x22Creds = await call("registries.add", { token: ana, body: { name: "带凭据", index_url: "https://u:p@example.com/index.json" }, entry: prodHandler });
+  check("源地址里塞用户名密码直接拒", x22Creds.payload.error === "invalid_api_base_url", x22Creds.payload);
+  const x22Query = await call("registries.add", { token: ana, body: { name: "带查询", index_url: `${regBase}/index.json?raw=1` } });
+  check("源地址不收查询串：少一个绕过校验的花样", x22Query.payload.error === "invalid_api_base_url", x22Query.payload);
+  check("被挡下的源一行都没落库", (await call("registries.list", { token: ana, method: "GET" })).payload.items?.length === 0, x22Query.payload);
+
+  const x22Add = await call("registries.add", { token: ana, body: { name: "社区技能源", index_url: `${regBase}/index.json` } });
+  const regId = x22Add.payload.registry?.id;
+  check("加源：拉通 index 并记下条数与时间", x22Add.payload.ok === true
+    && x22Add.payload.registry?.skill_count === 5 && x22Add.payload.registry?.last_error === null
+    && Boolean(x22Add.payload.registry?.skills_at), x22Add.payload);
+  check("坏条目如实记成 skipped，不悄悄丢掉", (x22Add.payload.probe?.skipped ?? []).map((row) => row.reason).join(",")
+    === "invalid_slug,invalid_name,invalid_body_url,invalid_body_url,duplicate_slug", x22Add.payload.probe?.skipped);
+  check("正文跨源的路子被挡在条目级：别人的地址进不了我们的抓取",
+    (x22Add.payload.probe?.skipped ?? []).some((row) => row.slug === "elsewhere" && row.reason === "invalid_body_url"));
+  check("未登录读不到源清单", (await call("registries.list", { method: "GET" })).status === 401);
+  const x22Dupe = await call("registries.add", { token: ana, body: { name: "同一个源", index_url: `${regBase}/index.json` } });
+  check("同一地址不重复加", x22Dupe.payload.error === "registry_exists", x22Dupe.payload);
+  check("查重挡下时没有多发一次请求", mock22.requests.length === 1, mock22.requests);
+
+  const x22List = await call("skills.remoteList", { token: ana, method: "GET" });
+  check("远端清单带出版本、大小与正文链接", x22List.payload.items?.length === 5
+    && x22List.payload.items.every((row) => row.version === "1.2.0"
+      && String(row.body_url).startsWith(regBase) && row.size === 30
+      && row.registry_name === "社区技能源"), x22List.payload.items?.[0]);
+  check("清单里的正文链接已归一化成绝对地址，且还在这个源上", x22List.payload.items?.every(
+    (row) => row.body_url.startsWith(`${regBase}/`)), x22List.payload.items?.map((row) => row.body_url));
+  check("远端条目在装之前不冒充已装", x22List.payload.items?.every((row) => row.installed_skill_id === null), x22List.payload.items);
+  check("远端按关键词过滤", (await call("skills.remoteList", { token: ana, method: "GET", body: { q: "release" } })).payload.items?.length === 1, x22List.payload.items);
+
+  const x22InstalledBefore = (await call("skills.installed", { token: ana, method: "GET", body: { agent_id: mockAgentId } })).payload.items?.length;
+  const x22Install = await call("skills.remoteInstall", { token: ana, body: { registry_id: regId, slug: "release-check", agent_id: mockAgentId } });
+  const snapId = x22Install.payload.skill?.id;
+  check("从远端装：正文抄一份到本地并记下版本", x22Install.payload.ok === true
+    && x22Install.payload.skill?.source === "remote" && x22Install.payload.skill?.version === "1.2.0"
+    && x22Install.payload.skill?.source_registry_id === regId, x22Install.payload.skill);
+  check("装完这条员工就有了", (await call("skills.installed", { token: ana, method: "GET", body: { agent_id: mockAgentId } })).payload.items?.length === x22InstalledBefore + 1);
+  check("快照正文就是源上那一刻的正文", (await call("skills.get", { token: ana, method: "GET", body: { id: snapId } })).payload.skill?.body === mock22.state.body);
+  check("快照进本地市场，带着版本与来源", (await call("skills.market", { token: ana, method: "GET" })).payload.items
+    ?.some((row) => row.id === snapId && row.version === "1.2.0" && row.source_registry_id === regId));
+  check("快照正文注入员工上下文", (await skillPrompt(store(supabase), mockAgentId)).includes("### release-check 技能"));
+  check("快照不进别人的市场", !(await call("skills.market", { token: bToken, method: "GET" })).payload.items?.some((row) => row.id === snapId));
+  const x22Again = await call("skills.remoteInstall", { token: ana, body: { registry_id: regId, slug: "release-check", agent_id: mockAgentId } });
+  check("重复装同一员工不建第二条快照", x22Again.payload.skill?.id === snapId
+    && x22Again.payload.install?.agents?.[0]?.duplicate === true, x22Again.payload);
+  check("重复装不加安装数", Number((await call("skills.get", { token: ana, method: "GET", body: { id: snapId } })).payload.skill?.installs) === 1);
+
+  const x22AgentCount = (await call("agents.list", { token: ana, method: "GET" })).payload.items?.length;
+  const x22All = await call("skills.remoteInstall", { token: ana, body: { registry_id: regId, slug: "release-check", all_agents: true } });
+  check("装到全部现有员工：新增加已有等于员工数", x22All.payload.install?.scope === "all_agents"
+    && x22All.payload.install?.added + x22All.payload.install?.already === x22AgentCount, x22All.payload.install);
+  check("批量安装按真实新增数累加安装数",
+    Number((await call("skills.get", { token: ana, method: "GET", body: { id: snapId } })).payload.skill?.installs)
+      === 1 + x22All.payload.install?.added, { added: x22All.payload.install?.added });
+
+  const x22Future = await call("skills.remoteInstall", { token: ana, body: { registry_id: regId, slug: "release-check", all_agents: true, include_future: true } });
+  check("标成默认后，以后新建的员工也会带上它", x22Future.payload.future?.is_default === true, x22Future.payload);
+  const x22NewAgent = await call("agents.create", {
+    token: ana, body: { name: "小远", role: "远端技能", api_base_url: "demo://local", api_key: "demo-key-9", model: "demo" },
+  });
+  check("主人新建员工自动装上他的默认技能", (await call("skills.installed", { token: ana, method: "GET", body: { agent_id: x22NewAgent.payload.agent?.id } })).payload.items
+    ?.some((row) => row.id === snapId), x22NewAgent.payload);
+  const x22BoAgent = await call("agents.create", {
+    token: bToken, body: { name: "Bo 的员工", role: "对照", api_base_url: "demo://local", api_key: "demo-key-8", model: "demo" },
+  });
+  const x22BoAgentId = x22BoAgent.payload.agent?.id;
+  check("主人的私有默认不会装到别人的新员工", (await call("skills.installed", { token: bToken, method: "GET", body: { agent_id: x22BoAgentId } })).payload.items
+    ?.every((row) => row.id !== snapId), x22BoAgent.payload);
+
+  const x22Same = await call("skills.checkUpdates", { token: ana, method: "GET", body: { agent_id: mockAgentId } });
+  check("版本自查：源上没出新版本就不提示更新", x22Same.payload.items?.some((row) => row.skill_id === snapId
+    && row.update_available === false), x22Same.payload);
+  mock22.state.version = "1.10.0";
+  mock22.state.body = "# 发布前检查 v1.10\n- 备份\n- 灰度\n- 回滚演练";
+  const x22Newer = await call("skills.remoteList", { token: ana, method: "GET" });
+  check("远端清单发现新版本，给出更新依据", x22Newer.payload.items?.some((row) => row.slug === "release-check"
+    && row.update_available === true && row.installed_version === "1.2.0"), x22Newer.payload.items?.[0]);
+  const x22Check = await call("skills.checkUpdates", { token: ana, method: "GET", body: { agent_id: mockAgentId } });
+  check("员工已装列表能查出该更新了", x22Check.payload.items?.some((row) => row.skill_id === snapId
+    && row.update_available === true && row.latest_version === "1.10.0"), x22Check.payload);
+  const x22Update = await call("skills.remoteUpdate", { token: ana, body: { skill_id: snapId } });
+  const x22UpdatedBody = (await call("skills.get", { token: ana, method: "GET", body: { id: snapId } })).payload.skill?.body;
+  check("更新：正文与版本号一起换过来", x22Update.payload.skill?.version === "1.10.0"
+    && x22Update.payload.from_version === "1.2.0" && x22UpdatedBody === mock22.state.body, x22Update.payload);
+  check("更新响应只回元数据，正文要另外读", x22Update.payload.skill?.body === undefined);
+  check("更新后不再提示", (await call("skills.checkUpdates", { token: ana, method: "GET", body: { agent_id: mockAgentId } })).payload.items
+    ?.some((row) => row.skill_id === snapId && row.update_available === false));
+  const x22UpdateAgain = await call("skills.remoteUpdate", { token: ana, body: { skill_id: snapId } });
+  check("重复更新只刷那一条快照", x22UpdateAgain.payload.skill?.id === snapId
+    && (await db.skills.total([["source_registry_id", regId]], { columns: "id" })) === 1, x22UpdateAgain.payload);
+
+  mock22.state.hidden = ["release-check"];
+  const x22Gone = await call("skills.checkUpdates", { token: ana, method: "GET", body: { agent_id: mockAgentId } });
+  check("源上撤下的条目如实报 skill_not_in_registry", x22Gone.payload.unavailable?.some((row) => row.skill_id === snapId
+    && row.reason === "skill_not_in_registry"), x22Gone.payload);
+  check("撤下的条目装不了", (await call("skills.remoteInstall", { token: ana, body: { registry_id: regId, slug: "release-check", agent_id: mockAgentId } })).payload.error === "skill_not_in_registry");
+  mock22.state.hidden = [];
+
+  for (const [slug, want] of [
+    ["too-large", "registry_body_too_large"], ["empty-body", "registry_body_empty"],
+    ["binary-body", "registry_body_binary"], ["long-body", "skill_body_too_large"],
+  ]) {
+    const guarded = await call("skills.remoteInstall", { token: ana, body: { registry_id: regId, slug, agent_id: mockAgentId } });
+    check(`${slug}：正文不合规矩整条拒收，报 ${want}`, guarded.payload.error === want, guarded.payload);
+  }
+  check("被拒的正文不留半条快照", (await db.skills.total([["source_registry_id", regId]], { columns: "id" })) === 1);
+  check("装一条被跳过的条目，报出跳过的原因", (await call("skills.remoteInstall", { token: ana, body: { registry_id: regId, slug: "Standup Note", agent_id: mockAgentId } })).payload.error === "skill_skipped_invalid_slug");
+  check("装源上没有的 slug", (await call("skills.remoteInstall", { token: ana, body: { registry_id: regId, slug: "nope", agent_id: mockAgentId } })).payload.error === "skill_not_in_registry");
+
+  check("别人看不到我的源", (await call("registries.refresh", { token: bToken, body: { id: regId } })).payload.error === "registry_not_owned");
+  check("别人改不了我的源", (await call("registries.update", { token: bToken, body: { id: regId, enabled: false } })).payload.error === "registry_not_owned");
+  check("别人删不掉我的源", (await call("registries.remove", { token: bToken, body: { id: regId } })).payload.error === "registry_not_owned");
+  check("别人不能从我的源装技能", (await call("skills.remoteInstall", { token: bToken, body: { registry_id: regId, slug: "empty-body", agent_id: x22BoAgentId } })).payload.error === "registry_not_owned");
+  check("我自己的源还能刷", (await call("registries.refresh", { token: ana, body: { id: regId } })).payload.registry?.skill_count === 5);
+  check("查不到的源给 registry_not_found", (await call("registries.refresh", { token: ana, body: { id: crypto.randomUUID() } })).payload.error === "registry_not_found");
+  check("别人更新不了我的快照", (await call("skills.remoteUpdate", { token: bToken, body: { skill_id: snapId } })).payload.error === "skill_not_owned");
+  check("别人的员工查更新被拒", (await call("skills.checkUpdates", { token: bToken, method: "GET", body: { agent_id: mockAgentId } })).payload.error === "agent_not_owned");
+  check("本地上传的技能没有源可更", (await call("skills.remoteUpdate", { token: ana, body: { skill_id: uploaded.payload.skill?.id } })).payload.error === "skill_not_remote");
+
+  const x22Bad = await call("registries.add", { token: ana, body: { name: "乱回", index_url: `${regBase}/bad.json` } });
+  check("非 JSON 的 index 标 registry_bad_response，源行留着可重测", x22Bad.payload.ok === true
+    && x22Bad.payload.registry?.last_error === "registry_bad_response" && x22Bad.payload.probe?.error === "registry_bad_response", x22Bad.payload);
+  const x22Schema = await call("registries.add", { token: ana, body: { name: "版本不认", index_url: `${regBase}/schema2.json` } });
+  check("index 的 schema 版本不认识就整源拒收", x22Schema.payload.probe?.error === "registry_schema_unsupported", x22Schema.payload);
+  const x22Move = await call("registries.add", { token: ana, body: { name: "跳转源", index_url: `${regBase}/move.json` } });
+  check("源用重定向把人引去别处：拒收", x22Move.payload.probe?.error === "registry_redirect_blocked", x22Move.payload);
+  const x22Deny = await call("registries.add", { token: ana, body: { name: "要鉴权", index_url: `${regBase}/deny.json` } });
+  check("401 的源标 registry_unauthorized", x22Deny.payload.probe?.error === "registry_unauthorized", x22Deny.payload);
+  for (const id of [x22Bad, x22Schema, x22Move, x22Deny].map((row) => row.payload.registry?.id)) {
+    await call("registries.remove", { token: ana, body: { id } });
+  }
+  check("清掉坏源后回到一条", (await call("registries.list", { token: ana, method: "GET" })).payload.items?.length === 1);
+
+  const x22Dead = await call("registries.add", { token: ana, body: { name: "死源", index_url: "http://127.0.0.1:1/index.json" } });
+  check("连不上也留下源行并标 error", x22Dead.payload.ok === true && x22Dead.payload.registry?.last_error === "registry_unreachable", x22Dead.payload);
+  const x22Mixed = await call("skills.remoteList", { token: ana, method: "GET" });
+  check("一个源挂了不影响另一个出条目，错误标在挂掉那个上", x22Mixed.payload.registries?.some((row) => row.error === "registry_unreachable")
+    && x22Mixed.payload.items?.length === 5, x22Mixed.payload.registries);
+  await call("registries.remove", { token: ana, body: { id: x22Dead.payload.registry?.id } });
+
+  const x22Many = await call("registries.add", { token: ana, body: { name: "超大清单", index_url: `${regBase}/many.json` } });
+  check("单源最多收 200 条，多出来的记成 over_limit", x22Many.payload.registry?.skill_count === 200
+    && x22Many.payload.probe?.skipped?.some((row) => row.reason === "over_limit"), x22Many.payload.registry);
+  const manyId = x22Many.payload.registry?.id;
+  const x22Off = await call("registries.update", { token: ana, body: { id: manyId, enabled: false } });
+  check("停用后远端清单不再拉这个源", x22Off.payload.registry?.enabled === false
+    && (await call("skills.remoteList", { token: ana, method: "GET" })).payload.items?.length === 5, x22Off.payload);
+  check("点名查某个源时，停用了也查得到", (await call("skills.remoteList", { token: ana, method: "GET", body: { registry_id: manyId } })).payload.items?.length === 200);
+
+  const stamp22 = new Date().toISOString();
+  const placeholderIds = [];
+  for (let i = 0; i < 6; i += 1) {
+    const row = await db.skill_registries.insert({
+      id: crypto.randomUUID(), owner_id: anaId, name: `占位${i}`,
+      index_url: `https://placeholder${i}.example.com/index.json`, skill_count: 0,
+      last_error: null, skills_at: null, enabled: true, created_at: stamp22, updated_at: stamp22,
+    });
+    placeholderIds.push(row.id);
+  }
+  const x22ReqBefore = mock22.requests.length;
+  const x22Full = await call("registries.add", { token: ana, body: { name: "第九个源", index_url: `${regBase}/index.json` } });
+  check("每人最多 8 个技能源", x22Full.payload.error === "too_many_registries", x22Full.payload);
+  check("超量这条在出网之前就被挡下", mock22.requests.length === x22ReqBefore, {
+    before: x22ReqBefore, after: mock22.requests.length,
+  });
+  for (const id of placeholderIds) await db.skill_registries.remove([["id", id]]);
+
+  await call("registries.remove", { token: ana, body: { id: manyId } });
+  check("删源不抽走已抄到本地的技能", (await call("skills.get", { token: ana, method: "GET", body: { id: snapId } })).payload.skill?.id === snapId);
+  await call("registries.remove", { token: ana, body: { id: regId } });
+  check("源没了，版本自查如实报 registry_not_found", (await call("skills.checkUpdates", { token: ana, method: "GET", body: { agent_id: mockAgentId } })).payload.unavailable
+    ?.some((row) => row.skill_id === snapId && row.reason === "registry_not_found"));
+  check("清空后源清单是空的", (await call("registries.list", { token: ana, method: "GET" })).payload.items?.length === 0);
+  check("版本比对按数字段比大小：1.10 新于 1.2", isUpdateAvailable("1.2.0", "1.10.0") === true
+    && isUpdateAvailable("1.10.0", "1.9.9") === false);
+  check("版本比对：没装过报有更新，源上没版本不误报，相同不报", isUpdateAvailable("", "1.0.0") === true
+    && isUpdateAvailable("1.0.0", "") === false && isUpdateAvailable("1.0.0", "1.0.0") === false);
+  check("版本比对：比不动的非数字版本，不同就算有更新", isUpdateAvailable("v1", "v2") === true
+    && isUpdateAvailable("v2", "v2") === false);
+  await mock22.close();
 
   console.log(`\n结果：${passed} 项通过，${failures.length} 项失败`);
   if (failures.length) {

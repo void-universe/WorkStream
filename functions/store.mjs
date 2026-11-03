@@ -110,6 +110,20 @@ function table(client, name) {
       if (problem) throw new Halt(failure, 503, problem);
       return result.data?.id ?? null;
     },
+    /**
+     * 按条件批量删：分页取 id 再逐行删，直到条件不再命中。
+     * remove 走的是 maybeSingle，条件命中多行时线上会直接报错，不能拿它做批量删。
+     */
+    async removeAll(pairs, { pageSize = 500, maxRows = 5000 } = {}) {
+      let total = 0;
+      for (;;) {
+        const rows = await this.list(pairs, { columns: "id", limit: pageSize });
+        if (!rows.length) return total;
+        for (const row of rows) await this.remove([["id", row.id]]);
+        total += rows.length;
+        if (total > maxRows) throw new Halt("remove_all_overflow", 503, { table, total });
+      }
+    },
   };
 }
 

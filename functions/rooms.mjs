@@ -115,7 +115,7 @@ async function insertMessage(db, { streamId, senderType, senderId, senderName, c
     content,
     mentions: mentions ?? [],
     reply_to: replyTo ?? null,
-    kind: kind ?? "chat",
+    kind: kind ?? (senderType === "system" ? "system" : "chat"),
     error: null,
     attachments: attachments ?? [],
     created_at: now(),
@@ -293,7 +293,8 @@ export const actions = {
     if (!stream) throw new Halt("stream_not_found", 404);
     if (stream.owner_id !== user.id) throw new Halt("owner_only", 403);
     const targetId = uuid(body.membership_id, "membership_id");
-    const target = await db.members.byId(targetId, { columns: "id,principal_type,principal_id,role" });
+    // 取回的列必须包含 stream_id：少了它下面的归属校验永远为真，移交会一律假装“成员不存在”。
+    const target = await db.members.byId(targetId, { columns: "id,stream_id,principal_type,principal_id,role" });
     if (!target || target.stream_id !== streamId || target.principal_type !== "human") {
       throw new Halt("member_missing", 404);
     }
@@ -518,15 +519,34 @@ export const actions = {
     return json({ ok: true });
   },
 
+  /**
+   * 停用群：把所有入口一次关掉——成员关系、待批的申请与邀请、优先级权重、虚拟机授权、
+   * 群记录本身，顺带让这条群钥匙随记录一起失效。
+   * 历史消息按保留策略留在库里，但正文先洗掉。
+   */
   async "streams.delete"({ db, user, body }) {
     const streamId = uuid(body.stream_id, "stream_id");
     const stream = await db.streams.byId(streamId, { columns: "id,owner_id" });
     if (!stream) throw new Halt("stream_not_found", 404);
     if (stream.owner_id !== user.id) throw new Halt("owner_only", 403);
-    await db.members.patch([["stream_id", streamId]], { role: "removed", updated_at: now() });
-    await db.messages.patch([["stream_id", streamId], ["kind", "chat"]], { content: "[群已删除]", kind: "system", updated_at: now() });
-    await db.stream_vms.patch([["stream_id", streamId]], { level: "revoked", updated_at: now() });
-    return json({ ok: true, note: "群已停用；历史消息按保留策略留在库中。" });
+    // 排队中的任务先取消，否则群没了、信还在队列里悄悄躺着。
+    await db.mail.patch([["stream_id", streamId], ["status", "queued"]], {
+      status: "cancelled", error: "stream_closed", updated_at: now(),
+    });
+    await db.requests.patch([["stream_id", streamId], ["status", "pending"]], {
+      status: "rejected", handled_at: now(), updated_at: now(),
+    });
+    // 读路径按“有没有成员行”放行，所以成员关系必须真删；写 role="removed" 没有读者，等于没停用。
+    await db.members.removeAll([["stream_id", streamId]]);
+    await db.slice_prefs.removeAll([["stream_id", streamId]]);
+    await db.stream_vms.removeAll([["stream_id", streamId]]);
+    // 正文一律清空：系统提示里也带着文件名与公告正文，按 kind 只清聊天会漏出内容。
+    await db.messages.patch([["stream_id", streamId]], {
+      content: "[群已删除]", kind: "system", updated_at: now(),
+    });
+    const removed = await db.streams.remove([["id", streamId], ["owner_id", user.id]]);
+    if (!removed) throw new Halt("stream_delete_failed", 503);
+    return json({ ok: true, id: removed, note: "群已停用：所有入口关闭，历史消息按保留策略留在库中。" });
   },
 
   async "files.list"({ db, user, params }) {

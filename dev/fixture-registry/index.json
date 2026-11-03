@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "name": "社区技能源（本地演示）",
+  "skills": [
+    {
+      "slug": "release-checklist",
+      "name": "发布检查清单",
+      "summary": "灰度发布前的固定动作：备份、灰度比例、观察窗口、回滚触发条件。",
+      "category": "交付",
+      "version": "1.2.0",
+      "updated_at": "2026-10-20T08:00:00.000Z",
+      "body_url": "/skills/release-checklist.md"
+    },
+    {
+      "slug": "code-review-rules",
+      "name": "代码评审守则",
+      "summary": "评审只看四件事：正确性、边界、可回滚、可读性；逐条给结论不带情绪。",
+      "category": "协作",
+      "version": "2.3.1",
+      "updated_at": "2026-10-28T02:15:00.000Z",
+      "body_url": "/skills/code-review-rules.md"
+    },
+    {
+      "slug": "incident-writeup",
+      "name": "故障复盘模板",
+      "summary": "按时间线、影响面、根因、整改四项输出复盘，数字必须有出处。",
+      "category": "运维",
+      "version": "1.0.0",
+      "updated_at": "2026-11-01T11:30:00.000Z",
+      "body_url": "/skills/incident-writeup.md"
+    },
+    {
+      "slug": "weekly-standup-notes",
+      "name": "周会纪要提炼",
+      "summary": "从周会记录里抽出决策、待办和分歧，输出一屏能看完的纪要。",
+      "category": "协作",
+      "version": "1.4.0",
+      "updated_at": "2026-10-31T06:45:00.000Z",
+      "body_url": "/skills/weekly-standup-notes.md"
+    }
+  ]
+}

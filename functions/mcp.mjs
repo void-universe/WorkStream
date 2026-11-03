@@ -5,6 +5,9 @@
 import { deliver } from "./accounts.mjs";
 import { streamWeight } from "./chat.mjs";
 import { createGroupFile, deleteGroupFile, insertMessage } from "./rooms.mjs";
+import { createPipeline } from "./pipeline.mjs";
+import { callConnectorTool, resolveConnectorTool } from "./plugins.mjs";
+import { runStepsTrace } from "./steps.mjs";
 import { seal } from "./sec.mjs";
 import { BUILTIN_SKILLS, installedSkillRows } from "./skills.mjs";
 import { CONTEXT_CHARS_DEFAULT, email as emailOf, json, newId, now, oneOf, sha256Hex, text, truncate, uuid } from "./util.mjs";
@@ -220,6 +223,14 @@ export const EXTERNAL_TOOL_NAMES = INTERNAL_TOOL_NAMES.filter((name) => !INTERNA
 
 export const toolDefinitions = () => TOOL_DEFINITIONS;
 
+/** 轨迹检视器的 Schema 页：按名字回工具的入参 JSON Schema，未声明的名字直接过滤掉。 */
+export const toolSchemas = (names) => {
+  const wanted = new Set(names ?? []);
+  return TOOL_DEFINITIONS
+    .filter((definition) => wanted.has(definition.function.name))
+    .map((definition) => ({ name: definition.function.name, parameters: definition.function.parameters }));
+};
+
 const likeEscape = (value) => value.replace(/[%_,]/g, " ").slice(0, 60);
 
 const clampCount = (value, fallback, max) => {
@@ -349,361 +360,392 @@ async function createStream(db, scope, args) {
   };
 }
 
-export async function executeTool(db, scope, name, args = {}, env = null) {
-  if (!INTERNAL_TOOL_NAMES.includes(name)) return { error: "tool_not_allowed" };
-  if (!scope.agentId && INTERNAL_ONLY.has(name)) return { error: "internal_only" };
-  const streamId = scope.streamId;
-  switch (name) {
-    case "search_history": {
-      const query = text(args.query ?? "", { max: 120, name: "query" });
-      const limit = clampCount(args.limit, 10, 20);
-      let builder = db.client.from("messages")
-        .select("seq,sender_type,sender_name,content,created_at")
-        .eq("stream_id", streamId)
-        .or(`content.ilike.%${likeEscape(query)}%,sender_name.ilike.%${likeEscape(query)}%`);
-      if (args.before_seq !== undefined && args.before_seq !== null) {
-        const cursor = Number(args.before_seq);
-        if (Number.isSafeInteger(cursor) && cursor >= 0) builder = builder.lt("seq", cursor);
-      }
-      const result = await builder.order("seq", { ascending: false }).limit(limit);
-      if (result.error) return { error: "history_unavailable" };
+// 每个工具一个 handler：名字就是 TOOL_DEFINITIONS 里的 function.name，注册表与声明必须一一对上。
+const TOOL_HANDLERS = {
+  search_history: async ({ db, scope, args, env, streamId }) => {
+    const query = text(args.query ?? "", { max: 120, name: "query" });
+    const limit = clampCount(args.limit, 10, 20);
+    let builder = db.client.from("messages")
+      .select("seq,sender_type,sender_name,content,created_at")
+      .eq("stream_id", streamId)
+      .or(`content.ilike.%${likeEscape(query)}%,sender_name.ilike.%${likeEscape(query)}%`);
+    if (args.before_seq !== undefined && args.before_seq !== null) {
+      const cursor = Number(args.before_seq);
+      if (Number.isSafeInteger(cursor) && cursor >= 0) builder = builder.lt("seq", cursor);
+    }
+    const result = await builder.order("seq", { ascending: false }).limit(limit);
+    if (result.error) return { error: "history_unavailable" };
+    return {
+      query,
+      hits: (result.data ?? []).map((row) => ({
+        seq: row.seq, from: `${row.sender_type === "agent" ? "虚拟" : "人"}:${row.sender_name}`,
+        at: row.created_at, text: truncate(row.content, 600),
+      })),
+      note: "检索来自 MCP：群历史在压缩后仍然完整保留，可用 read_window 取全文。",
+    };
+  },
+  read_window: async ({ db, scope, args, env, streamId }) => {
+    const from = Number(args.from_seq);
+    const to = Number(args.to_seq);
+    if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || to < from) {
+      return { error: "invalid_window" };
+    }
+    const result = await db.client.from("messages")
+      .select("seq,sender_type,sender_name,content,kind")
+      .eq("stream_id", streamId)
+      .gte("seq", Math.max(1, from))
+      .lte("seq", Math.min(to, from + 60))
+      .order("seq", { ascending: true })
+      .limit(61);
+    if (result.error) return { error: "history_unavailable" };
+    return { messages: result.data ?? [] };
+  },
+  list_files: async ({ db, scope, args, env, streamId }) => {
+    const rows = await db.files.list([["stream_id", streamId]], {
+      columns: "id,name,size_bytes,content_type,store,created_at", limit: 60,
+    });
+    return { files: rows };
+  },
+  read_file: async ({ db, scope, args, env, streamId }) => {
+    const id = args.id ? String(args.id) : null;
+    const wanted = args.name ? text(args.name, { max: 120, name: "name" }) : null;
+    const rows = await db.files.list([["stream_id", streamId]], {
+      columns: "id,name,size_bytes,content_type,store,content", limit: 100,
+    });
+    const file = rows.find((row) => (id ? row.id === id : row.name === wanted));
+    if (!file) return { error: "file_not_found" };
+    if (file.store !== "db") return { error: "binary_file_needs_download", name: file.name };
+    return { name: file.name, size_bytes: file.size_bytes, content: truncate(file.content ?? "", 12000) };
+  },
+  upload_file: async ({ db, scope, args, env, streamId }) => {
+    const owner = await db.users.byId(scope.ownerId, { columns: "id,display_name" });
+    if (!owner) return { error: "owner_missing" };
+    try {
+      const file = await createGroupFile(db, {
+        streamId,
+        userId: scope.ownerId,
+        userName: owner.display_name,
+        name: args.name,
+        contentType: args.content_type,
+        content: args.content,
+      });
       return {
-        query,
-        hits: (result.data ?? []).map((row) => ({
-          seq: row.seq, from: `${row.sender_type === "agent" ? "虚拟" : "人"}:${row.sender_name}`,
-          at: row.created_at, text: truncate(row.content, 600),
+        ok: true,
+        file: { id: file.id, name: file.name, size_bytes: file.size_bytes, content_type: file.content_type },
+      };
+    } catch (error) {
+      return { error: error?.error ?? "file_write_failed" };
+    }
+  },
+  delete_file: async ({ db, scope, args, env, streamId }) => {
+    const id = args.id ? uuid(args.id, "id") : null;
+    const wanted = args.name ? text(args.name, { max: 120, name: "name" }) : null;
+    if (!id && !wanted) return { error: "file_selector_required" };
+    const rows = await db.files.list([["stream_id", streamId]], {
+      columns: "id,name,store,object_path,uploaded_by", limit: 200,
+    });
+    const file = rows.find((row) => (id ? row.id === id : row.name === wanted));
+    if (!file) return { error: "file_not_found" };
+    const role = await membershipRole(db, streamId, scope.ownerId);
+    try {
+      await deleteGroupFile(db, { file, userId: scope.ownerId, role });
+      return { ok: true, id: file.id, name: file.name };
+    } catch (error) {
+      return { error: error?.error ?? "file_delete_failed" };
+    }
+  },
+  get_announcement: async ({ db, scope, args, env, streamId }) => {
+    const stream = await db.streams.byId(streamId, {
+      columns: "id,name,announcement,announcement_at",
+    });
+    if (!stream) return { error: "stream_not_found" };
+    return {
+      stream_id: stream.id,
+      name: stream.name,
+      announcement: stream.announcement ?? "",
+      updated_at: stream.announcement_at,
+    };
+  },
+  get_context: async ({ db, scope, args, env, streamId }) => {
+    const stream = await db.streams.byId(streamId, {
+      columns: "id,name,announcement,context_chars,join_policy",
+    });
+    if (!stream) return { error: "stream_not_found" };
+    const memberships = await db.members.list([["stream_id", streamId]], {
+      columns: "principal_type,principal_id,role", limit: 200,
+    });
+    const humanIds = memberships.filter((m) => m.principal_type === "human").map((m) => m.principal_id);
+    const agentIds = memberships.filter((m) => m.principal_type === "agent").map((m) => m.principal_id);
+    const humans = humanIds.length
+      ? await db.users.list([["id", humanIds]], { columns: "id,display_name", limit: 200 }) : [];
+    const agents = agentIds.length
+      ? await db.agents.list([["id", agentIds]], { columns: "id,name,role", limit: 200 }) : [];
+    const grants = await db.stream_vms.list([["stream_id", streamId]], { columns: "vm_id,level", limit: 40 });
+    const vmIds = grants.map((g) => g.vm_id);
+    const vms = vmIds.length
+      ? await db.vms.list([["id", vmIds]], { columns: "id,label,host,port,username,workdir", limit: 40 }) : [];
+    const memory = scope.agentId
+      ? await db.memories.list([["agent_id", scope.agentId], ["scope", "stream"], ["stream_id", streamId]], {
+        columns: "kind,content,covers_through_seq", limit: 20,
+      })
+      : [];
+    return {
+      stream: { name: stream.name, uuid: stream.id, announcement: stream.announcement ?? "" },
+      members: [
+        ...humans.map((human) => ({ type: "human", name: human.display_name })),
+        ...agents.map((agent) => ({ type: "agent", name: agent.name, role: agent.role })),
+      ],
+      vms: vms.map((vm) => ({
+        label: vm.label,
+        host: `${vm.username}@${vm.host}:${vm.port}`,
+        workdir: vm.workdir,
+        level: grants.find((grant) => grant.vm_id === vm.id)?.level,
+      })),
+      stream_memory: memory,
+    };
+  },
+  list_skills: async ({ db, scope, args, env, streamId }) => {
+    const installed = scope.agentId ? await installedSkillRows(db, scope.agentId) : [];
+    return {
+      skills: [
+        ...BUILTIN_SKILLS.map((skill) => ({ name: skill.name, summary: skill.summary, builtin: true })),
+        ...installed.map((row) => ({
+          name: row.name, summary: row.summary, category: row.category, builtin: false,
         })),
-        note: "检索来自 MCP：群历史在压缩后仍然完整保留，可用 read_window 取全文。",
-      };
-    }
-    case "read_window": {
-      const from = Number(args.from_seq);
-      const to = Number(args.to_seq);
-      if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || to < from) {
-        return { error: "invalid_window" };
-      }
-      const result = await db.client.from("messages")
-        .select("seq,sender_type,sender_name,content,kind")
-        .eq("stream_id", streamId)
-        .gte("seq", Math.max(1, from))
-        .lte("seq", Math.min(to, from + 60))
-        .order("seq", { ascending: true })
-        .limit(61);
-      if (result.error) return { error: "history_unavailable" };
-      return { messages: result.data ?? [] };
-    }
-    case "list_files": {
-      const rows = await db.files.list([["stream_id", streamId]], {
-        columns: "id,name,size_bytes,content_type,store,created_at", limit: 60,
-      });
-      return { files: rows };
-    }
-    case "read_file": {
-      const id = args.id ? String(args.id) : null;
-      const wanted = args.name ? text(args.name, { max: 120, name: "name" }) : null;
-      const rows = await db.files.list([["stream_id", streamId]], {
-        columns: "id,name,size_bytes,content_type,store,content", limit: 100,
-      });
-      const file = rows.find((row) => (id ? row.id === id : row.name === wanted));
-      if (!file) return { error: "file_not_found" };
-      if (file.store !== "db") return { error: "binary_file_needs_download", name: file.name };
-      return { name: file.name, size_bytes: file.size_bytes, content: truncate(file.content ?? "", 12000) };
-    }
-    case "upload_file": {
-      const owner = await db.users.byId(scope.ownerId, { columns: "id,display_name" });
-      if (!owner) return { error: "owner_missing" };
-      try {
-        const file = await createGroupFile(db, {
-          streamId,
-          userId: scope.ownerId,
-          userName: owner.display_name,
-          name: args.name,
-          contentType: args.content_type,
-          content: args.content,
-        });
-        return {
-          ok: true,
-          file: { id: file.id, name: file.name, size_bytes: file.size_bytes, content_type: file.content_type },
-        };
-      } catch (error) {
-        return { error: error?.error ?? "file_write_failed" };
-      }
-    }
-    case "delete_file": {
-      const id = args.id ? uuid(args.id, "id") : null;
-      const wanted = args.name ? text(args.name, { max: 120, name: "name" }) : null;
-      if (!id && !wanted) return { error: "file_selector_required" };
-      const rows = await db.files.list([["stream_id", streamId]], {
-        columns: "id,name,store,object_path,uploaded_by", limit: 200,
-      });
-      const file = rows.find((row) => (id ? row.id === id : row.name === wanted));
-      if (!file) return { error: "file_not_found" };
-      const role = await membershipRole(db, streamId, scope.ownerId);
-      try {
-        await deleteGroupFile(db, { file, userId: scope.ownerId, role });
-        return { ok: true, id: file.id, name: file.name };
-      } catch (error) {
-        return { error: error?.error ?? "file_delete_failed" };
-      }
-    }
-    case "get_announcement": {
-      const stream = await db.streams.byId(streamId, {
-        columns: "id,name,announcement,announcement_at",
-      });
-      if (!stream) return { error: "stream_not_found" };
-      return {
-        stream_id: stream.id,
-        name: stream.name,
-        announcement: stream.announcement ?? "",
-        updated_at: stream.announcement_at,
-      };
-    }
-    case "get_context": {
-      const stream = await db.streams.byId(streamId, {
-        columns: "id,name,announcement,context_chars,join_policy",
-      });
-      if (!stream) return { error: "stream_not_found" };
-      const memberships = await db.members.list([["stream_id", streamId]], {
-        columns: "principal_type,principal_id,role", limit: 200,
-      });
-      const humanIds = memberships.filter((m) => m.principal_type === "human").map((m) => m.principal_id);
-      const agentIds = memberships.filter((m) => m.principal_type === "agent").map((m) => m.principal_id);
-      const humans = humanIds.length
-        ? await db.users.list([["id", humanIds]], { columns: "id,display_name", limit: 200 }) : [];
-      const agents = agentIds.length
-        ? await db.agents.list([["id", agentIds]], { columns: "id,name,role", limit: 200 }) : [];
-      const grants = await db.stream_vms.list([["stream_id", streamId]], { columns: "vm_id,level", limit: 40 });
-      const vmIds = grants.map((g) => g.vm_id);
-      const vms = vmIds.length
-        ? await db.vms.list([["id", vmIds]], { columns: "id,label,host,port,username,workdir", limit: 40 }) : [];
-      const memory = scope.agentId
-        ? await db.memories.list([["agent_id", scope.agentId], ["scope", "stream"], ["stream_id", streamId]], {
-          columns: "kind,content,covers_through_seq", limit: 20,
-        })
-        : [];
-      return {
-        stream: { name: stream.name, uuid: stream.id, announcement: stream.announcement ?? "" },
-        members: [
-          ...humans.map((human) => ({ type: "human", name: human.display_name })),
-          ...agents.map((agent) => ({ type: "agent", name: agent.name, role: agent.role })),
-        ],
-        vms: vms.map((vm) => ({
-          label: vm.label,
-          host: `${vm.username}@${vm.host}:${vm.port}`,
-          workdir: vm.workdir,
-          level: grants.find((grant) => grant.vm_id === vm.id)?.level,
-        })),
-        stream_memory: memory,
-      };
-    }
-    case "list_skills": {
-      const installed = scope.agentId ? await installedSkillRows(db, scope.agentId) : [];
-      return {
-        skills: [
-          ...BUILTIN_SKILLS.map((skill) => ({ name: skill.name, summary: skill.summary, builtin: true })),
-          ...installed.map((row) => ({
-            name: row.name, summary: row.summary, category: row.category, builtin: false,
-          })),
-        ],
-      };
-    }
-    case "read_skill": {
-      const wanted = text(args.name ?? "", { max: 120, name: "name" });
-      const builtin = BUILTIN_SKILLS.find((skill) => skill.name === wanted);
-      if (builtin) return { name: builtin.name, body: builtin.body };
-      const installed = scope.agentId ? await installedSkillRows(db, scope.agentId) : [];
-      const match = installed.find((row) => row.name === wanted);
-      if (!match) return { error: "skill_not_found" };
-      const full = await db.skills.byId(match.id, { columns: "body" });
-      return { name: match.name, body: truncate(full?.body ?? "", 20000) };
-    }
-    case "list_my_resources": {
-      if (!scope.ownerId) return { error: "owner_missing" };
-      const [agents, vms, memberships] = await Promise.all([
-        db.agents.list([["owner_id", scope.ownerId]], {
-          columns: "id,name,model,status", order: ["created_at", { ascending: true }], limit: 60,
-        }),
-        db.vms.list([["owner_id", scope.ownerId]], { columns: "id,label,host,username", limit: 60 }),
-        db.members.list([["principal_type", "human"], ["principal_id", scope.ownerId]], {
-          columns: "stream_id,role", limit: 300,
-        }),
-      ]);
-      const streamIds = memberships.map((row) => row.stream_id);
-      const streams = streamIds.length
-        ? await db.streams.list([["id", streamIds]], { columns: "id,name", limit: 300 }) : [];
-      return {
-        agents: agents.map((agent) => ({ id: agent.id, name: agent.name, model: agent.model, status: agent.status })),
-        vms: vms.map((vm) => ({ id: vm.id, label: vm.label, host: vm.host, username: vm.username })),
-        streams: memberships.map((row) => ({
-          stream_id: row.stream_id,
-          name: streams.find((stream) => stream.id === row.stream_id)?.name ?? "（已删除）",
-          role: row.role,
-        })),
-      };
-    }
-    case "send_message": {
-      const content = text(args.content ?? "", { max: 8000, name: "content" });
-      if (scope.agentId) {
-        const agent = await db.agents.byId(scope.agentId, { columns: "id,name" });
-        if (!agent) return { error: "agent_not_found" };
-        return postAndFanout(db, {
-          streamId, senderType: "agent", senderId: agent.id, senderName: agent.name, content,
-        });
-      }
-      const stream = await db.streams.byId(streamId, { columns: "id,owner_id" });
-      if (!stream) return { error: "stream_not_found" };
-      return postAndFanout(db, {
-        streamId, senderType: "system", senderId: stream.owner_id, senderName: "MCP 客户端", content,
-      });
-    }
-    case "create_stream":
-      return createStream(db, scope, args);
-    case "add_agent_to_stream": {
-      const targetStreamId = args.stream_id ? uuid(args.stream_id, "stream_id") : streamId;
-      const role = await membershipRole(db, targetStreamId, scope.ownerId);
-      if (!role) return { error: "not_stream_member" };
-      const agent = await db.agents.byId(uuid(args.agent_id, "agent_id"), {
-        columns: "id,name,owner_id,status",
-      });
+      ],
+    };
+  },
+  read_skill: async ({ db, scope, args, env, streamId }) => {
+    const wanted = text(args.name ?? "", { max: 120, name: "name" });
+    const builtin = BUILTIN_SKILLS.find((skill) => skill.name === wanted);
+    if (builtin) return { name: builtin.name, body: builtin.body };
+    const installed = scope.agentId ? await installedSkillRows(db, scope.agentId) : [];
+    const match = installed.find((row) => row.name === wanted);
+    if (!match) return { error: "skill_not_found" };
+    const full = await db.skills.byId(match.id, { columns: "body" });
+    return { name: match.name, body: truncate(full?.body ?? "", 20000) };
+  },
+  list_my_resources: async ({ db, scope, args, env, streamId }) => {
+    if (!scope.ownerId) return { error: "owner_missing" };
+    const [agents, vms, memberships] = await Promise.all([
+      db.agents.list([["owner_id", scope.ownerId]], {
+        columns: "id,name,model,status", order: ["created_at", { ascending: true }], limit: 60,
+      }),
+      db.vms.list([["owner_id", scope.ownerId]], { columns: "id,label,host,username", limit: 60 }),
+      db.members.list([["principal_type", "human"], ["principal_id", scope.ownerId]], {
+        columns: "stream_id,role", limit: 300,
+      }),
+    ]);
+    const streamIds = memberships.map((row) => row.stream_id);
+    const streams = streamIds.length
+      ? await db.streams.list([["id", streamIds]], { columns: "id,name", limit: 300 }) : [];
+    return {
+      agents: agents.map((agent) => ({ id: agent.id, name: agent.name, model: agent.model, status: agent.status })),
+      vms: vms.map((vm) => ({ id: vm.id, label: vm.label, host: vm.host, username: vm.username })),
+      streams: memberships.map((row) => ({
+        stream_id: row.stream_id,
+        name: streams.find((stream) => stream.id === row.stream_id)?.name ?? "（已删除）",
+        role: row.role,
+      })),
+    };
+  },
+  send_message: async ({ db, scope, args, env, streamId }) => {
+    const content = text(args.content ?? "", { max: 8000, name: "content" });
+    if (scope.agentId) {
+      const agent = await db.agents.byId(scope.agentId, { columns: "id,name" });
       if (!agent) return { error: "agent_not_found" };
-      if (agent.owner_id !== scope.ownerId) return { error: "agent_not_owned" };
-      const existing = await db.members.first([
-        ["stream_id", targetStreamId], ["principal_type", "agent"], ["principal_id", agent.id],
-      ], { columns: "id" });
-      if (existing) return { ok: true, duplicate: true, agent_id: agent.id, stream_id: targetStreamId };
-      await db.members.insert({
-        id: newId(), stream_id: targetStreamId, principal_type: "agent", principal_id: agent.id,
-        role: "member", added_by: scope.ownerId, joined_at: now(),
-      }, { columns: "id" });
-      await insertMessage(db, {
-        streamId: targetStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
-        content: `虚拟员工「${agent.name}」被拉进了群。`,
+      return postAndFanout(db, {
+        streamId, senderType: "agent", senderId: agent.id, senderName: agent.name, content,
       });
-      return { ok: true, agent_id: agent.id, agent_name: agent.name, stream_id: targetStreamId };
     }
-    case "invite_member": {
-      const targetStreamId = args.stream_id ? uuid(args.stream_id, "stream_id") : streamId;
-      const role = await membershipRole(db, targetStreamId, scope.ownerId);
-      if (role !== "owner" && role !== "admin") return { error: "permission_denied" };
-      const invited = emailOf(args.email);
-      const existing = await db.requests.first([
-        ["stream_id", targetStreamId], ["kind", "invite"], ["applicant_email", invited], ["status", "pending"],
-      ], { columns: "id" });
-      if (existing) return { ok: true, duplicate: true, email: invited, request_id: existing.id };
-      const stream = await db.streams.byId(targetStreamId, { columns: "id,name" });
-      if (!stream) return { error: "stream_not_found" };
-      const created = await db.requests.insert({
-        id: newId(), stream_id: targetStreamId, kind: "invite",
-        applicant_user_id: null, applicant_email: invited, applicant_name: null,
-        agent_id: null, status: "pending", handled_by: null, handled_at: null,
-        created_at: now(), updated_at: now(),
-      }, { columns: "id" });
-      if (!created) return { error: "invite_failed" };
-      const invitee = await db.users.first([["email", invited]], {
-        columns: "id,email,display_name,at_channel",
-      });
-      await deliver({
-        db,
-        recipientEmail: invited,
-        userId: invitee?.id ?? null,
-        kind: "invite",
-        subject: `你被邀请加入 WorkStream 群「${stream.name}」`,
-        body: `群「${stream.name}」邀请你加入，群 UUID：${targetStreamId}。登录后在“待办”里接受即可。`,
-        link: `#/stream/${targetStreamId}`,
-        streamId: targetStreamId,
-      });
-      return { ok: true, email: invited, request_id: created.id, stream_id: targetStreamId };
-    }
-    case "set_signature": {
-      if (!scope.agentId) return { error: "internal_only" };
-      const signature = text(args.signature ?? "", { max: 120, required: false });
-      const updated = await db.agents.claim([["id", scope.agentId]], { signature, updated_at: now() });
-      if (!updated) return { error: "signature_update_failed" };
-      return { ok: true, signature };
-    }
-    case "set_announcement": {
-      const targetStreamId = args.stream_id ? uuid(args.stream_id, "stream_id") : streamId;
-      const role = await membershipRole(db, targetStreamId, scope.ownerId);
-      if (role !== "owner" && role !== "admin") return { error: "permission_denied" };
-      const content = text(args.content ?? "", { max: 4000, required: false });
-      await db.streams.patch([["id", targetStreamId]], {
-        announcement: content, announcement_at: now(), updated_at: now(),
-      });
-      await insertMessage(db, {
-        streamId: targetStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
-        content: content ? `群公告已更新：${content}` : "群公告已清空。",
-      });
-      return { ok: true, stream_id: targetStreamId, announcement: content };
-    }
-    case "register_vm": {
-      const label = text(args.label, { max: 60, name: "label" });
-      const host = text(args.host, { max: 200, name: "host" });
-      if (!/^[A-Za-z0-9._-]+$/.test(host)) return { error: "invalid_host" };
-      const port = Number(args.port ?? 22);
-      if (!Number.isSafeInteger(port) || port < 1 || port > 65535) return { error: "invalid_port" };
-      const username = text(args.username, { max: 60, name: "username" });
-      const authKind = oneOf(args.auth_kind, ["password", "key"], "auth_kind");
-      const secret = text(args.secret, { max: 8000, name: "secret" });
-      const workdir = text(args.workdir ?? "", { max: 200, required: false });
-      const sealed = await seal(secret, { supabase: db.client, env });
-      const id = newId();
-      const created = await db.vms.insert({
-        id, owner_id: scope.ownerId, label, host: host.toLowerCase(), port, username,
-        auth_kind: authKind, secret_cipher: sealed.cipher, key_source: sealed.key_source,
-        workdir, last_probe: null, created_at: now(), updated_at: now(),
-      }, { columns: "id,label" });
-      if (!created) return { error: "vm_create_failed" };
-      let grantedTo = null;
-      if (args.grant_stream_id) {
-        const grantStreamId = uuid(args.grant_stream_id, "stream_id");
-        const role = await membershipRole(db, grantStreamId, scope.ownerId);
-        if (role === "owner" || role === "admin") {
-          await db.stream_vms.insert({
-            id: newId(), stream_id: grantStreamId, vm_id: id, level: "member",
-            granted_by: scope.ownerId, created_at: now(),
-          }, { columns: "id" });
-          await insertMessage(db, {
-            streamId: grantStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
-            content: `虚拟机「${label}」已登记并授权给本群。`,
-          });
-          grantedTo = grantStreamId;
-        }
-      }
-      return { vm_id: id, label, host: host.toLowerCase(), username, granted_to: grantedTo };
-    }
-    case "grant_vm": {
-      const vmId = uuid(args.vm_id, "vm_id");
-      const targetStreamId = args.stream_id ? uuid(args.stream_id, "stream_id") : streamId;
-      const role = await membershipRole(db, targetStreamId, scope.ownerId);
-      if (role !== "owner" && role !== "admin") return { error: "permission_denied" };
-      const vm = await db.vms.byId(vmId, { columns: "id,owner_id,label" });
-      if (!vm) return { error: "vm_not_found" };
-      if (vm.owner_id !== scope.ownerId) return { error: "vm_not_owned" };
-      const level = oneOf(args.level ?? "member", ["member", "sudo"], "level");
-      const existing = await db.stream_vms.first([["stream_id", targetStreamId], ["vm_id", vmId]], {
-        columns: "id",
-      });
-      if (existing) {
-        await db.stream_vms.patch([["id", existing.id]], {
-          level, granted_by: scope.ownerId, updated_at: now(),
+    const stream = await db.streams.byId(streamId, { columns: "id,owner_id" });
+    if (!stream) return { error: "stream_not_found" };
+    return postAndFanout(db, {
+      streamId, senderType: "system", senderId: stream.owner_id, senderName: "MCP 客户端", content,
+    });
+  },
+  create_stream: ({ db, scope, args }) => createStream(db, scope, args),
+  add_agent_to_stream: async ({ db, scope, args, env, streamId }) => {
+    const targetStreamId = args.stream_id ? uuid(args.stream_id, "stream_id") : streamId;
+    const role = await membershipRole(db, targetStreamId, scope.ownerId);
+    if (!role) return { error: "not_stream_member" };
+    const agent = await db.agents.byId(uuid(args.agent_id, "agent_id"), {
+      columns: "id,name,owner_id,status",
+    });
+    if (!agent) return { error: "agent_not_found" };
+    if (agent.owner_id !== scope.ownerId) return { error: "agent_not_owned" };
+    const existing = await db.members.first([
+      ["stream_id", targetStreamId], ["principal_type", "agent"], ["principal_id", agent.id],
+    ], { columns: "id" });
+    if (existing) return { ok: true, duplicate: true, agent_id: agent.id, stream_id: targetStreamId };
+    await db.members.insert({
+      id: newId(), stream_id: targetStreamId, principal_type: "agent", principal_id: agent.id,
+      role: "member", added_by: scope.ownerId, joined_at: now(),
+    }, { columns: "id" });
+    await insertMessage(db, {
+      streamId: targetStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
+      content: `虚拟员工「${agent.name}」被拉进了群。`,
+    });
+    return { ok: true, agent_id: agent.id, agent_name: agent.name, stream_id: targetStreamId };
+  },
+  invite_member: async ({ db, scope, args, env, streamId }) => {
+    const targetStreamId = args.stream_id ? uuid(args.stream_id, "stream_id") : streamId;
+    const role = await membershipRole(db, targetStreamId, scope.ownerId);
+    if (role !== "owner" && role !== "admin") return { error: "permission_denied" };
+    const invited = emailOf(args.email);
+    const existing = await db.requests.first([
+      ["stream_id", targetStreamId], ["kind", "invite"], ["applicant_email", invited], ["status", "pending"],
+    ], { columns: "id" });
+    if (existing) return { ok: true, duplicate: true, email: invited, request_id: existing.id };
+    const stream = await db.streams.byId(targetStreamId, { columns: "id,name" });
+    if (!stream) return { error: "stream_not_found" };
+    const created = await db.requests.insert({
+      id: newId(), stream_id: targetStreamId, kind: "invite",
+      applicant_user_id: null, applicant_email: invited, applicant_name: null,
+      agent_id: null, status: "pending", handled_by: null, handled_at: null,
+      created_at: now(), updated_at: now(),
+    }, { columns: "id" });
+    if (!created) return { error: "invite_failed" };
+    const invitee = await db.users.first([["email", invited]], {
+      columns: "id,email,display_name,at_channel",
+    });
+    await deliver({
+      db,
+      recipientEmail: invited,
+      userId: invitee?.id ?? null,
+      kind: "invite",
+      subject: `你被邀请加入 WorkStream 群「${stream.name}」`,
+      body: `群「${stream.name}」邀请你加入，群 UUID：${targetStreamId}。登录后在“待办”里接受即可。`,
+      link: `#/stream/${targetStreamId}`,
+      streamId: targetStreamId,
+    });
+    return { ok: true, email: invited, request_id: created.id, stream_id: targetStreamId };
+  },
+  set_signature: async ({ db, scope, args, env, streamId }) => {
+    if (!scope.agentId) return { error: "internal_only" };
+    const signature = text(args.signature ?? "", { max: 120, required: false, name: "signature" });
+    const updated = await db.agents.claim([["id", scope.agentId]], { signature, updated_at: now() });
+    if (!updated) return { error: "signature_update_failed" };
+    return { ok: true, signature };
+  },
+  set_announcement: async ({ db, scope, args, env, streamId }) => {
+    const targetStreamId = args.stream_id ? uuid(args.stream_id, "stream_id") : streamId;
+    const role = await membershipRole(db, targetStreamId, scope.ownerId);
+    if (role !== "owner" && role !== "admin") return { error: "permission_denied" };
+    const content = text(args.content ?? "", { max: 4000, required: false, name: "content" });
+    await db.streams.patch([["id", targetStreamId]], {
+      announcement: content, announcement_at: now(), updated_at: now(),
+    });
+    await insertMessage(db, {
+      streamId: targetStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
+      content: content ? `群公告已更新：${content}` : "群公告已清空。",
+    });
+    return { ok: true, stream_id: targetStreamId, announcement: content };
+  },
+  register_vm: async ({ db, scope, args, env, streamId }) => {
+    const label = text(args.label, { max: 60, name: "label" });
+    const host = text(args.host, { max: 200, name: "host" });
+    if (!/^[A-Za-z0-9._-]+$/.test(host)) return { error: "invalid_host" };
+    const port = Number(args.port ?? 22);
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535) return { error: "invalid_port" };
+    const username = text(args.username, { max: 60, name: "username" });
+    const authKind = oneOf(args.auth_kind, ["password", "key"], "auth_kind");
+    const secret = text(args.secret, { max: 8000, name: "secret" });
+    const workdir = text(args.workdir ?? "", { max: 200, required: false });
+    const sealed = await seal(secret, { supabase: db.client, env });
+    const id = newId();
+    const created = await db.vms.insert({
+      id, owner_id: scope.ownerId, label, host: host.toLowerCase(), port, username,
+      auth_kind: authKind, secret_cipher: sealed.cipher, key_source: sealed.key_source,
+      workdir, last_probe: null, created_at: now(), updated_at: now(),
+    }, { columns: "id,label" });
+    if (!created) return { error: "vm_create_failed" };
+    let grantedTo = null;
+    if (args.grant_stream_id) {
+      const grantStreamId = uuid(args.grant_stream_id, "stream_id");
+      const role = await membershipRole(db, grantStreamId, scope.ownerId);
+      if (role === "owner" || role === "admin") {
+        await db.stream_vms.insert({
+          id: newId(), stream_id: grantStreamId, vm_id: id, level: "member",
+          granted_by: scope.ownerId, created_at: now(),
+        }, { columns: "id" });
+        await insertMessage(db, {
+          streamId: grantStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
+          content: `虚拟机「${label}」已登记并授权给本群。`,
         });
-        return { ok: true, grant_id: existing.id, level, stream_id: targetStreamId };
+        grantedTo = grantStreamId;
       }
-      const created = await db.stream_vms.insert({
-        id: newId(), stream_id: targetStreamId, vm_id: vmId, level,
-        granted_by: scope.ownerId, created_at: now(),
-      }, { columns: "id" });
-      if (!created) return { error: "grant_failed" };
-      await insertMessage(db, {
-        streamId: targetStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
-        content: `虚拟机「${vm.label}」授权给本群（级别：${level === "sudo" ? "可用 sudo" : "普通用户"}）。`,
-      });
-      return { ok: true, grant_id: created.id, level, stream_id: targetStreamId };
     }
-    default:
-      return { error: "tool_not_allowed" };
-  }
+    return { vm_id: id, label, host: host.toLowerCase(), username, granted_to: grantedTo };
+  },
+  grant_vm: async ({ db, scope, args, env, streamId }) => {
+    const vmId = uuid(args.vm_id, "vm_id");
+    const targetStreamId = args.stream_id ? uuid(args.stream_id, "stream_id") : streamId;
+    const role = await membershipRole(db, targetStreamId, scope.ownerId);
+    if (role !== "owner" && role !== "admin") return { error: "permission_denied" };
+    const vm = await db.vms.byId(vmId, { columns: "id,owner_id,label" });
+    if (!vm) return { error: "vm_not_found" };
+    if (vm.owner_id !== scope.ownerId) return { error: "vm_not_owned" };
+    const level = oneOf(args.level ?? "member", ["member", "sudo"], "level");
+    const existing = await db.stream_vms.first([["stream_id", targetStreamId], ["vm_id", vmId]], {
+      columns: "id",
+    });
+    if (existing) {
+      await db.stream_vms.patch([["id", existing.id]], {
+        level, granted_by: scope.ownerId, updated_at: now(),
+      });
+      return { ok: true, grant_id: existing.id, level, stream_id: targetStreamId };
+    }
+    const created = await db.stream_vms.insert({
+      id: newId(), stream_id: targetStreamId, vm_id: vmId, level,
+      granted_by: scope.ownerId, created_at: now(),
+    }, { columns: "id" });
+    if (!created) return { error: "grant_failed" };
+    await insertMessage(db, {
+      streamId: targetStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
+      content: `虚拟机「${vm.label}」授权给本群（级别：${level === "sudo" ? "可用 sudo" : "普通用户"}）。`,
+    });
+    return { ok: true, grant_id: created.id, level, stream_id: targetStreamId };
+  },
+};
+
+// 单一接缝：作用域校验 → pre 钩子（开步骤）→ handler → post 钩子（收步骤）。
+// 钩子按声明顺序串行；run_steps 写失败会一路抛出去，这轮任务直接失败并带着真实错误码，不悄悄降级。
+const pipeline = createPipeline([runStepsTrace]);
+
+/**
+ * @param {{streamId:string, agentId:string|null, ownerId:string|null, trace?: object}} scope
+ *        trace 由引擎在一次运行时挂上；外部 MCP 调用没有它，也就不属于任何轨迹。
+ * @param {{callId?: string}} meta 上游模型给的 tool_call id，只用于把步骤和调用配对。
+ */
+export async function executeTool(db, scope, name, args = {}, env = null, meta = {}) {
+  const ctx = {
+    db, scope, name, args, env,
+    streamId: scope.streamId,
+    callId: meta.callId ?? null,
+    output: null,
+    error: null,
+    step: null,
+  };
+  return pipeline.run(ctx, async () => {
+    if (INTERNAL_TOOL_NAMES.includes(name)) {
+      if (!scope.agentId && INTERNAL_ONLY.has(name)) return { error: "internal_only" };
+      const handler = TOOL_HANDLERS[name];
+      if (!handler) throw new Error(`工具 ${name} 在 MCP 声明里有、注册表里没有`);
+      return handler(ctx);
+    }
+    // 外部连接器的工具：只有这轮真拿到主人启用中连接器的声明才放行，
+    // 且必须发生在员工回路里——对外 MCP 那条路按 EXTERNAL_TOOL_NAMES 白名单走，碰不到这里。
+    if (!scope.agentId) return { error: "tool_not_allowed" };
+    const target = await resolveConnectorTool(db, env, scope.ownerId, name);
+    if (!target) return { error: "tool_not_allowed" };
+    return callConnectorTool(target, ctx.args);
+  });
 }
+
+// 冷启动就把“声明了但没实现”炸出来：否则它会在运行时变成一句 tool_not_allowed，谁也看不出是漏写。
+const missingHandlers = INTERNAL_TOOL_NAMES.filter((toolName) => !TOOL_HANDLERS[toolName]);
+if (missingHandlers.length) throw new Error(`工具缺少实现：${missingHandlers.join(", ")}`);
 
 const PROTOCOL_VERSION = "2024-11-05";
 
