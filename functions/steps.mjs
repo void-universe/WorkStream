@@ -11,6 +11,9 @@ const FIELD_CAPS = {
   reasoning: 8000,
   content: 4000,
   context: 800,
+  // 提示词槽位清单：一块约二十几字节，十几块才三百来字节，留双倍余量；
+  // 单独一档是因为它被 context 那一档的上限挤掉就等于缓存诊断数据没了。
+  prompt_slots: 1200,
   note: 1000,
 };
 const DEFAULT_CAP = 1500;

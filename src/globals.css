@@ -274,6 +274,34 @@ body {
   }
 }
 
+/* 群文件 .drawio 的结构预览：渲染器只生成结构与颜色，字号线宽在这里定，主题变量能继承下来。 */
+.ws-drawio {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-width: 320px;
+}
+
+.ws-drawio rect {
+  stroke-width: 1.5;
+}
+
+.ws-drawio line {
+  stroke: var(--muted-foreground);
+  stroke-width: 1.25;
+}
+
+/* 只给字号：fill 由渲染器按节点底色写在 <text> 上，
+   CSS 规则优先级高于 SVG  presentation attribute，这里再设 fill 会把浅底色上的深色字盖成主题前景色。 */
+.ws-drawio text {
+  font-size: 12px;
+}
+
+.ws-drawio .ws-edge-label {
+  fill: var(--muted-foreground);
+  font-size: 10px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .ws-flash-queued::after,
   .ws-flash-live::after {

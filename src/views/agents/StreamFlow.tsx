@@ -39,7 +39,38 @@ type Lane = {
   steps: number;
   queued: number;
   noTrace: number;
+  usage: UsageStat;
 };
+
+/** 一组模型轮的 token 用量：rounds 是全部模型轮，reported 只算上游同时回报了输入与命中数的那些。 */
+type UsageStat = { rounds: number; reported: number; input: number; cached: number };
+
+const newUsage = (): UsageStat => ({ rounds: 0, reported: 0, input: 0, cached: 0 });
+
+/**
+ * 累加一个群里若干封信的模型轮用量。
+ * 只把「输入和命中缓存两个数都回报了」的轮放进分母：被插话掐断的轮在末尾用量块之前就断了，
+ * QCA 和演示后端压根不回报用量——把它们当 0% 命中会把真实水平算低，宁可不进统计。
+ */
+function tallyUsage(usage: UsageStat, steps: RunStep[]) {
+  for (const step of steps) {
+    if (step.kind !== "model") continue;
+    usage.rounds += 1;
+    if (step.input_tokens === null || step.cached_tokens === null) continue;
+    const input = Number(step.input_tokens);
+    const cached = Number(step.cached_tokens);
+    if (!Number.isFinite(input) || input <= 0 || !Number.isFinite(cached)) continue;
+    usage.reported += 1;
+    usage.input += input;
+    usage.cached += cached;
+  }
+}
+
+/** 按 token 加权，不是每轮百分比的平均：长轮次对成本的影响本来就更该占大头。 */
+const hitRateOf = (usage: UsageStat) =>
+  usage.reported && usage.input > 0 ? `${Math.round((usage.cached / usage.input) * 100)}%` : "—";
+
+const grouped = (value: number) => value.toLocaleString("en-US");
 
 const MAIL_LABEL: Record<AgentProfileMail["status"], string> = {
   queued: "未读",
@@ -159,13 +190,23 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
     for (const mail of detail.queue) {
       const lane = lanes.get(mail.stream_id) ?? {
         id: mail.stream_id, name: mail.stream_name, priority: null, units: [], total: 0, steps: 0, queued: 0, noTrace: 0,
+        usage: newUsage(),
       };
       lane.priority = Math.max(lane.priority ?? 0, mail.priority);
       lane.total += 1;
       lane.steps += mail.steps?.length ?? 0;
+      tallyUsage(lane.usage, mail.steps ?? []);
       if (mail.status === "queued") lane.queued += 1;
       if (!mail.steps?.length && mail.status !== "queued" && mail.status !== "running") lane.noTrace += 1;
       lanes.set(mail.stream_id, lane);
+    }
+    // 汇总条按整个读取窗口算，和下面的车道计数同一口径，不受横向缩放/框选影响。
+    const usage = newUsage();
+    for (const lane of lanes.values()) {
+      usage.rounds += lane.usage.rounds;
+      usage.reported += lane.usage.reported;
+      usage.input += lane.usage.input;
+      usage.cached += lane.usage.cached;
     }
     for (const unit of visible) lanes.get(unit.mail.stream_id)?.units.push(unit);
 
@@ -178,6 +219,7 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
 
     return {
       rows,
+      usage,
       visible,
       byKey: new Map(ordered.map((unit) => [unit.id, unit])),
       domain,
@@ -298,6 +340,23 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
   const rangeSteps = rangeUnits.map((unit) => unit.step).filter((step): step is RunStep => Boolean(step));
   const rangeMs = rangeSteps.reduce((sum, step) => sum + Number(step.duration_ms ?? 0), 0);
   const rangeTokens = rangeSteps.reduce((sum, step) => sum + Number(step.output_tokens ?? 0), 0);
+  const rangeUsage = newUsage();
+  tallyUsage(rangeUsage, rangeSteps);
+  // 分群命中率按群名合并：同名群在统计条里并成一条（上面车道仍然分开画），
+  // 否则两行一模一样的名字看着像 bug。单群时它和总数是同一个数，不重复列。
+  const usageRows = (() => {
+    const byName = new Map<string, { color: string; usage: UsageStat }>();
+    for (const lane of flow.rows) {
+      if (!lane.usage.reported) continue;
+      const entry = byName.get(lane.name) ?? { color: laneColor(lane.id), usage: newUsage() };
+      entry.usage.rounds += lane.usage.rounds;
+      entry.usage.reported += lane.usage.reported;
+      entry.usage.input += lane.usage.input;
+      entry.usage.cached += lane.usage.cached;
+      byName.set(lane.name, entry);
+    }
+    return [...byName].sort((left, right) => right[1].usage.input - left[1].usage.input);
+  })();
 
   return (
     <Card className="mb-4 overflow-hidden">
@@ -510,6 +569,7 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
                 <span>工具 {rangeSteps.filter((step) => step.kind === "tool").length} 次</span>
                 <span>{durationText(rangeMs)}</span>
                 {rangeTokens ? <span>{rangeTokens} tok</span> : null}
+                {rangeUsage.reported ? <span>命中 {hitRateOf(rangeUsage)}</span> : null}
                 <button
                   type="button"
                   onClick={() => {
@@ -533,10 +593,41 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
           </aside>
         </div>
 
+        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-md border bg-muted/30 px-2 py-1.5 font-mono text-[10px]">
+          <span className="text-muted-foreground">缓存命中（本视图 {detail.queue.length} 封信）</span>
+          {flow.usage.reported ? (
+            <>
+              <span>输入 {grouped(flow.usage.input)}</span>
+              <span>命中 {grouped(flow.usage.cached)}</span>
+              <span className="font-semibold">{hitRateOf(flow.usage)}</span>
+            </>
+          ) : (
+            <span>这条后端不回报用量</span>
+          )}
+          <span className="text-muted-foreground">
+            模型轮 {flow.usage.rounds}（有用量 {flow.usage.reported}）
+          </span>
+          {usageRows.length > 1 ? (
+            <>
+              <span className="text-muted-foreground">分群</span>
+              {usageRows.map(([name, entry]) => (
+                <span key={name} className="inline-flex items-center gap-1" title={name}>
+                  <span className="h-1.5 w-1.5 rounded-full" style={{ background: entry.color }} aria-hidden />
+                  <span className="max-w-[90px] truncate">{name}</span>
+                  {hitRateOf(entry.usage)}
+                </span>
+              ))}
+            </>
+          ) : null}
+        </div>
+
         <p className="text-[10px] leading-relaxed text-muted-foreground">
           纵轴第一行是权重最高的群，同权重按群名排列。虚线是还没开始处理的邮件，跑起来后才会变成实心长条；
           斜纹是失败，空心是被插话掐断。轨迹上线前跑完的邮件没有步骤记录，所以不会有音符。
           框选时窗口外的步骤只是变暗、不会消失，方便对回上下文。按 Esc 清除选择。
+          <br />
+          命中率按 token 加权（命中 ÷ 输入），只算上游同时回报了这两个数的模型轮：被掐断的轮拿不到末尾用量块，
+          QCA 与演示后端不回报用量，都不进分母；轨迹一次最多读 240 步。
         </p>
       </CardContent>
     </Card>

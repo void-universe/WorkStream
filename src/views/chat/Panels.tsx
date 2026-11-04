@@ -23,6 +23,8 @@ import type { Agent } from "../../types";
 import { byteSize, timeAgo } from "../../lib/format";
 import { defaultFlashColors, readStreamFlash, saveFlashColors, type FlashColors, type FlashScene } from "../../lib/flash";
 import { CopyButton, CopyChip, Notice, PersonAvatar, RoleBadge, SectionTitle, TextInput } from "../../lib/ui";
+// 只 import 清单文件：内置渲染器是在那里被登记进注册表的，直接 import fileRenderers 会拿到一张空表。
+import { renderGroupFile } from "../../lib/renderers/index.mjs";
 import type { AgentPresence, GroupFile, Member, Request, StreamDetail, Vm } from "../../types";
 
 type Props = {
@@ -420,7 +422,8 @@ function AnnouncementSection({ detail, reload }: Pick<Props, "detail" | "reload"
   );
 }
 
-type Preview = { file: GroupFile; loading: boolean; content: string; signedUrl?: string; error: string };
+type Rendered = Awaited<ReturnType<typeof renderGroupFile>>;
+type Preview = { file: GroupFile; loading: boolean; content: string; signedUrl?: string; error: string; rendered: Rendered };
 
 export function FilesSection({ detail, reload }: Props) {
   const [files, setFiles] = useState<GroupFile[]>(detail.files);
@@ -474,21 +477,28 @@ export function FilesSection({ detail, reload }: Props) {
   }
 
   async function openPreview(file: GroupFile) {
-    setPreview({ file, loading: true, content: "", error: "" });
+    setPreview({ file, loading: true, content: "", error: "", rendered: null });
     try {
       const result = await get<{ ok: true; name: string; content_type: string; content?: string; signed_url?: string }>(
         "files.get",
         { id: file.id },
       );
+      const content = result.content ?? "";
+      // 怎么显示交给渲染器注册表：没人接住就是 null，下面照旧落回纯文本，不在这张表里加扩展名判断。
+      const rendered = result.signed_url ? null : await renderGroupFile({
+        name: result.name,
+        content_type: result.content_type,
+        content,
+      });
       setPreview((current) =>
         current && current.file.id === file.id
-          ? { file, loading: false, content: result.content ?? "", signedUrl: result.signed_url, error: "" }
+          ? { file, loading: false, content, signedUrl: result.signed_url, error: "", rendered }
           : current,
       );
     } catch (error) {
       setPreview((current) =>
         current && current.file.id === file.id
-          ? { file, loading: false, content: "", error: describeError(error) }
+          ? { file, loading: false, content: "", error: describeError(error), rendered: null }
           : current,
       );
     }
@@ -593,7 +603,7 @@ export function FilesSection({ detail, reload }: Props) {
           <div className="flex items-center gap-2">
             <input
               type="file"
-              accept=".txt,.md,.json,.csv,.log,.yaml,.yml,.ts,.js,.py,.sql"
+              accept=".txt,.md,.json,.csv,.log,.yaml,.yml,.ts,.js,.py,.sql,.drawio,.xml"
               className="min-w-0 flex-1 text-[11px] file:mr-2 file:rounded file:border file:border-border file:bg-muted file:px-2 file:py-0.5 file:text-[11px]"
               onChange={(event) => {
                 const file = event.target.files?.[0];
@@ -624,6 +634,21 @@ export function FilesSection({ detail, reload }: Props) {
             <a href={preview.signedUrl} target="_blank" rel="noopener" className="text-sm text-signal underline">
               这个文件在对象存储里，点这里打开下载链接
             </a>
+          ) : preview?.rendered?.view.kind === "svg" ? (
+            <div className="grid min-w-0 gap-1.5">
+              {/* markup 由渲染器自己生成：标签文本出图前逐字转义过，所以这里塞进 DOM 的不是群里的原文。 */}
+              <div
+                className="max-h-[55vh] overflow-auto rounded-md border bg-muted/30 p-3"
+                dangerouslySetInnerHTML={{ __html: preview.rendered.view.markup }}
+              />
+              <p className="font-mono text-[10px] leading-relaxed text-muted-foreground">
+                {preview.rendered.view.summary} · 结构预览（{preview.rendered.rendererId}）：只画节点与连线，样式和坐标精度不还原
+              </p>
+            </div>
+          ) : preview?.rendered?.view.kind === "text" ? (
+            <pre className="max-h-[55vh] overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap">
+              {preview.rendered.view.text || "（空文件）"}
+            </pre>
           ) : (
             <pre className="max-h-[55vh] overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap">
               {preview?.content || "（空文件）"}

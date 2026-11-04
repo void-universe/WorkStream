@@ -110,6 +110,18 @@ export function StepInspector({ step, mail, schemas, loading, error, onRefresh }
       return null;
     }
   }, [detail.context]);
+  // 提示词槽位：块序即缓存序，所以这里要按原序列出来，并标出第一个每轮重写的块。
+  const slots = useMemo(() => {
+    try {
+      return JSON.parse(String(detail.prompt_slots ?? "[]")) as [string, number, boolean][];
+    } catch {
+      return null;
+    }
+  }, [detail.prompt_slots]);
+  const firstRewrite = slots?.findIndex(([, , volatile]) => volatile) ?? -1;
+  const charsOf = (volatile: boolean) => (slots ?? [])
+    .filter(([, , slotVolatile]) => slotVolatile === volatile)
+    .reduce((sum, [, chars]) => sum + chars, 0);
 
   if (error) return <Notice tone="warn">读不到这一步：{error}</Notice>;
   if (loading && !step) return <Notice>正在取这一步的原文……</Notice>;
@@ -214,8 +226,31 @@ export function StepInspector({ step, mail, schemas, loading, error, onRefresh }
             <Row label="摘要覆盖到" value={context.summary_through ? `#${context.summary_through}` : "（无摘要）"} />
             <Row label="上下文块数" value={count(context.blocks)} />
             <Row label="上下文字符" value={count(context.chars)} />
+            {slots?.length ? (
+              <div className="mt-1 min-w-0 border-t pt-1.5">
+                <p className="text-[10px] text-muted-foreground">
+                  提示词槽位 · 稳态复用 {count(charsOf(false))} 字 / 每轮重写 {count(charsOf(true))} 字
+                </p>
+                <div className="mt-1 flex min-w-0 flex-wrap gap-1">
+                  {slots.map(([id, chars, volatile], index) => (
+                    <span
+                      key={id}
+                      title={volatile ? "这一轮起每轮重写，提供商的前缀缓存到此为止" : "稳态下逐字复用"}
+                      className={cn(
+                        "rounded border px-1 py-0.5 font-mono text-[10px]",
+                        volatile ? "text-foreground" : "border-transparent bg-muted/60 text-muted-foreground",
+                      )}
+                      style={index === firstRewrite ? { borderColor: "var(--signal)" } : undefined}
+                    >
+                      {index === firstRewrite ? "断点 " : ""}{id}·{chars}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
               这里只记口径不记正文：这段转录在群里本来就能翻，重复存一份只会把库撑大。
+              槽位那一行是这轮的 system 由哪几块拼的，「断点」之前提供商能逐字复用，命中率掉了就看它是哪一块动了。
             </p>
           </div>
         ) : (

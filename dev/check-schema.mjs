@@ -164,7 +164,30 @@ for (const [table, set] of reads) {
   }
 }
 
+/* ---------- 4. 群文件渲染器清单对账 ---------- */
+// 注册表是运行时的，本机假数据库与 smoke 都看不见「写了渲染器文件但没人 import」——
+// 那正好是 mcp.mjs 冷启动扫「声明了但没实现」的同一类事故，这里静态拦一道。
+const rendererDir = join(root, "src", "lib", "renderers");
+const manifest = readFileSync(join(rendererDir, "index.mjs"), "utf8");
+const rendererFiles = readdirSync(rendererDir).filter((name) => name.endsWith(".mjs") && name !== "index.mjs").sort();
+for (const name of rendererFiles) {
+  if (!manifest.includes(`import "./${name}"`)) {
+    problems.push(`群文件渲染器 ${name} 没被 src/lib/renderers/index.mjs 引入：注册表里永远看不见它`);
+  }
+}
+for (const match of manifest.matchAll(/import "\.\/([\w.-]+\.mjs)"/g)) {
+  if (!rendererFiles.includes(match[1])) problems.push(`src/lib/renderers/index.mjs 引了不存在的渲染器：${match[1]}`);
+}
+// 渲染器按节点底色把 fill 写在 <text> 的属性上；CSS 作者规则优先级高于 presentation attribute，
+// .ws-drawio text 里再声明一次 fill 就会把深色字悄悄盖成主题前景色——暗色主题下浅粉彩底 + 近白字等于看不见。
+const sheet = readFileSync(join(root, "src", "globals.css"), "utf8");
+const drawioTextRule = /\.ws-drawio\s+text\s*\{[^}]*\}/g.exec(sheet)?.[0] ?? "";
+if (/fill\s*:/.test(drawioTextRule)) {
+  problems.push("src/globals.css 的 .ws-drawio text 规则里设了 fill：会盖掉渲染器按底色算出的标签颜色");
+}
+
 console.log(`迁移里的表（${tables.size}）：${[...tables.keys()].join(", ")}`);
+console.log(`群文件渲染器（${rendererFiles.length}）：${rendererFiles.join(", ") || "（无）"}`);
 if (dynamicWrites.size) console.log(`按变量传参、无法静态展开写入列的表：${[...dynamicWrites].join(", ")}`);
 if (problems.length) {
   console.log(`发现 ${problems.length} 处不一致：\n- ${problems.join("\n- ")}`);

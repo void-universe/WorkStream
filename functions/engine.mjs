@@ -4,11 +4,13 @@ import { armInterrupt, disarmInterrupt, fireInterrupt } from "./bus.mjs";
 import { shapeMessage, streamWeight } from "./chat.mjs";
 import { executeTool, INTERNAL_TOOL_NAMES, toolDefinitions } from "./mcp.mjs";
 import { connectorToolDefs } from "./plugins.mjs";
+import { composeAsk, composeSystemPrompt, isCloudBackend } from "./prompt.mjs";
 import { open } from "./sec.mjs";
 import { insertMessage, nextSeq } from "./rooms.mjs";
 import { requireMembership } from "./perm.mjs";
 import { skillPrompt } from "./skills.mjs";
 import { closeOrphanSteps, createStepWriter } from "./steps.mjs";
+import { renderTranscript, rowChars } from "./transcript.mjs";
 import { CONTEXT_CHARS_DEFAULT, Halt, Interrupted, json, newId, now, text, truncate, uuid } from "./util.mjs";
 
 const TOOL_DEFINITIONS = toolDefinitions();
@@ -354,8 +356,8 @@ export async function runTask({ db, env, mailId }) {
 
   let prepared = await assemble({ db, agent, stream });
   const skills = await skillPrompt(db, agent.id);
-  let messages = await buildContext({ db, agent, stream, prepared, trigger, skills });
-  let used = size(messages);
+  let built = await buildContext({ db, agent, stream, prepared, trigger, skills });
+  let used = size(built.messages);
 
   // 超预算不在关键路径里调模型：先按字符预算从窗口头部确定性裁剪（摘要滞后一轮），
   // 压缩交给后台 mail 做，长对话那一轮不再付双倍延迟。
@@ -365,13 +367,13 @@ export async function runTask({ db, env, mailId }) {
     let dropped = 0;
     let droppedChars = 0;
     while (used - droppedChars > budget && dropped < prepared.window.length - 2) {
-      droppedChars += renderTranscript([prepared.window[dropped]]).length + 2;
+      droppedChars += rowChars(prepared.window[dropped]) + 2;
       dropped += 1;
     }
     if (dropped > 0) {
       prepared = { ...prepared, window: prepared.window.slice(dropped) };
-      messages = await buildContext({ db, agent, stream, prepared, trigger: currentTrigger, skills });
-      used = size(messages);
+      built = await buildContext({ db, agent, stream, prepared, trigger: currentTrigger, skills });
+      used = size(built.messages);
       needsCompress = true;
     }
   }
@@ -392,12 +394,15 @@ export async function runTask({ db, env, mailId }) {
   for (let steer = 0; ; steer += 1) {
     try {
       reply = await withTools({
-        db, env, agent, stream, key, messages, watch, trace,
+        db, env, agent, stream, key, messages: built.messages, watch, trace,
+        // 这一步实际落下的提示词槽位与各自字符数：命中率掉了要对得出是哪一块动了。
+        // 单列一个字段而不是塞进 context——那块有 800 字上限，槽位清单不该被它挤掉。
+        promptSlots: built.promptSlots,
         contextNote: {
           from: prepared.window[0]?.seq ?? null,
           to: prepared.window.at(-1)?.seq ?? null,
           summary_through: prepared.windowStart,
-          blocks: messages.length,
+          blocks: built.messages.length,
         },
       });
       break;
@@ -424,11 +429,11 @@ export async function runTask({ db, env, mailId }) {
       currentTrigger = next;
       absorbed.push({ id: next.id, seq: Number(next.seq ?? 0) });
       prepared = await assemble({ db, agent, stream });
-      messages = await buildContext({
+      built = await buildContext({
         db, agent, stream, prepared, trigger: next, skills,
         steerNote: `上一条回复说到一半被 @ 你的新消息打断了。已输出的半截是：${truncate(error.payload.partial ?? "", 400)}。请以这条插话为准，重新给出完整回应。`,
       });
-      used = size(messages);
+      used = size(built.messages);
     }
   }
 
@@ -561,9 +566,20 @@ async function imageParts(db, message, limit = 4) {
   return parts;
 }
 
+/** 一轮请求的上下文：正文由提示词槽位表装配（见 functions/prompt.mjs），这里只补图。
+ *  连带的 promptSlots 是这一步真正落下的块与各自字符数，要进步骤轨迹——命中率掉了得能对出是哪一块动的。 */
 async function buildContext({ db, agent, stream, prepared, trigger, skills, steerNote }) {
   const images = await imageParts(db, trigger);
-  return buildMessages({ agent, stream, prepared, trigger, skills, steerNote, images });
+  const { system, promptSlots } = composeSystemPrompt({
+    agent, stream, prepared, trigger, skills, steerNote, cloud: isCloudBackend(agent),
+  });
+  return {
+    promptSlots,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: composeAsk({ images }) },
+    ],
+  };
 }
 
 async function finish(db, mailId, status, error) {
@@ -634,7 +650,7 @@ async function history(db, streamId, { from, maxChars, anchor }) {
     const batch = Array.isArray(result.data) ? result.data : [];
     if (!batch.length) break;
     for (const row of batch) {
-      const cost = renderTranscript([row]).length + 1;
+      const cost = rowChars(row) + 1;
       // 单条就超上限时也要留一条，否则窗口空了，模型连触发消息之外什么都看不到。
       if (rows.length && chars + cost > maxChars) { truncated = true; break; }
       rows.push(row);
@@ -646,53 +662,6 @@ async function history(db, streamId, { from, maxChars, anchor }) {
   if (pages >= HISTORY_MAX_PAGES) truncated = true;
   // rows 在 head 锚下是从旧到新、tail 锚下是从新到旧，统一按序号升序交给上下文。
   return { rows: head ? rows : rows.reverse(), truncated };
-}
-
-const imageMark = (row) => {
-  const count = Array.isArray(row.attachments) ? row.attachments.length : 0;
-  return count ? `（附 ${count} 图）` : "";
-};
-
-function renderTranscript(rows) {
-  return rows
-    .map((row) => `${row.kind === "system" ? "·" : "#"}${row.seq} [${row.sender_type === "agent" ? "虚拟" : row.sender_type === "human" ? "人" : "系统"}] ${row.sender_name}：${row.content}${imageMark(row)}`)
-    .join("\n");
-}
-
-function buildMessages({ agent, stream, prepared, trigger, skills, steerNote, images = [] }) {
-  // 块序即缓存序：提供商侧前缀缓存按“从头开始最长匹配”命中，所以稳定块在前、
-  // 每轮必变的块（本群记忆 notes、触发消息、插话提示）一律压到最后。
-  // 转录窗口按字符封顶、只在尾部追加；头部一旦滑动就说明那批记录该进摘要了（同一轮会补投压缩信），
-  // 于是两轮之间的公共前缀通常能覆盖到上一轮窗口末尾。
-  const cloud = (agent.backend ?? "openai") === "qca";
-  const head = [
-    `你是虚拟员工「${agent.name}」（角色：${agent.role}），正在 WorkStream 群「${stream.name}」里工作。`,
-    // 云端 Agent 用自己的工具集，我们的群工具不在这条通道里；不说清楚它就会照着技能说明
-    // "调用 send_message"，把工具名写进正文，群里看到的是一次假执行。
-    cloud ? "本次由云端 Agent 作答：下面提到的 WorkStream 工具（发消息、群文件、虚拟机、记忆写入等）在这一通道里都调不到，也不要把工具名写进回复。请把结论直接写进正文，需要落地的动作列成待办交给同事。" : "",
-    agent.signature ? `你的个性签名（群里头像旁可见${cloud ? "" : "，需要时用 set_signature 更新"}）：${agent.signature}` : "",
-    agent.system_prompt ? `工作守则：${agent.system_prompt}` : "",
-    stream.announcement ? `群公告：${stream.announcement}` : "",
-    skills ? `你的技能（${cloud ? "在这里只是背景知识，细则的全文在本机技能库里" : "按需调用对应工具；细则可用 read_skill 查全文"}）：\n${skills}` : "",
-    cloud ? "如需更早的记录，请说明还需要哪一段，由 WorkStream 侧补给你；回答用群成员能直接用的表述。"
-      : "如需更早的记录，调用 search_history / read_window 工具；回答用群成员能直接用的表述。",
-    prepared.common.length ? `你的长期记忆（common）：\n${prepared.common.map((m) => `- ${m.content}`).join("\n")}` : "",
-    prepared.summary ? `本群较早内容的压缩摘要（序号 1-${prepared.windowStart}）：\n${prepared.summary}` : "",
-    `最近记录：\n${renderTranscript(prepared.window)}`,
-    prepared.notes.length ? `本群记忆：\n${prepared.notes.map((m) => `- ${m.content}`).join("\n")}` : "",
-    `上一条 @ 你的消息：${trigger ? `${trigger.sender_name}：${trigger.content}${imageMark(trigger)}` : "（队列里的补发任务，无原始消息）"}`,
-    steerNote ?? "",
-  ].filter(Boolean);
-  const ask = images.length
-    ? [
-      { type: "text", text: "请按上面的上下文回应这条任务。这条消息附有图片，图像内容在下面直接给你，需要时描述或据此行动。" },
-      ...images,
-    ]
-    : "请按上面的上下文回应这条任务。";
-  return [
-    { role: "system", content: head.join("\n\n") },
-    { role: "user", content: ask },
-  ];
 }
 
 /** 压缩：把窗口里较老的一半折叠进摘要，写入该 stream 的记忆并记录覆盖到的序号。
@@ -752,7 +721,7 @@ async function compress({ db, env, agent, stream, prepared, key, trace }) {
 
 /** 工具回路：最多两轮，工具执行都走内部 MCP 实现，作用域锁死在 (agent, stream, owner)。
  *  每一轮模型调用和每一次工具调用都落一条 run_steps，员工详情页的时间线读的就是它。 */
-async function withTools({ db, env, agent, stream, key, messages, watch, trace, contextNote }) {
+async function withTools({ db, env, agent, stream, key, messages, watch, trace, contextNote, promptSlots }) {
   const started = Date.now();
   // 主人启用中的插件工具并进这一轮的清单；重名时内置优先，插件被挤掉。
   const externalDefs = await connectorToolDefs(db, agent.owner_id, INTERNAL_TOOL_NAMES);
@@ -781,6 +750,7 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
         detail: {
           content: preempted ? (error.payload?.partial ?? "") : "",
           context,
+          prompt_slots: promptSlots,
           note: preempted ? "生成到一半被群里的插话掐断" : "",
         },
       });
@@ -792,6 +762,7 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
         reasoning: answer.reasoning ?? "",
         content: answer.content ?? "",
         context,
+        prompt_slots: promptSlots,
         tool_names: (answer.tool_calls ?? []).map((call) => call?.function?.name).join(", "),
         note: answer.mode === "demo" ? "演示模型：不回报思考链与用量" : `finish_reason：${answer.finish_reason ?? "—"}`,
       },

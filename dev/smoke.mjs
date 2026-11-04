@@ -9,6 +9,7 @@ import { serveSite } from "../functions/adapter.mjs";
 import { executeTool, INTERNAL_TOOL_NAMES } from "../functions/mcp.mjs";
 import { connectorToolDefs } from "../functions/plugins.mjs";
 import { isUpdateAvailable } from "../functions/registries.mjs";
+import { CACHE_BREAKPOINT_ID, PROMPT_SECTIONS, composeSystemPrompt } from "../functions/prompt.mjs";
 import { skillPrompt } from "../functions/skills.mjs";
 import { store } from "../functions/store.mjs";
 import { closeOrphanSteps, createStepWriter } from "../functions/steps.mjs";
@@ -16,6 +17,7 @@ import { askCloudAgent, flattenPrompt, parseAgentId, QcaError } from "../functio
 import { completeForAgent } from "../functions/agents.mjs";
 import { Interrupted } from "../functions/util.mjs";
 import { createFixtureClient } from "./fixture-supabase.mjs";
+import { fileRenderers, registerFileRenderer, renderGroupFile } from "../src/lib/renderers/index.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "ws-smoke-"));
 const file = join(dir, "db.json");
@@ -1055,6 +1057,63 @@ async function main() {
     { 命中率: `${((shared / curr.length) * 100).toFixed(1)}%`, 断点后: curr.slice(shared, shared + 40) });
   check("每轮只新付本轮新增的记录与触发消息（可复用前缀 ≥95%）", shared / curr.length >= 0.95,
     { 命中率: `${((shared / curr.length) * 100).toFixed(1)}%`, 长度: [prev.length, curr.length], 断点后: curr.slice(shared, shared + 60) });
+
+  step("8d2. 提示词槽位表：位置是从表里领的号，缓存断点写在表里");
+  check("槽位 id 唯一、都有整数 order 和 build（重复 id 会静默覆盖，重复 order 让顺序取决于插入先后）",
+    new Set(PROMPT_SECTIONS.map((section) => section.id)).size === PROMPT_SECTIONS.length
+    && PROMPT_SECTIONS.every((section) => Number.isInteger(section.order) && typeof section.build === "function"),
+    { 槽位数: PROMPT_SECTIONS.length });
+  check("缓存断点就是 memory.common：它之前的块在稳态下逐字复用",
+    CACHE_BREAKPOINT_ID === "memory.common", { CACHE_BREAKPOINT_ID });
+  const slotCtx = {
+    agent: { name: "小S", role: "测试", signature: "一句签名", system_prompt: "一条守则", backend: "openai" },
+    stream: { name: "槽位群", announcement: "一条公告" },
+    prepared: {
+      common: [{ content: "长期记忆甲" }],
+      summary: "摘要正文",
+      windowStart: 3,
+      window: [{ seq: 4, sender_type: "agent", sender_name: "小S", content: "窗口里的一条" }],
+      notes: [{ content: "本群记忆甲" }],
+    },
+    trigger: { sender_name: "安娜", content: "@小S 干活" },
+    skills: "### 技能正文",
+    steerNote: "",
+    cloud: false,
+  };
+  const composed = composeSystemPrompt(slotCtx);
+  check("落下的槽位与顺序按表分配（这一份夹具应当是这十一个块）",
+    composed.promptSlots.map(([id]) => id).join(",") ===
+      "identity,signature,guide,announcement,skills,history.access,memory.common,summary,transcript,memory.stream,trigger",
+    { 实际: composed.promptSlots.map(([id]) => id) });
+  check("正文逐字对得上：身份打头、触发消息收尾，块之间恰好一个空行",
+    composed.system.startsWith("你是虚拟员工「小S」（角色：测试），正在 WorkStream 群「槽位群」里工作。\n\n")
+    && composed.system.endsWith("上一条 @ 你的消息：安娜：@小S 干活")
+    && !composed.system.includes("\n\n\n")
+    && composed.system.split("\n\n").length === composed.promptSlots.length,
+    { 字符数: composed.system.length });
+  const trimmed = composeSystemPrompt({
+    ...slotCtx,
+    agent: { ...slotCtx.agent, signature: "", system_prompt: "" },
+    stream: { ...slotCtx.stream, announcement: "" },
+    prepared: { ...slotCtx.prepared, common: [], notes: [], summary: "" },
+    skills: "",
+  });
+  check("没有内容的槽位不落块，也不在正文里留下空段",
+    trimmed.promptSlots.map(([id]) => id).join(",") === "identity,history.access,transcript,trigger"
+    && trimmed.system.split("\n\n").length === 4 && !trimmed.system.includes("\n\n\n"),
+    { 实际: trimmed.promptSlots.map(([id]) => id) });
+  const clouded = composeSystemPrompt({ ...slotCtx, agent: { ...slotCtx.agent, backend: "qca" }, cloud: true });
+  check("云端通道只多一块云端须知、只换这两处措辞，其余块和它们的顺序照旧",
+    clouded.promptSlots.map(([id]) => id).filter((id) => id !== "backend.cloud").join(",")
+      === composed.promptSlots.map(([id]) => id).join(",")
+    && clouded.system.includes("本次由云端 Agent 作答")
+    && clouded.system.includes("由 WorkStream 侧补给你")
+    && !clouded.system.includes("需要时用 set_signature 更新"),
+    { 云端槽位: clouded.promptSlots.map(([id]) => id) });
+  check("对照：自建端点那一份仍然是本地措辞（不是所有员工都被当成云端）",
+    composed.system.includes("调用 search_history / read_window 工具")
+    && composed.system.includes("需要时用 set_signature 更新")
+    && !composed.system.includes("本次由云端 Agent 作答"), {});
   step("8e. 突发排队：同群第二封的上下文里必须带着第一封刚落的回复");
   const burst = async (content) => call("messages.send", {
     token: ana,
@@ -1772,6 +1831,13 @@ async function main() {
   check("思考链增量真的被抓进 model 步", String(x20Steps[0]?.detail?.reasoning ?? "").includes("search_history"), x20Steps[0]?.detail);
   check("模型步记下本轮上下文的口径", Number(JSON.parse(String(x20Steps[0]?.detail?.context ?? "{}")).blocks) === 2
     && Number(JSON.parse(String(x20Steps[0]?.detail?.context ?? "{}")).chars) > 0, x20Steps[0]?.detail?.context);
+  // 提示词槽位清单单独一列：命中率掉了要能对着这一步列出是哪几块、各多少字。
+  const x20Slots = JSON.parse(String(x20Steps[0]?.detail?.prompt_slots ?? "[]"));
+  check("模型步记下这一步真正落下的提示词槽位（含易变的转录与触发消息）",
+    Array.isArray(x20Slots) && x20Slots.some(([id, chars]) => id === "transcript" && Number(chars) > 0)
+    && x20Slots.some(([id]) => id === "trigger")
+    && x20Slots.every(([id, chars, volatile]) => typeof id === "string" && Number.isInteger(chars) && typeof volatile === "boolean"),
+    x20Steps[0]?.detail?.prompt_slots);
   check("请求带了 stream_options，用量四列才落得下来", Number(x20Steps[0]?.input_tokens) === 812
     && Number(x20Steps[0]?.output_tokens) === 24 && Number(x20Steps[0]?.cached_tokens) === 640
     && Number(x20Steps[0]?.reasoning_tokens) === 9, x20Steps[0]);
@@ -2445,6 +2511,107 @@ async function main() {
   check("删云端员工不会留下孤儿 session",
     (await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id", limit: 20 })).length === 0);
   await qca.close();
+
+  step("\n§24 群文件渲染器：注册即返回精确 disposer，drawio 出结构");
+  const drawioModel = `<mxGraphModel><root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+    <mxCell id="2" value="开始 &lt;测试&gt;" vertex="1" style="rounded=0;fillColor=#dae8fc;strokeColor=#6c8ebf" parent="1">
+      <mxGeometry x="40" y="40" width="120" height="60" as="geometry" />
+    </mxCell>
+    <mxCell id="3" value="结束" vertex="1" parent="1">
+      <mxGeometry x="40" y="200" width="120" height="60" as="geometry" />
+    </mxCell>
+    <mxCell id="4" value="&lt;b&gt;走&lt;/b&gt;" edge="1" source="2" target="3" parent="1">
+      <mxGeometry relative="1" as="geometry" />
+    </mxCell>
+  </root></mxGraphModel>`;
+  // diagrams.net 存盘时默认把页体 encodeURIComponent + raw DEFLATE + base64，这里用同一套 API 造样本。
+  const packDiagram = async (xml) => {
+    const bytes = new TextEncoder().encode(encodeURIComponent(xml));
+    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate-raw"));
+    const packed = new Uint8Array(await new Response(stream).arrayBuffer());
+    return btoa(String.fromCharCode(...packed));
+  };
+
+  check("内置渲染器在模块加载时就挂上注册表", fileRenderers().some((row) => row.id === "drawio"), fileRenderers().map((row) => row.id));
+  const plainView = await renderGroupFile({ name: "流程图.drawio", content_type: "text/plain", content: drawioModel });
+  check("未压缩的 mxGraphModel 出结构预览：两个节点一条连线", plainView?.rendererId === "drawio"
+    && plainView.view.kind === "svg" && plainView.view.summary === "2 个节点 · 1 条连线", plainView?.view?.summary);
+  check("节点画成方框、连线画成带箭头的直线", (String(plainView?.view?.markup).match(/<rect /g) ?? []).length === 2
+    && (String(plainView?.view?.markup).match(/<line /g) ?? []).length === 1
+    && String(plainView?.view?.markup).includes('marker-end="url(#ws-arrow)"'), String(plainView?.view?.markup).slice(0, 160));
+  check("作者写的颜色保留、没写的走主题变量", String(plainView?.view?.markup).includes('fill="#dae8fc"')
+    && String(plainView?.view?.markup).includes('fill="var(--card)"'), String(plainView?.view?.markup).slice(0, 200));
+  check("标签里的实体与富文本只留纯文本，出图时再转义回 XML", String(plainView?.view?.markup).includes("开始 &lt;测试&gt;")
+    && String(plainView?.view?.markup).includes(">走<") && !String(plainView?.view?.markup).includes("<b>"), String(plainView?.view?.markup));
+  check("生成的图里没有可执行入口", !/<script|onload=|onclick=|javascript:/i.test(String(plainView?.view?.markup)));
+
+  const contrastView = await renderGroupFile({
+    name: "d.drawio",
+    content_type: "text/plain",
+    content: "<mxGraphModel><root><mxCell id=\"0\"/><mxCell id=\"1\" parent=\"0\"/>"
+      + "<mxCell id=\"2\" value=\"浅底\" vertex=\"1\" style=\"fillColor=#d5e8d4\" parent=\"1\"><mxGeometry x=\"0\" y=\"0\" width=\"100\" height=\"40\" as=\"geometry\"/></mxCell>"
+      + "<mxCell id=\"3\" value=\"深底\" vertex=\"1\" style=\"fillColor=#1f2a44\" parent=\"1\"><mxGeometry x=\"0\" y=\"80\" width=\"100\" height=\"40\" as=\"geometry\"/></mxCell>"
+      + "<mxCell id=\"4\" value=\"没配色\" vertex=\"1\" parent=\"1\"><mxGeometry x=\"0\" y=\"160\" width=\"100\" height=\"40\" as=\"geometry\"/></mxCell>"
+      + "</root></mxGraphModel>",
+  });
+  const markupOf = (word) => String(contrastView?.view?.markup)
+    .match(new RegExp(`<text[^>]*fill="([^"]+)"[^>]*>${word}<`))?.[1];
+  check("节点标签的底色跟着节点自己的颜色走，不跟主题走",
+    markupOf("浅底") === "#141416" && markupOf("深底") === "#f4f4f5" && markupOf("没配色") === "var(--foreground)",
+    [markupOf("浅底"), markupOf("深底"), markupOf("没配色")]);
+
+  const singleCell = await renderGroupFile({
+    name: "a.drawio",
+    content_type: "text/plain",
+    content: `<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="2" value="只有一个框" vertex="1" parent="1"><mxGeometry x="10" y="20" width="30" height="40" as="geometry"/></mxCell></root></mxGraphModel>`,
+  });
+  check("自闭合的 mxCell 不会抢走下一个节点的坐标", singleCell?.view?.summary === "1 个节点 · 0 条连线"
+    && String(singleCell?.view?.markup).includes('x="10" y="20" width="30" height="40"'), singleCell?.view?.summary);
+
+  const zipped = await renderGroupFile({
+    name: "b.drawio",
+    content_type: "text/plain",
+    content: `<mxfile host="app.diagrams.net"><diagram id="p1" name="第 1 页">${await packDiagram(drawioModel)}</diagram></mxfile>`,
+  });
+  check("diagrams.net 默认的压缩页（base64 + raw DEFLATE）也出结构", zipped?.view?.summary === "2 个节点 · 1 条连线", zipped?.view?.summary);
+  check("解析不出结构时如实回 null，界面落回纯文本而不是空白框",
+    (await renderGroupFile({ name: "c.drawio", content_type: "text/plain", content: "<mxfile><diagram></diagram></mxfile>" })) === null);
+  check("普通文本文件不进任何渲染器，仍走原来的纯文本",
+    (await renderGroupFile({ name: "清单.md", content_type: "text/markdown", content: "# 标题" })) === null);
+
+  const dispose = registerFileRenderer({
+    id: "smoke-probe",
+    order: 1,
+    match: (file) => file.name.endsWith(".probe"),
+    render: () => ({ kind: "text", text: "命中探针" }),
+  });
+  check("注册之后立刻可见，并按 order 排在内置渲染器之前", fileRenderers()[0]?.id === "smoke-probe", fileRenderers().map((row) => row.id));
+  const probeHit = await renderGroupFile({ name: "x.probe", content_type: "text/plain", content: "" });
+  check("匹配上的渲染器接管这一份文件", probeHit?.rendererId === "smoke-probe" && probeHit.view.kind === "text", probeHit);
+  check("注销句柄摘掉自己那一条之后不再接管", dispose() === true
+    && (await renderGroupFile({ name: "x.probe", content_type: "text/plain", content: "" })) === null);
+
+  const keepFirst = registerFileRenderer({ id: "shared", order: 50, match: () => false, render: () => null });
+  let duplicated = null;
+  try {
+    registerFileRenderer({ id: "shared", order: 60, match: () => false, render: () => null });
+  } catch (error) {
+    duplicated = error;
+  }
+  check("同 id 重复注册就地抛错，而不是悄悄覆盖", duplicated instanceof Error && /id 重复/.test(duplicated.message), String(duplicated));
+  check("抛错之后原来那条仍留在注册表里", fileRenderers().some((row) => row.id === "shared" && row.order === 50));
+  check("缺 render 的注册在登记时就抛", (() => {
+    try {
+      registerFileRenderer({ id: "bad", order: 1, match: () => false });
+      return false;
+    } catch (error) {
+      return /match 与 render/.test(String(error?.message));
+    }
+  })());
+  keepFirst();
+  check("精确 disposer：注销后彻底消失", !fileRenderers().some((row) => row.id === "shared"));
 
   console.log(`\n结果：${passed} 项通过，${failures.length} 项失败`);
   if (failures.length) {
