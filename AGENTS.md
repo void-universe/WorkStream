@@ -5,7 +5,7 @@ WorkStream 是"真人 × 虚拟员工"协作台：Vite 静态前端 + 单个 Edg
 ## 环境与门禁
 
 - **Node 必须 22.12+，`engines` 是 `>=22.12.0 <23`。** 本机系统 Node 是 v24，会被 [scripts/check-node.mjs](scripts/check-node.mjs) 的 `preinstall`/`predev`/`prebuild` 拦下。所有 `npm`/`npx` 前面加 `export PATH="/d/tools/node22:$PATH"`（便携版 Node 22）。
-- **`npm run qa` 是唯一的全量门禁**（= check-node + check-schema + smoke）。改动合入前跑它，报数以千计：`dev/smoke.mjs` 用真实 handler + 本机假数据库跑端到端，**525 项检查、0 失败**是当前的地板，只许涨不许跌。
+- **`npm run qa` 是唯一的全量门禁**（= check-node + check-schema + smoke）。改动合入前跑它，报数以千计：`dev/smoke.mjs` 用真实 handler + 本机假数据库跑端到端，**575 项检查、0 失败**是当前的地板，只许涨不许跌。
 - **`npm run build` = `tsc --noEmit && node scripts/build.mjs`**，类型检查在构建里，不在 qa 里。
 - **本仓没有 ESLint 配置**：别跑 `npx eslint`，别建议加 linter 来代替静态检查。需要机器可验的不变量时，照 `dev/check-schema.mjs` 的样子写成 `scripts/` 下的静态对账 + 在 `dev/smoke.mjs` 里落一条 `check()`。
 - 起服务端要带 `--worker`（或 `WORKSTREAM_WORKER=1`）：[functions/worker.mjs](functions/worker.mjs) 是常驻调度循环，不带它就只能靠前端每 5 秒轮询推进一格，页面一隐藏邮箱就停（见 [dev/local-function.mjs:17](dev/local-function.mjs#L17)）。

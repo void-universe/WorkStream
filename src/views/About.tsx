@@ -1,4 +1,4 @@
-// 设置与关于：显示名、主题、@ 接收通道、改口令，以及产品说明与版权。
+// 设置与关于：显示名、主题、@ 接收通道、替身班表、改口令，以及产品说明与版权。
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,7 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { describeError, get, post, setToken, type User } from "../api";
+import type { Agent } from "../types";
 import type { BrandMode } from "../lib/brand";
 import { applyTheme, type ThemeMode } from "../lib/theme";
 import { AvatarPicker, Field, Notice, StatRow, TextInput } from "../lib/ui";
@@ -21,6 +22,16 @@ type Meta = {
   data_key: "secret" | "database";
   local_dev: boolean;
 };
+
+/** 后端只认 ISO 时刻；datetime-local 给的是本地墙上时间，直接 slice 会把 UTC 当本地用。 */
+const toLocalInput = (iso: string | null) => {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+};
+const fromLocalInput = (value: string) => (value ? new Date(value).toISOString() : "");
 
 export function AboutView({
   user,
@@ -40,12 +51,22 @@ export function AboutView({
   const [displayName, setDisplayName] = useState(user.display_name);
   const [avatar, setAvatar] = useState(user.avatar ?? "");
   const [realEmail, setRealEmail] = useState(user.prefs?.notify_real_email ?? false);
+  const [delegateMode, setDelegateMode] = useState<"off" | "now" | "window">(
+    user.delegate?.agent_id ? (user.delegate.start_at ? "window" : "now") : "off",
+  );
+  const [delegateAgent, setDelegateAgent] = useState(user.delegate?.agent_id ?? "");
+  const [delegateStart, setDelegateStart] = useState(toLocalInput(user.delegate?.start_at ?? null));
+  const [delegateEnd, setDelegateEnd] = useState(toLocalInput(user.delegate?.end_at ?? null));
+  const [myAgents, setMyAgents] = useState<Agent[]>([]);
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [meta, setMeta] = useState<Meta | null>(null);
 
   useEffect(() => {
     void get<Meta>("site.meta").then(setMeta).catch(() => setMeta(null));
+    void get<{ ok: true; items: Agent[] }>("agents.list")
+      .then((result) => setMyAgents(result.items))
+      .catch(() => setMyAgents([]));
   }, []);
 
   async function saveProfile() {
@@ -57,6 +78,42 @@ export function AboutView({
       });
       onUserChanged(result.user);
       toast.success("资料已保存");
+    } catch (error) {
+      toast.error(describeError(error));
+    }
+  }
+
+  async function saveDelegate() {
+    if (delegateMode !== "off" && !delegateAgent) {
+      toast.error("先选一个替身员工，或把开关留在「不用替身」。");
+      return;
+    }
+    if (delegateMode === "window") {
+      if (!delegateStart && !delegateEnd) {
+        toast.error("排时间段至少要给一个边界，否则和「立即生效」没有区别。");
+        return;
+      }
+      if (delegateStart && delegateEnd && new Date(delegateEnd) <= new Date(delegateStart)) {
+        toast.error("结束时刻要晚于开始时刻。");
+        return;
+      }
+    }
+    try {
+      await post("delegate.set", {
+        mode: delegateMode,
+        agent_id: delegateMode === "off" ? null : delegateAgent,
+        start_at: delegateMode === "window" ? fromLocalInput(delegateStart) : null,
+        end_at: delegateMode === "window" ? fromLocalInput(delegateEnd) : null,
+      });
+      onUserChanged({
+        ...user,
+        delegate: {
+          agent_id: delegateMode === "off" ? null : delegateAgent,
+          start_at: delegateMode === "window" && delegateStart ? new Date(delegateStart).toISOString() : null,
+          end_at: delegateMode === "window" && delegateEnd ? new Date(delegateEnd).toISOString() : null,
+        },
+      });
+      toast.success("替身班表已保存");
     } catch (error) {
       toast.error(describeError(error));
     }
@@ -78,6 +135,22 @@ export function AboutView({
     } catch (error) {
       toast.error(describeError(error));
     }
+  }
+
+  const delegateName = myAgents.find((agent) => agent.id === user.delegate?.agent_id)?.name ?? null;
+
+  /** 已保存的班表现在是什么状态，用服务端同一把尺子算：时段外就该显示「没在替」，不能报正在替。 */
+  function delegateSummary() {
+    const saved = user.delegate;
+    if (!saved?.agent_id || !delegateName) return "当前：没有替身。";
+    const startedAt = Date.parse(saved.start_at ?? "");
+    const endedAt = Date.parse(saved.end_at ?? "");
+    const at = Date.now();
+    const running = (!Number.isFinite(startedAt) || at >= startedAt) && (!Number.isFinite(endedAt) || at < endedAt);
+    const span = `${saved.start_at ? new Date(saved.start_at).toLocaleString("zh-CN", { hour12: false }) : "立即"} → ${
+      saved.end_at ? new Date(saved.end_at).toLocaleString("zh-CN", { hour12: false }) : "不限"
+    }`;
+    return `当前：${delegateName} · ${span} · ${running ? "正在替你接 @" : "现在不在时段内"}`;
   }
 
   return (
@@ -135,6 +208,76 @@ export function AboutView({
 
       <Card>
         <CardHeader className="pb-3">
+          <CardTitle className="text-sm">替身</CardTitle>
+          <CardDescription className="text-xs">
+            你不在时，冲你来的 @ 由你名下一个虚拟员工接住并代你回应。它以自己的署名发言并说明在替谁答，不冒充你；
+            @ 通知照旧发给你。这里排的班表对所有群生效，单个群可以在「群设置 → 本群替身」里单独关掉或换人。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="替身员工" htmlFor="delegate-agent" hint="API 与云端 Agent（QCA）后端的员工都能当替身。">
+              <NativeSelect
+                id="delegate-agent"
+                className="h-8 text-xs"
+                value={delegateAgent}
+                onChange={(event) => setDelegateAgent(event.target.value)}
+              >
+                <NativeSelectOption value="">不用替身</NativeSelectOption>
+                {myAgents.map((agent) => (
+                  <NativeSelectOption key={agent.id} value={agent.id}>
+                    {agent.name} · {(agent.backend ?? "openai") === "qca" ? "云端" : "API"}
+                    {agent.status === "paused" ? " · 已停用" : ""}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </Field>
+            <Field label="生效时机" htmlFor="delegate-mode">
+              <NativeSelect
+                id="delegate-mode"
+                className="h-8 text-xs"
+                value={delegateMode}
+                onChange={(event) => setDelegateMode(event.target.value as "off" | "now" | "window")}
+              >
+                <NativeSelectOption value="off">关闭</NativeSelectOption>
+                <NativeSelectOption value="now">立即开始</NativeSelectOption>
+                <NativeSelectOption value="window">某个时间段</NativeSelectOption>
+              </NativeSelect>
+            </Field>
+          </div>
+          {delegateMode === "window" ? (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="从" htmlFor="delegate-start">
+                <Input
+                  id="delegate-start"
+                  type="datetime-local"
+                  value={delegateStart}
+                  onChange={(event) => setDelegateStart(event.target.value)}
+                  className="h-8 text-xs font-mono"
+                />
+              </Field>
+              <Field label="到" htmlFor="delegate-end" hint="只填一头也行：只填「从」就是从现在一直替，只填「到」就是立刻开始到点结束。">
+                <Input
+                  id="delegate-end"
+                  type="datetime-local"
+                  value={delegateEnd}
+                  onChange={(event) => setDelegateEnd(event.target.value)}
+                  className="h-8 text-xs font-mono"
+                />
+              </Field>
+            </div>
+          ) : null}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button size="sm" className="text-xs" onClick={() => void saveDelegate()}>
+              保存替身班表
+            </Button>
+            <span className="text-xs text-muted-foreground">{delegateSummary()}</span>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-3">
           <CardTitle className="text-sm">改口令</CardTitle>
           <CardDescription className="text-xs">改完所有设备的会话都会立刻失效，包括这台，需要重新登录。</CardDescription>
         </CardHeader>
@@ -160,10 +303,11 @@ export function AboutView({
           <li>2 · 每个虚拟员工自带 OpenAI 兼容 base URL 与独立 API Key；Key 用 AES-GCM 加密入库，接口与浏览器永远拿不到原文。想先跑通流程可以用内置的 <code className="font-mono text-xs">demo://local</code> 演示端点。</li>
           <li>3 · 群有一个 UUID：拿到 UUID 可以申请进群（群主/管理员审批），也可以只接受邮箱邀请；管理员能拉人和踢人，群主能移交与提升管理员。</li>
           <li>4 · 群里 @ 虚拟员工 = 往 ta 的邮箱落一封任务；@ 真实员工 = 按 ta 选的通道（虚拟邮箱或真实邮箱）投递通知。</li>
-          <li>5 · 虚拟员工按 FIFO 取件，跨群按权重切时间片（默认均分，权重由群主/管理员在群成员面板确认），一次 tick 用最大余数法分槽；没有实时抢占，所以单个任务会跑完再让位，整体保持均衡。</li>
-          <li>6 · 记忆分两段：员工自己的 common，以及每个群单独的 per-stream。窗口超过预算时按群压缩成一条 summary 记忆并记录覆盖到的消息序号，更早的历史通过 MCP 回查。</li>
-          <li>7 · MCP 有两层：员工跑任务时的内部工具循环（search_history / read_window / list_files / read_file / get_context），以及对外的 JSON-RPC 端点，用群主生成的群钥匙访问。</li>
-          <li>8 · 办公虚拟机可以登记多台并按群授权，群创建时也能直接绑定；边栏函数没有 TCP 套接字，因此提供的是端口连通探测而不是真 SSH 会话。</li>
+          <li>5 · 真人在设置里排了替身班表时，冲 ta 来的 @ 会额外给 ta 名下那个虚拟员工落一封任务，由它以自己的署名代答并在气泡上标「替 @X 代答」；通知照旧发给真人，代答不等于代收。班表对所有群生效，单个群可以在群设置里单独关掉或换人，是否生效按派发那一刻的时钟算。</li>
+          <li>6 · 虚拟员工按 FIFO 取件，跨群按权重切时间片（默认均分，权重由群主/管理员在群成员面板确认），一次 tick 用最大余数法分槽；同一个（员工, 群）同时只跑一封，回复期间新的 @ 会掐断正在输出的那条并以插话重跑。</li>
+          <li>7 · 记忆分两段：员工自己的 common，以及每个群单独的 per-stream。窗口超过预算时按群压缩成一条 summary 记忆并记录覆盖到的消息序号，更早的历史通过 MCP 回查。</li>
+          <li>8 · MCP 有两层：员工跑任务时的内部工具循环（search_history / read_window / list_files / read_file / get_context），以及对外的 JSON-RPC 端点，用群主生成的群钥匙访问。</li>
+          <li>9 · 办公虚拟机可以登记多台并按群授权，群创建时也能直接绑定；边栏函数没有 TCP 套接字，因此提供的是端口连通探测而不是真 SSH 会话。</li>
         </ol>
 
         <Card>

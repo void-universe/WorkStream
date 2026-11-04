@@ -4,6 +4,7 @@
 //       只作用于该群：读工具 + 发消息 / 邀请真人 / 改公告。
 import { deliver } from "./accounts.mjs";
 import { streamWeight } from "./chat.mjs";
+import { queueDelegateMail } from "./delegate.mjs";
 import { createGroupFile, deleteGroupFile, insertMessage } from "./rooms.mjs";
 import { createPipeline } from "./pipeline.mjs";
 import { callConnectorTool, resolveConnectorTool } from "./plugins.mjs";
@@ -259,7 +260,9 @@ async function postAndFanout(db, { streamId, senderType, senderId, senderName, c
   const humanIds = members.filter((m) => m.principal_type === "human").map((m) => m.principal_id);
   const agentIds = members.filter((m) => m.principal_type === "agent").map((m) => m.principal_id);
   const humans = humanIds.length
-    ? await db.users.list([["id", humanIds]], { columns: "id,display_name,email,at_channel", limit: 300 })
+    ? await db.users.list([["id", humanIds]], {
+      columns: "id,display_name,email,at_channel,delegate_agent_id,delegate_start_at,delegate_end_at", limit: 300,
+    })
     : [];
   const agents = agentIds.length
     ? await db.agents.list([["id", agentIds]], { columns: "id,name,status", limit: 300 })
@@ -274,6 +277,8 @@ async function postAndFanout(db, { streamId, senderType, senderId, senderName, c
   const message = await insertMessage(db, {
     streamId, senderType, senderId, senderName, content, mentions: mentions.slice(0, 10),
   });
+  // 这条正文里已经直接点名的员工不必再经替身绕一遍。
+  const agentMentions = new Set(mentions.slice(0, 10).filter((m) => m.type === "agent").map((m) => m.id));
   for (const mention of mentions.slice(0, 10)) {
     if (mention.type === "agent") {
       if (mention.id === senderId) continue;
@@ -296,6 +301,14 @@ async function postAndFanout(db, { streamId, senderType, senderId, senderName, c
       stream_id: streamId, channel: human.at_channel === "real_email" ? "real_email" : "virtual",
       status: "queued", created_at: now(), read_at: null,
     }, { columns: "id" });
+    await queueDelegateMail(db, {
+      human,
+      streamId,
+      message,
+      senderId,
+      skipAgents: agentMentions,
+      weight: (delegateAgentId) => streamWeight(db, delegateAgentId, streamId),
+    });
   }
   return { seq: message.seq, mentions: mentions.slice(0, 10) };
 }

@@ -2,6 +2,7 @@
 import { AGENT_COLUMNS, AGENT_SECRET_COLUMNS, completeForAgent, publicAgent } from "./agents.mjs";
 import { armInterrupt, disarmInterrupt, fireInterrupt } from "./bus.mjs";
 import { shapeMessage, streamWeight } from "./chat.mjs";
+import { queueDelegateMail } from "./delegate.mjs";
 import { executeTool, INTERNAL_TOOL_NAMES, toolDefinitions } from "./mcp.mjs";
 import { connectorToolDefs } from "./plugins.mjs";
 import { composeAsk, composeSystemPrompt, isCloudBackend } from "./prompt.mjs";
@@ -313,6 +314,12 @@ export async function runTask({ db, env, mailId }) {
     return { status: "failed", error: "stream_missing" };
   }
   const trigger = mail.message_id ? await db.messages.byId(mail.message_id) : null;
+  // 替身任务：这封是替某个真人接的 @，模型要看见自己在替谁说话，回复也要带上这个标记。
+  const representedId = mail.meta?.on_behalf_of ?? null;
+  const represented = representedId
+    ? await db.users.byId(representedId, { columns: "id,display_name" })
+    : null;
+  const delegate = represented ? { name: represented.display_name, id: represented.id } : null;
   const secret = await db.agents.byId(mail.agent_id, { columns: AGENT_SECRET_COLUMNS });
   if (!secret?.api_key_cipher) {
     await finish(db, mailId, "failed", "agent_key_missing");
@@ -356,7 +363,7 @@ export async function runTask({ db, env, mailId }) {
 
   let prepared = await assemble({ db, agent, stream });
   const skills = await skillPrompt(db, agent.id);
-  let built = await buildContext({ db, agent, stream, prepared, trigger, skills });
+  let built = await buildContext({ db, agent, stream, prepared, trigger, skills, delegate });
   let used = size(built.messages);
 
   // 超预算不在关键路径里调模型：先按字符预算从窗口头部确定性裁剪（摘要滞后一轮），
@@ -372,7 +379,7 @@ export async function runTask({ db, env, mailId }) {
     }
     if (dropped > 0) {
       prepared = { ...prepared, window: prepared.window.slice(dropped) };
-      built = await buildContext({ db, agent, stream, prepared, trigger: currentTrigger, skills });
+      built = await buildContext({ db, agent, stream, prepared, trigger: currentTrigger, skills, delegate });
       used = size(built.messages);
       needsCompress = true;
     }
@@ -430,7 +437,7 @@ export async function runTask({ db, env, mailId }) {
       absorbed.push({ id: next.id, seq: Number(next.seq ?? 0) });
       prepared = await assemble({ db, agent, stream });
       built = await buildContext({
-        db, agent, stream, prepared, trigger: next, skills,
+        db, agent, stream, prepared, trigger: next, skills, delegate,
         steerNote: `上一条回复说到一半被 @ 你的新消息打断了。已输出的半截是：${truncate(error.payload.partial ?? "", 400)}。请以这条插话为准，重新给出完整回应。`,
       });
       used = size(built.messages);
@@ -450,6 +457,7 @@ export async function runTask({ db, env, mailId }) {
     senderName: agent.name,
     content,
     mentions,
+    onBehalfOf: represented?.id ?? null,
   });
   await db.memories.insert({
     id: newId(), agent_id: agent.id, scope: "stream", stream_id: stream.id, kind: "note",
@@ -568,10 +576,10 @@ async function imageParts(db, message, limit = 4) {
 
 /** 一轮请求的上下文：正文由提示词槽位表装配（见 functions/prompt.mjs），这里只补图。
  *  连带的 promptSlots 是这一步真正落下的块与各自字符数，要进步骤轨迹——命中率掉了得能对出是哪一块动的。 */
-async function buildContext({ db, agent, stream, prepared, trigger, skills, steerNote }) {
+async function buildContext({ db, agent, stream, prepared, trigger, skills, steerNote, delegate }) {
   const images = await imageParts(db, trigger);
   const { system, promptSlots } = composeSystemPrompt({
-    agent, stream, prepared, trigger, skills, steerNote, cloud: isCloudBackend(agent),
+    agent, stream, prepared, trigger, skills, steerNote, delegate, cloud: isCloudBackend(agent),
   });
   return {
     promptSlots,
@@ -832,6 +840,9 @@ export async function matchMentions(db, streamId, content) {
 
 /** 虚拟员工的回复里 @ 了别人：真人进邮箱通知，其他虚拟员工进任务队列（带跳数上限）。 */
 async function fanout({ db, env, stream, message, mentions, hops, agentId }) {
+  // 这次 @ 已经直接点名的员工 + 正在说话的这个员工：前者不必再经替身绕一遍，
+  // 后者若正好是某个真人的替身，替身再 @ 主人时必须跳过，否则替身会替自己反复接活。
+  const skipAgents = new Set([agentId, ...mentions.filter((m) => m.type === "agent").map((m) => m.id)]);
   for (const mention of mentions) {
     if (mention.type === "agent") {
       if (mention.id === agentId) continue;
@@ -846,7 +857,9 @@ async function fanout({ db, env, stream, message, mentions, hops, agentId }) {
       }, { columns: "id" });
       continue;
     }
-    const human = await db.users.byId(mention.id, { columns: "id,email,display_name,at_channel" });
+    const human = await db.users.byId(mention.id, {
+      columns: "id,display_name,email,at_channel,delegate_agent_id,delegate_start_at,delegate_end_at",
+    });
     if (!human) continue;
     await db.outbox.insert({
       id: newId(), recipient_email: human.email, user_id: human.id, kind: "mention",
@@ -855,6 +868,14 @@ async function fanout({ db, env, stream, message, mentions, hops, agentId }) {
       stream_id: stream.id, channel: human.at_channel === "real_email" ? "real_email" : "virtual",
       status: "queued", created_at: now(), read_at: null,
     }, { columns: "id" });
+    await queueDelegateMail(db, {
+      human,
+      streamId: stream.id,
+      message,
+      senderId: message.sender_id,
+      skipAgents,
+      weight: (delegateAgentId) => streamWeight(db, delegateAgentId, stream.id),
+    });
     void env;
   }
 }

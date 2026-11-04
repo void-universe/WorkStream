@@ -25,7 +25,7 @@ import { defaultFlashColors, readStreamFlash, saveFlashColors, type FlashColors,
 import { CopyButton, CopyChip, Notice, PersonAvatar, RoleBadge, SectionTitle, TextInput } from "../../lib/ui";
 // 只 import 清单文件：内置渲染器是在那里被登记进注册表的，直接 import fileRenderers 会拿到一张空表。
 import { renderGroupFile } from "../../lib/renderers/index.mjs";
-import type { AgentPresence, GroupFile, Member, Request, StreamDetail, Vm } from "../../types";
+import type { AgentPresence, DelegateStatus, GroupFile, Member, Request, StreamDetail, Vm } from "../../types";
 
 type Props = {
   detail: StreamDetail;
@@ -48,6 +48,25 @@ async function run(action: string, body: unknown, done: string, reload: () => Pr
   }
 }
 
+/** 服务端回的原因码，原样翻译成人话；没见过的码就照实贴出来，不编一个好听的说法。 */
+const DELEGATE_REASONS: Record<string, string> = {
+  not_enabled: "全局班表没开替身",
+  no_agent: "还没选替身员工",
+  agent_missing: "那位虚拟员工已被删除",
+  agent_not_owned: "只能用自己的虚拟员工当替身",
+  agent_paused: "替身员工已停用",
+  agent_not_in_stream: "替身员工不在这个群，把 ta 拉进群才会生效",
+  not_started: "还没到班表的时段",
+  expired: "班表时段已过",
+  stream_off: "本群已关掉替身",
+};
+
+function delegateStatusText(status: DelegateStatus) {
+  if (status.active) return `现在由「${status.agent_name}」在本群替你接 @。`;
+  const reason = status.reason ? DELEGATE_REASONS[status.reason] ?? status.reason : "原因未知";
+  return `本群现在没有替身：${reason}。`;
+}
+
 /** 分组列表容器：行与行之间用发丝线分隔。 */
 function ListGroup({ children }: { children: ReactNode }) {
   return <div className="divide-y divide-border/50 overflow-hidden rounded-xl border border-border/60 bg-card/50">{children}</div>;
@@ -56,12 +75,14 @@ function ListGroup({ children }: { children: ReactNode }) {
 /** 设置类列表行：左侧标题与说明，右侧控件。 */
 function Row({ label, hint, children }: { label: string; hint?: ReactNode; children: ReactNode }) {
   return (
-    <div className="flex items-center gap-3 px-3 py-2.5">
-      <div className="min-w-0 flex-1">
+    // 控件是 shrink-0 的：窄容器里三个控件一起上，就会把说明文字挤成一列竖排的字。
+    // 所以文字块给下限（basis-40）、装不下时控件整排换到第二行，控件自己那排再按 max-w-full 折行。
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2.5">
+      <div className="min-w-0 flex-1 basis-40">
         <p className="text-xs font-medium">{label}</p>
         {hint ? <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">{hint}</p> : null}
       </div>
-      <div className="flex shrink-0 items-center gap-2">{children}</div>
+      <div className="ml-auto flex w-max max-w-full shrink-0 flex-wrap items-center justify-end gap-2">{children}</div>
     </div>
   );
 }
@@ -681,10 +702,12 @@ function FileGlyph({ name }: { name: string }) {
   );
 }
 
-export function SettingsPanel({ detail, myVms, reload }: Props) {
+export function SettingsPanel({ detail, myAgents, myVms, reload }: Props) {
   const [name, setName] = useState(detail.stream.name);
   const [contextChars, setContextChars] = useState(detail.stream.context_chars);
   const [joinPolicy, setJoinPolicy] = useState(detail.stream.join_policy);
+  const [delegateMode, setDelegateMode] = useState(detail.my_delegate.mode);
+  const [delegateAgent, setDelegateAgent] = useState(detail.my_delegate.agent_id ?? "");
   const [advanced, setAdvanced] = useState(false);
   const owner = detail.my_role === "owner";
   const leader = isLeader(detail.my_role);
@@ -728,6 +751,55 @@ export function SettingsPanel({ detail, myVms, reload }: Props) {
               <NativeSelectOption value="invite_only">只接受邮箱邀请</NativeSelectOption>
             </NativeSelect>
             <Button size="xs" variant="outline" disabled={!owner} onClick={() => void run("streams.settings", { stream_id: detail.stream.id, join_policy: joinPolicy }, "进群方式已更新", reload)}>
+              保存
+            </Button>
+          </Row>
+        </ListGroup>
+      </section>
+
+      <section className="grid gap-1.5">
+        <SectionTitle>本群替身</SectionTitle>
+        <ListGroup>
+          <Row
+            label="替身覆盖"
+            hint={
+              <>
+                班表在「设置 → 替身」里排，对所有群生效；这里只决定本群跟不跟。
+                {delegateStatusText(detail.my_delegate)}
+              </>
+            }
+          >
+            <NativeSelect
+              className="h-8 w-32 text-xs"
+              value={delegateMode}
+              onChange={(event) => setDelegateMode(event.target.value as "inherit" | "on" | "off")}
+            >
+              <NativeSelectOption value="inherit">跟随全局班表</NativeSelectOption>
+              <NativeSelectOption value="on">只在本群开</NativeSelectOption>
+              <NativeSelectOption value="off">本群关掉</NativeSelectOption>
+            </NativeSelect>
+            {delegateMode === "on" ? (
+              <NativeSelect className="h-8 w-28 text-xs" value={delegateAgent} onChange={(event) => setDelegateAgent(event.target.value)}>
+                <NativeSelectOption value="">用全局那位</NativeSelectOption>
+                {myAgents.map((agent) => (
+                  <NativeSelectOption key={agent.id} value={agent.id}>
+                    {agent.name}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            ) : null}
+            <Button
+              size="xs"
+              variant="outline"
+              onClick={() =>
+                void run(
+                  "delegate.stream",
+                  { stream_id: detail.stream.id, mode: delegateMode, agent_id: delegateMode === "on" ? delegateAgent || null : null },
+                  "本群替身已更新",
+                  reload,
+                )
+              }
+            >
               保存
             </Button>
           </Row>

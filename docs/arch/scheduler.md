@@ -1,6 +1,6 @@
 # WorkStream 调度器架构
 
-scheduler · executor · context assembly ｜ 实测日期 2026-11-02 ｜ 源码：`functions/engine.mjs`、`functions/worker.mjs`、`functions/bus.mjs`、`functions/chat.mjs`、`functions/agents.mjs`
+scheduler · executor · context assembly ｜ 实测日期 2026-11-02 ｜ 源码：`functions/engine.mjs`、`functions/worker.mjs`、`functions/bus.mjs`、`functions/chat.mjs`、`functions/agents.mjs`、`functions/delegate.mjs`
 
 **一页结论。** 调度层是「邮箱 FIFO + 跨群加权时间片」：群里 @ 一位虚拟员工 = 往 ta 的邮箱投一封信，`scheduler.tick` 按创建顺序取信、按群权重分并发槽、CAS 抢任务执行；服务端常驻 `worker` 让队列在没有浏览器时也往前走。执行层是「单发流式调用 + 插话掐断」：每轮把群历史现场重渲染成一条 system 消息发给 OpenAI 兼容上游，边收 SSE 边查插话。上下文层是「稳定前缀 + 尾部追加窗口 + 后台压缩」：块序即缓存序，窗口按字符预算分页取，压缩在后台把水位线推上去；实测两轮之间的可复用前缀 **98.5%**，每轮只为本轮新增的记录付 prefill。
 
@@ -47,7 +47,8 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 | `mail` | `(agent_id, stream_id, status)` 索引 | 邮箱即任务队列。`status`: queued → running → done / failed / cancelled；`trigger_seq` 指向触发消息；`meta.interrupt` 存未消化的插话；`meta.kind="compress"` 是后台压缩信。 |
 | `slice_prefs` | `UNIQUE(agent_id, stream_id)` | 该员工在该群的时间片权重 1–20（默认 1）。群主/管理员才能改。 |
 | `memories` | `(agent_id, scope)`、`(agent_id, stream_id)` | `scope=common` 跨群长期记忆；`scope=stream` 本群记忆；`kind=summary` + `covers_through_seq` 是本群压缩摘要的水位线。 |
-| `messages` | `(stream_id, seq)` | 群转录的唯一权威。上下文窗口、插话判定、审计回执全部以它为准。 |
+| `messages` | `(stream_id, seq)` | 群转录的唯一权威。上下文窗口、插话判定、审计回执全部以它为准。`on_behalf_of` 非空表示这条正文是替身代某位真人说的。 |
+| `users` / `members` 的替身字段 | `users.delegate_agent_id` + `delegate_start_at` / `delegate_end_at`（账号级班表）；`members.delegate_mode`（`inherit` / `on` / `off`）+ `members.delegate_agent_id`（单群覆盖） | 真人被 @ 时先看群内覆盖、再看班表，命中才往替身邮箱投一封 `meta.on_behalf_of` 的信（见 3.4）。 |
 | `cli_sessions`（规划） | `UNIQUE(agent_id, stream_id)` | per（员工, 群）的 CLI 会话键：runner / session_id / last_seq / workdir。见第 7 节。 |
 | `run_traces`（规划） | `(mail_id, seq)` | 每次运行的 thinking / 工具调用 / 装配上下文快照。群里只看结论，过程在员工详情里点开看。 |
 
@@ -75,6 +76,17 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 ### 3.3 为什么默认 FIFO 就够
 
 群聊里「先说先办」符合真人直觉，FIFO 让队头阻塞可预测；真正需要区分优先级的是跨群资源争抢，那部分已由权重时间片承担。等实测出现饥饿再上优先级队列。
+
+### 3.4 替身：@ 真人也能被回
+
+真人可以指定自己名下一个虚拟员工当替身，冲 ta 来的 @ 由替身接住。投递仍走同一封 `mail`，调度器不知道「替身」这回事——它只看见多了一封 queued 信，所以并发槽、CAS 认领、插话、压缩全部复用，没有第二条执行路径。
+
+- **班表挂账号、群内只放覆盖**（`functions/delegate.mjs`）。真人离开是账号级状态，不是每个群各离开一次；但「这个群要、那个群不要」确实存在，所以 `members.delegate_mode` 只需 `inherit` / `on` / `off` 三档，`members.delegate_agent_id` 还可以换成另一个员工。时段的两端始终读账号上的 `delegate_start_at/end_at`：班表说 ta 什么时候不在，覆盖说这段不在期间哪个群启用。
+- **生效判定按时钟现算，不到点翻牌**。`delegateWindow` 是纯函数，派发那一刻拿当前时间比一次。翻牌方案需要一个常驻进程保证那次写入真的发生，进程没跑到位时段结束后替身就永远停在开启态；现算就没有这种状态需要维护。窗口右端**左闭右开**，到点即失效，不留一秒重叠。
+- **代答不等于代收**：真人照旧收到 @ 通知（`outbox`），替身只是**多**接一封任务，本人回来还能翻到原始的 @。
+- **替身必须是本人名下、状态 active、且就在这个群里**。借别人的员工代自己说话等于让第三方读你的群上下文，直接拒（`agent_not_owned`）。
+- **署名与回执**：任务信带 `meta.on_behalf_of`，落群的回复带 `messages.on_behalf_of`，界面据此标「替 @X 代答」——正文署名仍是替身自己，不冒充真人。
+- **两处挡住回环**：同一条消息既 @ 真人又 @ ta 的替身时，`skipAgents` 让替身只收那封直接任务；替身回复里再 @ 主人时，`human.id === senderId` 直接跳过，不给自己派活。smoke §25 借演示模型会把提示词尾巴念回正文这个行为，把「队列里始终只有一封」钉成了端到端断言。
 
 ---
 
@@ -107,6 +119,7 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 | `summary` | 90 | 是 | 本群压缩摘要 + 水位线 |
 | `transcript` | 100 | 是 | 最近转录窗口（按字符预算，**尾部追加**） |
 | `memory.stream` | 110 | 是 | 本群记忆 notes（近 30 条，**升序渲染**） |
+| `delegate` | 115 | 是 | 替身须知（仅替身轮） |
 | `trigger` | 120 | 是 | 触发消息 |
 | `steer` | 130 | 是 | 插话提示（仅插话轮） |
 
@@ -115,6 +128,8 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 `memory.common`、`transcript` 两块用升序/尾部追加，是为了让新内容只追加到块尾，不打断已有前缀（降序会让每条新记忆改写块头）。
 
 **`memory.stream` 的取舍**：每回完一条就往本群记忆插一条 `#NN 回应：<正文前 200 字>` 的回声。装配时按序号两头剔除——`NN ≤ 水位线`的已经折进摘要，`NN ≥ 窗口头`的转录里就带全文，只有落在「摘要没覆盖、窗口又装不下」那段缝隙里的回声才单列。这块排在转录之后，而**前缀缓存是一刀切**：断点之后哪怕逐字节相同也算 miss，所以让它常态为空比让它变小更要紧（实测它一度占每轮 miss 的 86%，见 P9）。非回声类 note（压缩失败留痕、用户显式记下的事）没有序号，一律保留。
+
+**`delegate` 只在替身轮落下**：非替身轮它的 build 返回空串，空串不落块，装配结果和加这块之前逐字节相同——替身特性不给普通轮的缓存添任何代价。断点位置不受它影响（`CACHE_BREAKPOINT_ID` 是表里第一颗 volatile 块，在 `memory.common`，smoke 8d2 钉着），它只是在断点之后、触发消息之前多一段正文。这块的内容是内部提示，进群正文的红线由 `DEMO_QUOTABLE_HEADERS` 守住：演示模型只准从转录和两段记忆里摘录，那三类本来就是群里可见的内容；守则、替身须知、触发消息是内部提示，被照抄进正文等于把提示词摊给全群看（本机假上游就是这么暴露的，smoke §25 有断言，白名单与装配共用同一份抬头常量，加新块不会悄悄漏进摘录）。
 
 **命中率掉了怎么定位**：每个模型轮收尾时把这轮真正落下的槽位清单（`[id, 字符数, volatile]` 三元组）写进 `run_steps.detail.prompt_slots`，员工详情页的轨迹检视器「上下文」标签按原序排出来，并在第一颗每轮重写的块上标「断点」。它只记口径不记正文——正文库里已经有，重复存只会把库撑大。
 
@@ -224,4 +239,5 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 - **权重语义**：槽位不够分时重权平均完成名次显著靠前且轻权不被饿死；槽位富余时不得断言严格优先（bench **B4** 两个方向都锁）。
 - **多驱动者**：前端轮询与 worker 并行时重复执行必须为 0，`slice_count` 全为 1（bench **B5**）。
 - **块序是被分配的**：槽位表的 id 唯一、order 齐、build 齐全，且第一个 volatile 块就是缓存断点（smoke **8d2** 已锁）；装配出来的块序与正文逐字对得上同一条检查。
+- **代答不另开一条路**：替身任务与普通任务同表同队列，普通轮提示词逐字节不变（smoke **25**：非替身轮不落 `delegate` 块）；一条 @ 最多派一封（回环两处 guard 各配一条放行断言），真人侧通知不因代答而少（**代答≠代收**）。
 - 每个模型轮在 `run_steps.detail.prompt_slots` 落下这轮的 `[槽位 id, 字符数, volatile]` 清单，轨迹检视器「上下文」标签按原序显示并标出断点；prompt 字符数与上一轮 LCP 的自动采集仍待 R3/trace 表落地。

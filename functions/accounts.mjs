@@ -7,7 +7,7 @@ const SESSION_SECONDS = 30 * 24 * 60 * 60;
 const VERIFY_SECONDS = 24 * 60 * 60;
 
 export const PUBLIC_USER =
-  "id,email,email_verified,display_name,avatar,at_channel,prefs,created_at";
+  "id,email,email_verified,display_name,avatar,at_channel,prefs,delegate_agent_id,delegate_start_at,delegate_end_at,created_at";
 
 export const actions = {
   async "auth.register"({ db, body }) {
@@ -154,6 +154,11 @@ function shapeUser(row) {
     avatar: row.avatar ?? null,
     at_channel: row.at_channel,
     prefs: row.prefs ?? {},
+    delegate: {
+      agent_id: row.delegate_agent_id ?? null,
+      start_at: row.delegate_start_at ?? null,
+      end_at: row.delegate_end_at ?? null,
+    },
     created_at: row.created_at,
   };
 }

@@ -15,6 +15,17 @@ import { imageMark, renderTranscript } from "./transcript.mjs";
 /** 云端 Agent 通道：工具不在这一条通道里，两处措辞要跟着换。 */
 export const isCloudBackend = (agent) => (agent.backend ?? "openai") === "qca";
 
+// 内容块的抬头：装配用它，演示模型摘录它，两边必须读同一份，否则过滤会跟着正文悄悄失效。
+const MEMORY_COMMON_HEADER = "你的长期记忆（common）：";
+const MEMORY_STREAM_HEADER = "本群记忆：";
+const TRANSCRIPT_HEADER = "最近记录：";
+
+/**
+ * 演示模型允许进群正文的块：只有转录和两段记忆——它们本来就是群里或成员档案里可见的内容。
+ * 指令块（守则、替身须知、触发消息）是内部提示，念到群里等于把提示词摊在同事面前。
+ */
+export const DEMO_QUOTABLE_HEADERS = [MEMORY_COMMON_HEADER, MEMORY_STREAM_HEADER, TRANSCRIPT_HEADER];
+
 /**
  * 一个槽位 = { id, order, volatile, build }。
  * `build(ctx)` 返回这一段正文，空串表示这一轮不落这个块（和过去的 filter(Boolean) 同义）。
@@ -79,7 +90,7 @@ export const PROMPT_SECTIONS = [
     order: 80,
     volatile: true,
     build: ({ prepared }) => (prepared.common.length
-      ? `你的长期记忆（common）：\n${prepared.common.map((m) => `- ${m.content}`).join("\n")}`
+      ? `${MEMORY_COMMON_HEADER}\n${prepared.common.map((m) => `- ${m.content}`).join("\n")}`
       : ""),
   },
   {
@@ -94,14 +105,24 @@ export const PROMPT_SECTIONS = [
     id: "transcript",
     order: 100,
     volatile: true,
-    build: ({ prepared }) => `最近记录：\n${renderTranscript(prepared.window)}`,
+    build: ({ prepared }) => `${TRANSCRIPT_HEADER}\n${renderTranscript(prepared.window)}`,
   },
   {
     id: "memory.stream",
     order: 110,
     volatile: true,
     build: ({ prepared }) => (prepared.notes.length
-      ? `本群记忆：\n${prepared.notes.map((m) => `- ${m.content}`).join("\n")}`
+      ? `${MEMORY_STREAM_HEADER}\n${prepared.notes.map((m) => `- ${m.content}`).join("\n")}`
+      : ""),
+  },
+  {
+    id: "delegate",
+    order: 115,
+    volatile: true,
+    // 替身必须自己说出来：署名仍是员工本人，冒充真人发言等于伪造身份。
+    // 排在转录与本群记忆之后，员工平时接活的那段前缀不会被这块打断。
+    build: ({ delegate }) => (delegate
+      ? `这一轮你是「${delegate.name}」的替身：这条 @ 是冲 ta 本人来的，ta 现在不在。请以同事身份代 ta 回应，正文里要让人看出是你在替 ta 答；不要冒充 ta 本人发言，也不要替 ta 做只有本人能做的承诺（审批、交接、对外报价、离职类决定）。`
       : ""),
   },
   {

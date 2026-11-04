@@ -6,7 +6,22 @@ export type User = {
   avatar?: string | null;
   at_channel: "virtual" | "real_email";
   prefs: { theme?: "light" | "dark" | "system"; notify_real_email?: boolean };
+  delegate: {
+    agent_id: string | null;
+    start_at: string | null;
+    end_at: string | null;
+  };
   created_at: string;
+};
+
+/** 某个群里替身当下的状态：本群覆盖 + 账号班表 + 服务端按此刻时钟算出的结论。 */
+export type DelegateStatus = {
+  mode: "inherit" | "on" | "off";
+  agent_id: string | null;
+  agent_name: string | null;
+  active: boolean;
+  reason: string | null;
+  schedule: { agent_id: string | null; start_at: string | null; end_at: string | null };
 };
 
 export type Agent = {
@@ -214,6 +229,8 @@ export type Message = {
   attachments?: Attachment[];
   deliveries?: Delivery[];
   kind: "chat" | "system";
+  /** 替身代答时是被谁的名下任务触发的：署名仍是员工，界面要标出这是替谁说话。 */
+  on_behalf_of?: string | null;
   error: string | null;
   created_at: string;
 };
@@ -435,6 +452,7 @@ export type StreamDetail = {
   ok: true;
   stream: Stream;
   my_role: "owner" | "admin" | "member";
+  my_delegate: DelegateStatus;
   members: Member[];
   files: GroupFile[];
   vms: StreamVm[];

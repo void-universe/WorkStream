@@ -189,6 +189,14 @@ export function ChatView({
     }
     return map;
   }, [detail]);
+  // 替身代答的气泡要标出替的是谁：消息里只有 user id，名字按成员目录补。
+  const humanNames = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const member of detail?.members ?? []) {
+      if (member.type === "human" && member.id && member.display_name) map.set(member.id, member.display_name);
+    }
+    return map;
+  }, [detail]);
 
   async function afterSent(result: SendResult) {
     setMessages((current) => [...current, result.message]);
@@ -291,6 +299,7 @@ export function ChatView({
                     message={message}
                     names={names}
                     me={user.id}
+                    humanNames={humanNames}
                     color={agentColors.get(message.sender_id)}
                     avatar={
                       presenceMap.get(message.sender_id)?.avatar ??
@@ -359,6 +368,7 @@ function MessageRow({
   color,
   avatar,
   presence,
+  humanNames,
 }: {
   message: Message;
   names: string[];
@@ -366,6 +376,7 @@ function MessageRow({
   color?: string;
   avatar?: string | null;
   presence?: AgentPresence;
+  humanNames: Map<string, string>;
 }) {
   if (message.sender_type === "system" || message.kind === "system") {
     return <p className="py-0.5 text-center text-[11px] leading-relaxed text-muted-foreground">{message.content}</p>;
@@ -389,6 +400,11 @@ function MessageRow({
             {agent ? (
               <Badge variant="outline" className="rounded-full px-1.5 py-0 font-mono text-[10px] font-normal text-machine">
                 虚拟
+              </Badge>
+            ) : null}
+            {message.on_behalf_of ? (
+              <Badge variant="outline" className="rounded-full border-signal/50 px-1.5 py-0 text-[10px] font-normal text-signal">
+                替 @{humanNames.get(message.on_behalf_of) ?? "已不在本群的同事"} 代答
               </Badge>
             ) : null}
             {agent && presence?.signature ? (

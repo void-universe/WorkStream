@@ -2,6 +2,7 @@
 import { open, seal } from "./sec.mjs";
 import { agentPresence } from "./presence.mjs";
 import { askCloudAgent, checkCloudAccess, parseAgentId } from "./qca.mjs";
+import { DEMO_QUOTABLE_HEADERS } from "./prompt.mjs";
 import { installDefaultSkillsFor, skillsForAgent } from "./skills.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, Interrupted, avatarData, int, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
 
@@ -516,7 +517,13 @@ function demoComplete({ messages, tools, summary }) {
     return { mode: "demo", content: lines.join("\n") || "（演示压缩：本段没有可摘录的发言。）", tool_calls: [] };
   }
   const context = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n");
-  const facts = (context.match(/^[^\n]{6,120}$/gm) ?? []).slice(-3).map((line) => truncate(line, 80));
+  // 只从转录与两段记忆里摘录：它们本来就是群里可见的内容。指令块（守则、替身须知、触发消息）
+  // 是内部提示，演示模型照抄进正文等于把提示词念给全群听。
+  const quotable = context
+    .split("\n\n")
+    .filter((block) => DEMO_QUOTABLE_HEADERS.some((header) => block.startsWith(header)))
+    .join("\n");
+  const facts = (quotable.match(/^[^\n]{6,120}$/gm) ?? []).slice(-3).map((line) => truncate(line, 80));
   return {
     mode: "demo",
     content: [

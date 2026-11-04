@@ -4,11 +4,12 @@ import { AGENT_COLUMNS } from "./agents.mjs";
 import { fireInterrupt } from "./bus.mjs";
 import { requireMembership } from "./perm.mjs";
 import { streamPresence } from "./presence.mjs";
+import { queueDelegateMail } from "./delegate.mjs";
 import { insertMessage } from "./rooms.mjs";
 import { Halt, isUuid, json, newId, now, text, truncate, uuid } from "./util.mjs";
 
 export const MESSAGE_COLUMNS =
-  "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,attachments,created_at";
+  "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,attachments,on_behalf_of,created_at";
 
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const MAX_IMAGES = 4;
@@ -151,7 +152,9 @@ export const actions = {
       : [];
     if (agents.length !== agentIds.length) throw new Halt("mention_agent_missing", 400);
     const humans = humanIds.length
-      ? await db.users.list([["id", humanIds]], { columns: "id,display_name,email,at_channel", limit: 20 })
+      ? await db.users.list([["id", humanIds]], {
+        columns: "id,display_name,email,at_channel,delegate_agent_id,delegate_start_at,delegate_end_at", limit: 20,
+      })
       : [];
     if (humans.length !== humanIds.length) throw new Halt("mention_human_missing", 400);
     // 每个被 @ 的主体都必须已经在这个群里，不能借 @ 向陌生会话投递。
@@ -215,7 +218,22 @@ export const actions = {
       notified.push({ user_id: human.id, channel: human.at_channel === "real_email" ? "real_email" : "virtual" });
     }
 
-    return json({ ok: true, message, queued, interrupted, notified, my_role: membership.role });
+    // 真人照旧收到通知，替身只是多接一封任务：代答不等于代收，本人回来还能看到原始 @。
+    const targeted = new Set([...queued.map((row) => row.agent_id), ...merged]);
+    const delegated = [];
+    for (const human of humans) {
+      const result = await queueDelegateMail(db, {
+        human,
+        streamId,
+        message,
+        senderId: user.id,
+        skipAgents: targeted,
+        weight: (agentId) => streamWeight(db, agentId, streamId),
+      });
+      if (result) delegated.push(result);
+    }
+
+    return json({ ok: true, message, queued, interrupted, notified, delegated, my_role: membership.role });
   },
 
   /** 取一条消息附带的原图：群成员才能取，返回 base64 供前端拼 data URL。 */

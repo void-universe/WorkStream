@@ -1,11 +1,12 @@
 // 群（stream）：UUID 申请进群、邀请、成员角色、公告、群文件、消息与 @ 派发。
 import { deliver } from "./accounts.mjs";
 import { AGENT_COLUMNS, publicAgent } from "./agents.mjs";
+import { delegateStatus } from "./delegate.mjs";
 import { STREAM_COLUMNS, humanMembership, requireMembership, requireRole } from "./perm.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, email as emailOf, int, json, newId, now, oneOf, text, uuid } from "./util.mjs";
 
 const MESSAGE_COLUMNS =
-  "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,attachments,created_at";
+  "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,attachments,on_behalf_of,created_at";
 const FILE_COLUMNS = "id,stream_id,name,size_bytes,content_type,store,uploaded_by,created_at";
 export const MAX_FILE_BYTES = 400_000;
 
@@ -103,7 +104,7 @@ export async function nextSeq(db, streamId) {
   throw new Halt("seq_contention", 503);
 }
 
-async function insertMessage(db, { streamId, senderType, senderId, senderName, content, mentions, replyTo, kind, attachments }) {
+async function insertMessage(db, { streamId, senderType, senderId, senderName, content, mentions, replyTo, kind, attachments, onBehalfOf }) {
   const seq = await nextSeq(db, streamId);
   const row = await db.messages.insert({
     id: newId(),
@@ -118,6 +119,8 @@ async function insertMessage(db, { streamId, senderType, senderId, senderName, c
     kind: kind ?? (senderType === "system" ? "system" : "chat"),
     error: null,
     attachments: attachments ?? [],
+    // 替身代答时记下 ta 替谁说话：署名仍是替身自己，群里要看得见不是本人发言。
+    on_behalf_of: onBehalfOf ?? null,
     created_at: now(),
   }, { columns: MESSAGE_COLUMNS });
   if (!row) throw new Halt("message_write_failed", 503);
@@ -226,6 +229,8 @@ export const actions = {
       ok: true,
       stream,
       my_role: membership.role,
+      // 只回本人那条的替身状态：别人的班表是账号配置，不跟着群现场一起漏出去。
+      my_delegate: await delegateStatus(db, { human: user, streamId }),
       members: [...directory.humans, ...directory.agents],
       files,
       vms: granted.map((g) => ({

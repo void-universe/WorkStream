@@ -9,7 +9,8 @@ import { serveSite } from "../functions/adapter.mjs";
 import { executeTool, INTERNAL_TOOL_NAMES } from "../functions/mcp.mjs";
 import { connectorToolDefs } from "../functions/plugins.mjs";
 import { isUpdateAvailable } from "../functions/registries.mjs";
-import { CACHE_BREAKPOINT_ID, PROMPT_SECTIONS, composeSystemPrompt } from "../functions/prompt.mjs";
+import { CACHE_BREAKPOINT_ID, DEMO_QUOTABLE_HEADERS, PROMPT_SECTIONS, composeSystemPrompt } from "../functions/prompt.mjs";
+import { delegateWindow } from "../functions/delegate.mjs";
 import { skillPrompt } from "../functions/skills.mjs";
 import { store } from "../functions/store.mjs";
 import { closeOrphanSteps, createStepWriter } from "../functions/steps.mjs";
@@ -1114,6 +1115,10 @@ async function main() {
     composed.system.includes("调用 search_history / read_window 工具")
     && composed.system.includes("需要时用 set_signature 更新")
     && !composed.system.includes("本次由云端 Agent 作答"), {});
+  // 演示模型按抬头挑可摘录的块：改了块措辞没改这份清单，过滤会静默失效、内部指令又会被念进群。
+  check("演示模型允许摘录的抬头都真的出现在装配出来的正文里",
+    DEMO_QUOTABLE_HEADERS.every((header) => composed.system.includes(header)),
+    { 缺: DEMO_QUOTABLE_HEADERS.filter((header) => !composed.system.includes(header)) });
   step("8e. 突发排队：同群第二封的上下文里必须带着第一封刚落的回复");
   const burst = async (content) => call("messages.send", {
     token: ana,
@@ -2612,6 +2617,181 @@ async function main() {
   })());
   keepFirst();
   check("精确 disposer：注销后彻底消失", !fileRenderers().some((row) => row.id === "shared"));
+
+  step("\n§25 替身：真人不在时由本人名下的虚拟员工代答");
+  const DAY = 24 * 60 * 60 * 1000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const T0 = Date.parse("2026-01-10T12:00:00Z");
+
+  // 生效判定是纯函数：派发路径和界面用同一把尺子，所以先把尺子本身钉死。
+  check("没排班表、群内也没单独开：不生效，如实说未开启",
+    delegateWindow({ mode: "inherit", scheduled: false, atMs: T0 }).reason === "not_enabled");
+  check("排了班表但没给时段：立即生效",
+    delegateWindow({ mode: "inherit", scheduled: true, atMs: T0 }).active === true);
+  check("时段内生效",
+    delegateWindow({ mode: "inherit", scheduled: true, startAt: iso(T0 - 60000), endAt: iso(T0 + 60000), atMs: T0 }).active === true);
+  check("时段左端取得到（到点即生效）",
+    delegateWindow({ mode: "inherit", scheduled: true, startAt: iso(T0), endAt: iso(T0 + 60000), atMs: T0 }).active === true);
+  check("时段右端取不到（到点即失效，不留一秒重叠）",
+    delegateWindow({ mode: "inherit", scheduled: true, startAt: iso(T0 - 60000), endAt: iso(T0), atMs: T0 }).reason === "expired");
+  check("还没到时段：如实说没开始",
+    delegateWindow({ mode: "inherit", scheduled: true, startAt: iso(T0 + 60000), atMs: T0 }).reason === "not_started");
+  check("只填结束且还没到：生效",
+    delegateWindow({ mode: "inherit", scheduled: true, endAt: iso(T0 + 60000), atMs: T0 }).active === true);
+  check("只填开始且已经过去：生效",
+    delegateWindow({ mode: "inherit", scheduled: true, startAt: iso(T0 - 60000), atMs: T0 }).active === true);
+  check("本群关掉压过班表：关就是关",
+    delegateWindow({ mode: "off", scheduled: true, atMs: T0 }).reason === "stream_off");
+  check("本群单独开不依赖班表：没排班也能只在这个群生效",
+    delegateWindow({ mode: "on", scheduled: false, atMs: T0 }).active === true);
+
+  const lin = await call("auth.register", { body: { email: "lin@example.com", password: "passw0rd-25", display_name: "林" } });
+  const linId = lin.payload.user?.id;
+  await call("auth.verify", { body: { token: decodeURIComponent((lin.payload.verify_link ?? "").split("token=")[1] ?? "") } });
+  const linToken = (await call("auth.login", { body: { email: "lin@example.com", password: "passw0rd-25" } })).payload.token;
+  const han = await call("auth.register", { body: { email: "han@example.com", password: "passw0rd-26", display_name: "韩" } });
+  const hanId = han.payload.user?.id;
+  const hanToken = (await call("auth.login", { body: { email: "han@example.com", password: "passw0rd-26" } })).payload.token;
+  const standIn = await call("agents.create", {
+    token: linToken,
+    body: { name: "小L", role: "值班", api_base_url: "demo://local", api_key: "demo-key-25", model: "demo" },
+  });
+  const standInId = standIn.payload.agent?.id;
+  const dStream = await call("streams.create", { token: linToken, body: { name: "替身值班组", agent_ids: [standInId] } });
+  const dStreamId = dStream.payload.stream?.id;
+  const dApply = await call("streams.apply", { token: hanToken, body: { stream_uuid: dStreamId } });
+  await call("streams.decide", { token: linToken, body: { request_id: dApply.payload.request_id, approve: true } });
+
+  // 成对：同一个员工，别人拿来当替身被拒、本人拿来用放行——只比 owner 时两条会同时通过或同时失败。
+  const steal = await call("delegate.set", { token: hanToken, body: { mode: "now", agent_id: standInId } });
+  check("借别人的虚拟员工当替身被拒", steal.status === 403 && steal.payload.error === "agent_not_owned", steal.payload);
+  const ownSet = await call("delegate.set", { token: linToken, body: { mode: "now", agent_id: standInId } });
+  check("对照：本人名下的员工就能立为替身", ownSet.payload.ok === true, ownSet.payload);
+  const anonymousSet = await call("delegate.set", { body: { mode: "now", agent_id: standInId } });
+  check("未登录改班表被拒", anonymousSet.status === 401, anonymousSet.payload);
+  check("班表只写在自己的账号行上：韩的班表仍是空的",
+    (await call("auth.me", { token: hanToken, method: "GET" })).payload.user?.delegate?.agent_id === null, hanId);
+  const badMode = await call("delegate.set", { token: linToken, body: { mode: "always", agent_id: standInId } });
+  check("不认识的替身模式被拒", badMode.status === 400 && badMode.payload.error === "invalid_mode", badMode.payload);
+  check("时间段两头都不填被拒",
+    (await call("delegate.set", { token: linToken, body: { mode: "window", agent_id: standInId } })).payload.error === "window_needs_bounds");
+  check("结束早于开始被拒",
+    (await call("delegate.set", { token: linToken, body: { mode: "window", agent_id: standInId, start_at: iso(T0), end_at: iso(T0 - 1000) } })).payload.error === "window_inverted");
+  check("排到 90 天以后被拒：没人会记得自己开过这么远的替身",
+    (await call("delegate.set", { token: linToken, body: { mode: "window", agent_id: standInId, start_at: iso(Date.now() + 200 * DAY) } })).payload.error === "window_too_far_ahead");
+  check("时刻格式不合法就地炸，不静默按立即处理",
+    (await call("delegate.set", { token: linToken, body: { mode: "window", agent_id: standInId, start_at: "明天下午" } })).payload.error === "invalid_start_at");
+
+  const dSend = await call("messages.send", {
+    token: hanToken,
+    body: { stream_id: dStreamId, content: "@林 这个报错你帮我看下", mentions: [{ type: "human", id: linId }] },
+  });
+  check("@ 真人时替身接到一封任务",
+    (dSend.payload.delegated ?? []).some((d) => d.user_id === linId && d.active && d.agent_id === standInId), dSend.payload);
+  check("@ 真人时本人照旧收到通知：代答不等于代收",
+    (dSend.payload.notified ?? []).some((n) => n.user_id === linId), dSend.payload);
+  const dMail = await db.mail.list([["message_id", dSend.payload.message?.id]], { columns: "agent_id,status,meta", limit: 5 });
+  check("落下的任务里记着替谁说话", dMail.length === 1 && dMail[0].meta?.on_behalf_of === linId, dMail);
+  const dTick = await call("scheduler.tick", { token: linToken, method: "GET" });
+  check("替身把这封任务跑掉了",
+    (dTick.payload.ran ?? []).some((r) => r.agent_id === standInId && r.status === "done"), dTick.payload);
+  const dHistory = await call("messages.list", { token: hanToken, method: "GET", body: { stream_id: dStreamId } });
+  const dReply = (dHistory.payload.items ?? []).find((m) => m.sender_type === "agent");
+  check("回复署名是替身本人，不是被替的真人",
+    dReply?.sender_name === "小L" && dReply?.sender_id === standInId, dReply);
+  check("回复带着 on_behalf_of，界面据此标出是代答", dReply?.on_behalf_of === linId, dReply);
+  check("代答正文不念内部指令：替身须知和触发消息都留在提示词里",
+    !String(dReply?.content).includes("这一轮你是") && !String(dReply?.content).includes("上一条 @ 你的消息"), dReply?.content);
+  check("对照：转录与记忆照旧摘录得出来（演示模型仍能证明上下文进得去）",
+    /建档：|韩：@林/.test(String(dReply?.content)), dReply?.content);
+  // 演示模型会把触发消息原样摘录进回复，所以这条回复天然又 @ 了主人：正是自我触发的现场。
+  const dLoopMail = await db.mail.list([["agent_id", standInId], ["stream_id", dStreamId]], { columns: "id,status,message_id", limit: 10 });
+  check("替身的回复里 @ 了主人：不再给自己派活，队列里没有第二封",
+    dLoopMail.length === 1, dLoopMail);
+
+  const offHere = await call("delegate.stream", { token: linToken, body: { stream_id: dStreamId, mode: "off" } });
+  check("本群关掉压过全局「立即」", offHere.payload.active === false && offHere.payload.reason === "stream_off", offHere.payload);
+  const dSendOff = await call("messages.send", {
+    token: hanToken,
+    body: { stream_id: dStreamId, content: "@林 还在吗", mentions: [{ type: "human", id: linId }] },
+  });
+  check("关掉之后 @ 真人不再落替身任务",
+    dSendOff.payload.delegated?.[0]?.active === false && dSendOff.payload.delegated[0].reason === "stream_off", dSendOff.payload);
+  const onHere = await call("delegate.stream", { token: linToken, body: { stream_id: dStreamId, mode: "on" } });
+  check("对照：同一处改成只在本群开就重新生效", onHere.payload.active === true && onHere.payload.agent_name === "小L", onHere.payload);
+  const dSendOn = await call("messages.send", {
+    token: hanToken,
+    body: { stream_id: dStreamId, content: "@林 这条要接", mentions: [{ type: "human", id: linId }] },
+  });
+  check("对照：重新打开之后 @ 真人又会落替身任务",
+    dSendOn.payload.delegated?.[0]?.active === true, dSendOn.payload);
+  const selfSend = await call("messages.send", {
+    token: linToken,
+    body: { stream_id: dStreamId, content: "@林 自己 @ 自己", mentions: [{ type: "human", id: linId }] },
+  });
+  check("自己 @ 自己不触发替身", (selfSend.payload.delegated ?? []).length === 0, selfSend.payload);
+
+  const standIn2 = await call("agents.create", {
+    token: linToken,
+    body: { name: "小M", role: "备份替身", api_base_url: "demo://local", api_key: "demo-key-26", model: "demo" },
+  });
+  const standIn2Id = standIn2.payload.agent?.id;
+  const notInRoom = await call("delegate.stream", { token: linToken, body: { stream_id: dStreamId, mode: "on", agent_id: standIn2Id } });
+  check("替身不在本群：如实说不在，不硬派",
+    notInRoom.payload.active === false && notInRoom.payload.reason === "agent_not_in_stream", notInRoom.payload);
+  await call("streams.agents.add", { token: linToken, body: { stream_id: dStreamId, agent_id: standIn2Id } });
+  const inRoom = await call("delegate.stream", { token: linToken, body: { stream_id: dStreamId, mode: "on", agent_id: standIn2Id } });
+  check("对照：把这位员工拉进群后，本群替身就用 ta",
+    inRoom.payload.active === true && inRoom.payload.agent_name === "小M", inRoom.payload);
+  await call("agents.update", { token: linToken, body: { id: standIn2Id, status: "paused" } });
+  check("替身被停用：如实说停用，不派给一个不会回话的员工",
+    (await call("delegate.stream", { token: linToken, body: { stream_id: dStreamId, mode: "on", agent_id: standIn2Id } })).payload.reason === "agent_paused");
+  await call("agents.update", { token: linToken, body: { id: standIn2Id, status: "active" } });
+  await call("delegate.stream", { token: linToken, body: { stream_id: dStreamId, mode: "inherit" } });
+
+  const hanOverride = await call("delegate.stream", { token: hanToken, body: { stream_id: dStreamId, mode: "off" } });
+  check("群内覆盖只改自己那条成员记录：韩能关掉韩自己的替身", hanOverride.payload.ok === true, hanOverride.payload);
+  const linStill = await call("streams.get", { token: linToken, method: "GET", body: { id: dStreamId } });
+  check("对照：韩的覆盖动不到林的班表", linStill.payload.my_delegate?.active === true, linStill.payload.my_delegate);
+  const hanView = await call("streams.get", { token: hanToken, method: "GET", body: { id: dStreamId } });
+  check("别人的替身班表不从群现场里漏出去",
+    hanView.payload.my_delegate?.schedule?.agent_id === null && hanView.payload.my_delegate?.mode === "off", hanView.payload.my_delegate);
+
+  // 到期靠时钟判定，不靠"到点翻牌"：没有任何常驻进程保证那次写入发生。
+  const pastWindow = await call("delegate.set", {
+    token: linToken,
+    body: { mode: "window", agent_id: standInId, start_at: iso(Date.now() - 2 * DAY), end_at: iso(Date.now() - DAY) },
+  });
+  check("已经结束的时段存得下来（不需要谁去翻牌）", pastWindow.payload.ok === true, pastWindow.payload);
+  const dSendExpired = await call("messages.send", {
+    token: hanToken,
+    body: { stream_id: dStreamId, content: "@林 时段过了还找我吗", mentions: [{ type: "human", id: linId }] },
+  });
+  check("时段已过：不再派任务，如实说已过期",
+    dSendExpired.payload.delegated?.[0]?.active === false && dSendExpired.payload.delegated[0].reason === "expired", dSendExpired.payload);
+
+  const offAll = await call("delegate.set", { token: linToken, body: { mode: "off" } });
+  check("全局一键关掉", offAll.payload.ok === true && offAll.payload.delegate.agent_id === null, offAll.payload);
+  check("关掉后账号里读得到空班表",
+    (await call("auth.me", { token: linToken, method: "GET" })).payload.user?.delegate?.agent_id === null);
+  const onlyHere = await call("delegate.stream", { token: linToken, body: { stream_id: dStreamId, mode: "on", agent_id: standInId } });
+  check("全局关着仍可在单个群单独启用", onlyHere.payload.active === true, onlyHere.payload);
+  const dSendLocal = await call("messages.send", {
+    token: hanToken,
+    body: { stream_id: dStreamId, content: "@林 只在这个群找你", mentions: [{ type: "human", id: linId }] },
+  });
+  check("单独启用的那个群会落任务", dSendLocal.payload.delegated?.[0]?.active === true, dSendLocal.payload);
+
+  const withDelegate = composeSystemPrompt({ ...slotCtx, delegate: { name: "林", id: linId } });
+  check("替身这一轮单独成一块，位置在本群记忆之后、触发消息之前",
+    withDelegate.promptSlots.map(([id]) => id).join(",")
+      === "identity,signature,guide,announcement,skills,history.access,memory.common,summary,transcript,memory.stream,delegate,trigger",
+    withDelegate.promptSlots.map(([id]) => id));
+  check("这块要求替身自报是替身，且不冒充本人、不替本人承诺",
+    withDelegate.system.includes("你是「林」的替身") && withDelegate.system.includes("不要冒充 ta 本人"));
+  check("替身块标注为易变：它不会打断平时接活的那段前缀",
+    PROMPT_SECTIONS.find((section) => section.id === "delegate")?.volatile === true);
+  check("不是替身的那一轮不落这一块", !composed.promptSlots.some(([id]) => id === "delegate"));
 
   console.log(`\n结果：${passed} 项通过，${failures.length} 项失败`);
   if (failures.length) {
