@@ -8,9 +8,10 @@ import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { describeError, get, post, type Agent } from "../api";
-import type { Schedule, Stream } from "../types";
+import { describeCode, describeError, get, post, type Agent } from "../api";
+import type { DreamState, Schedule, Stream } from "../types";
 import { shortUuid, timeAgo } from "../lib/format";
 import { Field, Notice, PersonAvatar, StatRow } from "../lib/ui";
 
@@ -67,6 +68,10 @@ function specLabel(row: Schedule): string {
 
 const dayKey = (date: Date) => `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
 
+/** 归并是被谁叫醒的：后端在信上记了原因，界面上就要能分开这三种入口。 */
+const dreamReason = (reason: string | null): string =>
+  reason === "auto" ? "群折叠触发" : reason === "cron" ? "排程触发" : "手动按钮";
+
 /** 未来的对点用「今天/明天/周几 + 钟点」读，钟点按本机时区换算——界面上的时间差一分钟都不该差。 */
 function occurrenceLabel(iso: string | undefined): string {
   if (!iso) return "—";
@@ -85,6 +90,8 @@ type Draft = {
   instruction: string;
   agent_id: string;
   stream_id: string;
+  /** 这条排程到点干什么："" 是干活，"dreaming" 是归并全局记忆。建好后不能改。 */
+  purpose: "" | "dreaming";
   kind: "every" | "daily";
   interval_minutes: string;
   at_time: string;
@@ -98,6 +105,7 @@ const emptyDraft = (): Draft => ({
   instruction: "",
   agent_id: "",
   stream_id: "",
+  purpose: "",
   kind: "every",
   interval_minutes: "30",
   at_time: "09:00",
@@ -111,20 +119,26 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
   const [busy, setBusy] = useState(false);
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [limits, setLimits] = useState({ max_per_owner: 20, min_interval_minutes: 1 });
+  const [dream, setDream] = useState<DreamState | null>(null);
+  const [dreamAgent, setDreamAgent] = useState("");
+  const [dreamStream, setDreamStream] = useState("");
   const [draft, setDraft] = useState<Draft | null>(null);
   const [saving, setSaving] = useState(false);
+  const [dreaming, setDreaming] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const [next, mine, cron] = await Promise.all([
+      const [next, mine, cron, dreamState] = await Promise.all([
         get<Board>("scheduler.board"),
         get<{ ok: true; items: Stream[] }>("streams.mine"),
         get<{ ok: true; items: Schedule[]; limits: typeof limits }>("cron.list"),
+        get<DreamState>("dreaming.get"),
       ]);
       setBoard(next);
       setStreams(mine.items);
       setSchedules(cron.items);
       setLimits(cron.limits);
+      setDream(dreamState);
     } catch (error) {
       toast.error(describeError(error));
     }
@@ -179,12 +193,17 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
     for (const stream of streams) if (stream.name) map.set(stream.id, stream.name);
     return map;
   }, [board, streams]);
-  const draftStreams = useMemo(() => {
-    const entry = (board?.boards ?? []).find((item) => item.agent.id === draft?.agent_id);
-    if (!entry) return [];
+  // 「这位员工和我也都在的群」这张表排程和归并用同一份：两处各算一遍迟早会算出两种口径。
+  const streamsByAgent = useMemo(() => {
     const mine = new Set(streams.map((stream) => stream.id));
-    return entry.streams.filter((slice) => mine.has(slice.stream_id));
-  }, [board, streams, draft?.agent_id]);
+    const map = new Map<string, Slice[]>();
+    for (const entry of board?.boards ?? []) {
+      map.set(entry.agent.id, entry.streams.filter((slice) => mine.has(slice.stream_id)));
+    }
+    return map;
+  }, [board, streams]);
+  const draftStreams = streamsByAgent.get(draft?.agent_id ?? "") ?? [];
+  const dreamStreams = streamsByAgent.get(dreamAgent) ?? [];
   const tzOptions = useMemo(() => {
     const whole: number[] = [];
     for (let hour = -12; hour <= 14; hour += 1) whole.push(hour * 60);
@@ -204,8 +223,7 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
       return;
     }
     const first = (board?.boards ?? [])[0];
-    const mine = new Set(streams.map((stream) => stream.id));
-    const shared = first ? first.streams.filter((slice) => mine.has(slice.stream_id)) : [];
+    const shared = first ? streamsByAgent.get(first.agent.id) ?? [] : [];
     setDraft({ ...emptyDraft(), agent_id: first?.agent.id ?? "", stream_id: shared[0]?.stream_id ?? "" });
   }
 
@@ -216,6 +234,7 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
       instruction: row.instruction,
       agent_id: row.agent_id,
       stream_id: row.stream_id,
+      purpose: row.purpose === "dreaming" ? "dreaming" : "",
       kind: row.kind,
       interval_minutes: String(row.interval_minutes ?? 30),
       at_time: row.at_time ?? "09:00",
@@ -231,7 +250,8 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
       toast.error("给排程起个名字：群里回头要认得出是哪一条在说话。");
       return;
     }
-    if (!draft.instruction.trim()) {
+    // 归并全局记忆那条不看「要办的事」：正文是可选的额外要求，留空就用默认口径。
+    if (!draft.instruction.trim() && draft.purpose !== "dreaming") {
       toast.error("「要办的事」不能空着：这一轮醒来它主要就看这句话。");
       return;
     }
@@ -256,6 +276,7 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
         instruction: draft.instruction.trim(),
         agent_id: draft.agent_id,
         stream_id: draft.stream_id,
+        purpose: draft.purpose || undefined,
         kind: draft.kind,
         interval_minutes: draft.kind === "every" ? interval : null,
         at_time: draft.kind === "daily" ? draft.at_time : null,
@@ -294,6 +315,59 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
     }
   }
 
+  // 归并的信要落进某位员工的某个群邮箱才能排队；默认取第一个能用的组合，不逼用户先选一遍。
+  useEffect(() => {
+    if (dreamAgent || !board?.boards.length) return;
+    const entry = board.boards.find((item) => (streamsByAgent.get(item.agent.id) ?? []).length);
+    if (!entry) return;
+    setDreamAgent(entry.agent.id);
+    setDreamStream(streamsByAgent.get(entry.agent.id)?.[0]?.stream_id ?? "");
+  }, [board, streamsByAgent, dreamAgent]);
+
+  async function saveDreamAuto(next: boolean) {
+    setDream((prev) => (prev ? { ...prev, auto: next } : prev));
+    try {
+      await post("auth.patch", { prefs: { dreaming_auto: next } });
+      toast.success(next ? "已打开：任何一个群折叠历史时，顺手补一次归并。" : "已关闭：归并只按排程或手动按钮走。");
+    } catch (error) {
+      setDream((prev) => (prev ? { ...prev, auto: !next } : prev));
+      toast.error(describeError(error));
+    }
+  }
+
+  async function runDreamNow() {
+    if (!dreamAgent || !dreamStream) {
+      toast.error("先选归并走哪位员工、落哪个群。");
+      return;
+    }
+    setDreaming(true);
+    try {
+      const result = await post<{ ok: true; queued: boolean; reason?: string }>("dreaming.run", {
+        agent_id: dreamAgent,
+        stream_id: dreamStream,
+      });
+      toast.success(result.queued
+        ? "已投给后台：这一轮跑完就能看到新的全局记忆，它不会在群里说话。"
+        : `这次没排队：${result.reason === "already_pending" ? "已经有一封还没跑的归并信了。" : "名下没有可用的虚拟员工。"}`);
+      await refresh();
+    } catch (error) {
+      toast.error(describeError(error));
+    } finally {
+      setDreaming(false);
+    }
+  }
+
+  async function clearDream() {
+    if (!window.confirm("删掉这份全局记忆？每群的覆盖水位会一并清空，下一次归并从各群现有的摘要重并。")) return;
+    try {
+      await post("dreaming.clear", {});
+      toast.success("全局记忆已清空。");
+      await refresh();
+    } catch (error) {
+      toast.error(describeError(error));
+    }
+  }
+
   const totals = (board?.boards ?? [])
     .flatMap((entry) => entry.streams)
     .reduce(
@@ -305,6 +379,8 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
       }),
       { queued: 0, running: 0, done: 0, failed: 0 },
     );
+  // 排程那一张表已经带了 purpose，这里只数一下，不另开一份"定时归并列表"。
+  const dreamCount = schedules.filter((row) => row.purpose === "dreaming").length;
 
   return (
     <div className="mx-auto grid h-full w-full max-w-5xl min-h-0 gap-4 overflow-y-auto p-4 scrollbar-thin md:p-6">
@@ -418,6 +494,18 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
                     onChange={(event) => setDraft({ ...draft, name: event.target.value })}
                   />
                 </Field>
+                <Field label="这条排程干什么" htmlFor="cron-purpose" hint="建好之后不能改：换成另一种活法，等于悄悄改了同一条排程的语义，要改就删了重建。">
+                  <NativeSelect
+                    id="cron-purpose"
+                    className="h-8 text-xs"
+                    value={draft.purpose}
+                    disabled={Boolean(draft.id)}
+                    onChange={(event) => setDraft({ ...draft, purpose: event.target.value as Draft["purpose"] })}
+                  >
+                    <NativeSelectOption value="">到点干活（在群里说话）</NativeSelectOption>
+                    <NativeSelectOption value="dreaming">到点归并全局记忆（不进群）</NativeSelectOption>
+                  </NativeSelect>
+                </Field>
                 <Field label="干活的员工" htmlFor="cron-agent" hint="只能排你自己名下的虚拟员工：借别人的员工排班是烧别人的 Key。">
                   <NativeSelect
                     id="cron-agent"
@@ -530,7 +618,9 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
               <Field
                 label="要办的事"
                 htmlFor="cron-instruction"
-                hint="这一轮醒来时它看到的是这句话加上群里最近的转录；没事要让同事知道就留空正文，WorkStream 不会替你发一条空消息。"
+                hint={draft.purpose === "dreaming"
+                  ? "归并那一轮的素材是你名下各个群的压缩摘要，这句话只是额外交代（比如「只并待办和数字」），可以留空。"
+                  : "这一轮醒来时它看到的是这句话加上群里最近的转录。这句话不能空着；要在「没事的时候别说话」，就把它写进这句话里。"}
               >
                 <Textarea
                   id="cron-instruction"
@@ -538,7 +628,9 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
                   maxLength={2000}
                   className="text-xs"
                   value={draft.instruction}
-                  placeholder="看一眼线上告警，把要紧的报出来；没有要紧的就别说话。"
+                  placeholder={draft.purpose === "dreaming"
+                    ? "只并稳定事实和还没办完的待办，人名与数字照抄。"
+                    : "看一眼线上告警，把要紧的报出来；没有要紧的就别说话。"}
                   onChange={(event) => setDraft({ ...draft, instruction: event.target.value })}
                 />
               </Field>
@@ -561,10 +653,14 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
 
           {schedules.map((row) => {
             const paused = row.next_run_at === null;
+            const isDream = row.purpose === "dreaming";
             return (
               <div key={row.id} className="grid gap-1.5 rounded-lg border bg-card/60 p-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="truncate text-sm font-medium">{row.name}</span>
+                  {isDream ? (
+                    <Badge variant="outline" className="rounded-sm font-mono text-[11px]">归并全局记忆</Badge>
+                  ) : null}
                   <Badge variant={paused ? "secondary" : "outline"} className="rounded-sm font-mono text-[11px]">
                     {paused ? "已暂停" : specLabel(row)}
                   </Badge>
@@ -591,11 +687,14 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
                     <a className="hover:underline" href={`#/stream/${row.stream_id}`}>
                       {streamNames.get(row.stream_id) ?? shortUuid(row.stream_id)}
                     </a>
+                    {isDream ? "（只是走信的群，这一轮不进群说话）" : ""}
                   </span>
                   <span>下一次 {occurrenceLabel(row.upcoming[0])}</span>
                   <span>{row.last_run_at ? `上次跑 ${timeAgo(row.last_run_at)}` : "还没跑过"}</span>
                 </div>
-                <p className="text-xs leading-relaxed text-muted-foreground">{row.instruction}</p>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  {row.instruction || (isDream ? "（这次没有额外交代，按默认口径归并）" : "")}
+                </p>
                 {pausedAgents.has(row.agent_id) ? (
                   <p className="text-[11px] text-machine">这位员工现在「暂停接活」，到点的那一轮会直接失败。</p>
                 ) : null}
@@ -607,7 +706,117 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
           <p className="text-xs text-muted-foreground">
             到点那一轮排在真人 @ 之后：同事在线等回答时先答人，欠下的对点下一轮照样按时钟追上来。
             员工中途退群时这条会自己暂停，界面上如实显示「已暂停」，要恢复得由主人重新排。
+            「归并全局记忆」那一类到点不进群说话，只把各群的摘要并进下面这一份。
           </p>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm">全局记忆（dreaming）</CardTitle>
+          <CardDescription className="text-xs">
+            把你名下各个群的压缩摘要归并成一份「属于你」的结论。它每一轮都在提示词里，但只用来判断该怎么答——
+            那是跨群归并出来的东西，不会被念给当前这个群听。三个入口：群一折叠历史就顺手归并（下面的开关）、
+            按排程定时归并（在上面新建一条「到点归并全局记忆」的排程，现在 {dreamCount} 条）、以及这里手动跑一次。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3">
+          <Field label="群一压缩完就归并一次" hint="没有新要点的那一轮直接算没事，不付模型调用；攒着等下一个群有新材料。">
+            <div className="flex h-8 items-center">
+              <Switch
+                checked={Boolean(dream?.auto)}
+                disabled={!dream}
+                onCheckedChange={(next) => void saveDreamAuto(next)}
+              />
+            </div>
+          </Field>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="归并走哪位员工" htmlFor="dream-agent" hint="只是借它的模型和 Key 跑这一次；结果归你，不归这位员工。">
+              <NativeSelect
+                id="dream-agent"
+                className="h-8 text-xs"
+                value={dreamAgent}
+                onChange={(event) => {
+                  const id = event.target.value;
+                  setDreamAgent(id);
+                  setDreamStream(streamsByAgent.get(id)?.[0]?.stream_id ?? "");
+                }}
+              >
+                <NativeSelectOption value="">选一个虚拟员工</NativeSelectOption>
+                {(board?.boards ?? []).map((entry) => (
+                  <NativeSelectOption key={entry.agent.id} value={entry.agent.id}>
+                    {entry.agent.name}
+                    {entry.agent.status === "paused" ? " · 暂停接活" : ""}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </Field>
+            <Field label="落哪个群" htmlFor="dream-stream" hint="这封信要落进某位员工的某个群邮箱才能排队；归并本身不进群。">
+              <NativeSelect
+                id="dream-stream"
+                className="h-8 text-xs"
+                value={dreamStream}
+                onChange={(event) => setDreamStream(event.target.value)}
+              >
+                <NativeSelectOption value="">
+                  {dreamAgent && !dreamStreams.length ? "这位员工没和你在任何共同群里" : "选一个群"}
+                </NativeSelectOption>
+                {dreamStreams.map((slice) => (
+                  <NativeSelectOption key={slice.stream_id} value={slice.stream_id}>
+                    {slice.name || shortUuid(slice.stream_id)}
+                  </NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </Field>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              className="text-xs"
+              onClick={() => void runDreamNow()}
+              disabled={dreaming || !dreamAgent || !dreamStream}
+            >
+              {dreaming ? "投递中…" : "立即归并一次"}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="text-xs"
+              onClick={() => void clearDream()}
+              disabled={!dream?.memory}
+            >
+              清空全局记忆
+            </Button>
+            {dream?.memory ? (
+              <span className="font-mono text-[11px] text-muted-foreground">
+                已并入 {Object.keys(dream.memory.covers_streams).length} 份群摘要 · 更新于 {timeAgo(dream.memory.updated_at)}
+              </span>
+            ) : null}
+          </div>
+
+          {dream?.memory ? (
+            <p className="whitespace-pre-wrap rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed">
+              {dream.memory.content}
+            </p>
+          ) : (
+            <Notice>
+              还没有全局记忆：先让名下的员工在群里跑起来——各群要有压缩摘要，这里才并得出东西。
+            </Notice>
+          )}
+
+          {dream?.last_run ? (
+            <p className="font-mono text-[11px] text-muted-foreground">
+              上一次归并：
+              {dream.last_run.status === "done"
+                ? `跑完于 ${dream.last_run.finished_at ? timeAgo(dream.last_run.finished_at) : "—"}`
+                : dream.last_run.status === "failed"
+                  ? `失败：${describeCode(dream.last_run.error ?? "dream_failed")}`
+                  : `${dream.last_run.status === "queued" ? "排队中" : dream.last_run.status === "running" ? "正在跑" : "已撤回"}`}
+              （{dreamReason(dream.last_run.reason)}）
+            </p>
+          ) : null}
         </CardContent>
       </Card>
 

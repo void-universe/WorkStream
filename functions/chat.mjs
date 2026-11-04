@@ -6,7 +6,7 @@ import { requireMembership } from "./perm.mjs";
 import { streamPresence } from "./presence.mjs";
 import { queueDelegateMail } from "./delegate.mjs";
 import { insertMessage, MESSAGE_COLUMNS } from "./rooms.mjs";
-import { Halt, isUuid, json, newId, now, text, truncate, uuid } from "./util.mjs";
+import { Halt, interruptibleMail, isUuid, json, newId, now, text, truncate, uuid } from "./util.mjs";
 
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const MAX_IMAGES = 4;
@@ -54,6 +54,8 @@ async function registerInterrupts(db, { user, streamId, message, agents }) {
   });
   const out = [];
   for (const mail of running) {
+    // 后台折叠那一轮不看插话：把它当成"这条 @ 已被消化"，这条消息就既没有任务行也等不到回执。
+    if (!interruptibleMail(mail.meta)) continue;
     const handled = Math.max(Number(mail.trigger_seq ?? 0), Number(mail.meta?.interrupt?.seq ?? 0));
     if (Number(message.seq) <= handled) continue;
     const meta = { ...(mail.meta ?? {}), interrupt: { message_id: message.id, seq: Number(message.seq), at: now() } };

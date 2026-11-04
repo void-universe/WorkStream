@@ -254,7 +254,9 @@ export const actions = {
     const scope = params.get("scope") ?? null;
     const streamId = params.get("stream_id") ?? null;
     const pairs = [["agent_id", agent.id]];
-    if (scope) pairs.push(["scope", scope === "common" ? "common" : "stream"]);
+    // 不认识的值当场拒，不塌成 "stream"：全局记忆那一层是另一个主人键（dreaming.get 读它），
+    // 悄悄当成 stream 查会回一堆不相干的行，问的人还以为那一层是空的。
+    if (scope) pairs.push(["scope", oneOf(scope, ["common", "stream"], "scope")]);
     if (streamId) pairs.push(["stream_id", uuid(streamId, "stream_id")]);
     const rows = await db.memories.list(pairs, {
       columns: "id,scope,stream_id,kind,content,covers_through_seq,created_at,updated_at,source",

@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { clockOf } from "../../lib/format";
+import { hitRateOf, newUsage, tallyUsage } from "../../lib/usageStats.mjs";
 import { describeError, get } from "../../api";
 import type { AgentPresenceDetail, AgentProfileMail, RunStep, TrajectoryResponse } from "../../types";
 import { StepInspector } from "./StepInspector";
@@ -17,6 +18,9 @@ const MIN_SPAN = 60_000;
 // 一屏最多铺多少颗：再密就只能靠框选而不是靠眼睛分辨了，多出来的直接不进窗口。
 const MAX_UNITS = 80;
 const DRAG_THRESHOLD = 3;
+
+/** 命中口径的字段形状跟着实现走，免得这里改一栏、那边漏一栏。 */
+type UsageStat = ReturnType<typeof newUsage>;
 
 type Unit = {
   id: string;
@@ -41,34 +45,6 @@ type Lane = {
   noTrace: number;
   usage: UsageStat;
 };
-
-/** 一组模型轮的 token 用量：rounds 是全部模型轮，reported 只算上游同时回报了输入与命中数的那些。 */
-type UsageStat = { rounds: number; reported: number; input: number; cached: number };
-
-const newUsage = (): UsageStat => ({ rounds: 0, reported: 0, input: 0, cached: 0 });
-
-/**
- * 累加一个群里若干封信的模型轮用量。
- * 只把「输入和命中缓存两个数都回报了」的轮放进分母：被插话掐断的轮在末尾用量块之前就断了，
- * QCA 和演示后端压根不回报用量——把它们当 0% 命中会把真实水平算低，宁可不进统计。
- */
-function tallyUsage(usage: UsageStat, steps: RunStep[]) {
-  for (const step of steps) {
-    if (step.kind !== "model") continue;
-    usage.rounds += 1;
-    if (step.input_tokens === null || step.cached_tokens === null) continue;
-    const input = Number(step.input_tokens);
-    const cached = Number(step.cached_tokens);
-    if (!Number.isFinite(input) || input <= 0 || !Number.isFinite(cached)) continue;
-    usage.reported += 1;
-    usage.input += input;
-    usage.cached += cached;
-  }
-}
-
-/** 按 token 加权，不是每轮百分比的平均：长轮次对成本的影响本来就更该占大头。 */
-const hitRateOf = (usage: UsageStat) =>
-  usage.reported && usage.input > 0 ? `${Math.round((usage.cached / usage.input) * 100)}%` : "—";
 
 const grouped = (value: number) => value.toLocaleString("en-US");
 

@@ -143,6 +143,10 @@ const MESSAGES: Record<string, string> = {
   invalid_at_time: "时刻格式不对，填 HH:MM，比如 09:30。",
   invalid_tz_offset_minutes: "时区偏移要在 UTC-12 到 UTC+14 之间。",
   invalid_weekdays: "周几只能是 1 到 7（周一到周日）。",
+  invalid_purpose: "排程的目的只有 dreaming（归并全局记忆）这一种特殊值，其余留空。",
+  dream_failed: "归并全局记忆时连不上上游，各群的水位线没动，下次照样会重看这一段。",
+  dream_empty: "归并这一轮模型一个字都没写，全局记忆和各群水位都保持原样。",
+  dream_write_failed: "全局记忆没写进去，请重试。",
   server_error: "服务端出了点问题，请稍后重试。",
 };
 

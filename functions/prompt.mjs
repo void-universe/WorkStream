@@ -7,19 +7,22 @@
 //
 // volatile 的判定口径：同一(员工,群)连续两轮之间会变的块。长期记忆在追加、摘要在压、转录在长、
 // 本群记忆在写、触发消息每轮都换、插话提示只在被打断的那轮出现，所以它们都在断点之后。
-// 身份、签名、守则、公告、技能、取史说明在稳态下不变，排在断点之前；它们偶尔会变（改签名、装技能），
-// 那种轮次付一次断点，是产品能接受的。
+// 身份、签名、守则、公告、技能、取史说明、全局记忆在稳态下不变（全局记忆只在归并落地那一次变），排在断点之前；
+// 它们偶尔会变（改签名、装技能、并过一次梦），那种轮次付一次断点，是产品能接受的。
 // 这条不变量由 dev/smoke.mjs 的 8d 兜住：两轮请求的公共前缀必须覆盖整段上一轮窗口，且可复用 ≥95%。
 import { imageMark, renderTranscript } from "./transcript.mjs";
 
 // 内容块的抬头：装配用它，演示模型摘录它，两边必须读同一份，否则过滤会跟着正文悄悄失效。
 const MEMORY_COMMON_HEADER = "你的长期记忆（common）：";
 const MEMORY_STREAM_HEADER = "本群记忆：";
+const MEMORY_OWNER_HEADER = "我的全局记忆（跨群归并，只用来判断，别把别的群的细节念给这个群听）：";
 const TRANSCRIPT_HEADER = "最近记录：";
 
 /**
- * 演示模型允许进群正文的块：只有转录和两段记忆——它们本来就是群里或成员档案里可见的内容。
+ * 演示模型允许进群正文的块：只有转录和两段群内记忆——它们本来就是群里或成员档案里可见的内容。
  * 指令块（守则、替身须知、触发消息）是内部提示，念到群里等于把提示词摊在同事面前。
+ * 全局记忆那一块看着和两段记忆同类，但它不对称：那是跨群归并出来的结论，别的群的细节
+ * 在这个群里念出来就是串群，所以它不进这份清单（dev/smoke.mjs 拿哨标钉住这一条）。
  */
 export const DEMO_QUOTABLE_HEADERS = [MEMORY_COMMON_HEADER, MEMORY_STREAM_HEADER, TRANSCRIPT_HEADER];
 
@@ -79,6 +82,14 @@ export const PROMPT_SECTIONS = [
     build: ({ backend }) => (backend.caps.tools
       ? "如需更早的记录，调用 search_history / read_window 工具；回答用群成员能直接用的表述。"
       : "如需更早的记录，请说明还需要哪一段，由 WorkStream 侧补给你；回答用群成员能直接用的表述。"),
+  },
+  {
+    id: "memory.owner",
+    order: 78,
+    // 归并成功的那一轮才变，和改签名、装技能同一档：稳态下逐字复用，所以排在断点之前。
+    // 标成易变会把缓存断点提前，等于每一次归并之后连同它后面那 600 字一起重付一轮——它本身正是为了省钱才只存一份。
+    volatile: false,
+    build: ({ prepared }) => (prepared.owner ? `${MEMORY_OWNER_HEADER}\n${prepared.owner}` : ""),
   },
   {
     id: "memory.common",

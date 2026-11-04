@@ -15,6 +15,11 @@ const FIELD_CAPS = {
   // 单独一档是因为它被 context 那一档的上限挤掉就等于缓存诊断数据没了。
   prompt_slots: 1200,
   note: 1000,
+  // 归并那一步的素材清单：一条是「哪个员工的哪个群并到了哪个序号」，一个主人几十份摘要就是几千字。
+  // 它和 prompt_slots 同一德性——被默认档挤掉就等于这次归并"吃了哪些素材"再也没人能复原，
+  // 而那正是界面问"为什么跨群的结论是这句"时唯一能查的东西。
+  merged_streams: 6000,
+  skipped_streams: 6000,
 };
 const DEFAULT_CAP = 1500;
 
@@ -113,6 +118,8 @@ export function createStepWriter(db, { mailId, agentId, streamId }) {
     openModel: ({ model }) => open({ kind: "model", name: model ?? null, detail: { model: model ?? "" } }),
     /** 后台压缩信没有工具回路，只记模型轮。 */
     openCompression: ({ model }) => open({ kind: "model", name: model ?? null, detail: { model: model ?? "", note: "压缩摘要" } }),
+    /** 归并全局记忆那一轮同样是后台活：没有工具回路，只记模型轮，note 用来在时间线上和摘要分开。 */
+    openDream: ({ model }) => open({ kind: "model", name: model ?? null, detail: { model: model ?? "", note: "归并全局记忆" } }),
     /** 下面两个是 mcp.mjs 工具钩子的实现：pre 记参数，post 记结果。 */
     recordToolPre: async (ctx) => {
       ctx.step = await open({

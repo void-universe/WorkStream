@@ -5,6 +5,7 @@ import { armInterrupt, disarmInterrupt, fireInterrupt } from "./bus.mjs";
 import { shapeMessage, streamWeight } from "./chat.mjs";
 import { fireDueSchedules } from "./cron.mjs";
 import { queueDelegateMail } from "./delegate.mjs";
+import { ownerDream, queueDreaming, runDream } from "./dream.mjs";
 import { executeTool, INTERNAL_TOOL_NAMES, toolDefinitions } from "./mcp.mjs";
 import { connectorToolDefs } from "./plugins.mjs";
 import { composeAsk, composeSystemPrompt } from "./prompt.mjs";
@@ -14,7 +15,7 @@ import { requireMembership } from "./perm.mjs";
 import { skillPrompt } from "./skills.mjs";
 import { closeOrphanSteps, createStepWriter } from "./steps.mjs";
 import { renderTranscript, rowChars } from "./transcript.mjs";
-import { CONTEXT_CHARS_DEFAULT, Halt, Interrupted, json, newId, now, text, truncate, uuid } from "./util.mjs";
+import { CONTEXT_CHARS_DEFAULT, Halt, Interrupted, interruptibleMail, json, newId, now, text, truncate, uuid } from "./util.mjs";
 
 const TOOL_DEFINITIONS = toolDefinitions();
 
@@ -64,7 +65,8 @@ export const actions = {
       if (taken.has(key)) continue;
       // 后台信让位给真人触发的那封：压缩排在前面时每次回复都要多等一轮；排程是"没人叫我也该干活"，
       // 但同事在线等回答时，先答人——排程不缺一轮，欠下的对点下一轮照样按时钟追上来。
-      if (item.meta?.kind === "compress" || item.meta?.kind === "cron") {
+      // 归并（dreaming）同样是后台活：它一个字都不进群，让它挤在真人前面只是拖慢回复。
+      if (item.meta?.kind === "compress" || item.meta?.kind === "cron" || item.meta?.kind === "dreaming") {
         background.push(item);
         continue;
       }
@@ -212,10 +214,12 @@ export const actions = {
     if (!stop && (!message || message.stream_id !== streamId || message.sender_id !== user.id)) {
       throw new Halt("interrupt_message_invalid", 400);
     }
-    const mail = await db.mail.first(
+    const running = await db.mail.list(
       [["agent_id", agentId], ["stream_id", streamId], ["status", "running"]],
-      { columns: "id,trigger_seq,meta", order: ["started_at", { ascending: true }] },
+      { columns: "id,trigger_seq,meta", order: ["started_at", { ascending: true }], limit: 20 },
     );
+    // 只挑看得见插话的那一封：后台折叠那一轮掐不动，把它报成"已经掐了"是一次假的成功。
+    const mail = running.find((row) => interruptibleMail(row.meta));
     if (!mail) throw new Halt("nothing_running", 409);
     const handled = Math.max(Number(mail.trigger_seq ?? 0), Number(mail.meta?.interrupt?.seq ?? 0));
     const meta = stop
@@ -371,10 +375,33 @@ export async function runTask({ db, env, mailId }) {
     await finish(db, mailId, "done", null);
     // 一次只折叠一批；水位线之后还压着记录就续投下一封，积压在后台自己排空，不用等真人再发一条。
     // 只有水位线真被推进了才续投，否则会在同一批记录上反复投递。
-    if (prepared.truncated && Number(folded.windowStart) > Number(prepared.windowStart)) {
-      await queueCompression(db, { agentId: agent.id, streamId: stream.id });
+    const foldedMore = prepared.truncated && Number(folded.windowStart) > Number(prepared.windowStart);
+    if (foldedMore) await queueCompression(db, { agentId: agent.id, streamId: stream.id });
+    // 摘要动了才考虑归并：水位线一步没推的轮次没有新素材，白付一次模型调用。
+    // 归并的信按主人去重，两个员工同时做完梦也只有一封在队里。
+    if (Number(folded.windowStart) > Number(prepared.windowStart)) {
+      await autoDream(db, { agent, streamId: stream.id });
     }
     return { status: "done", mode: "compress", ms: 0 };
+  }
+
+  if (mail.meta?.kind === "dreaming") {
+    // 归并那一轮和压缩同一德性：只写库、不往群里塞话，成功与否都从邮箱和轨迹里读。
+    let outcome;
+    try {
+      outcome = await runDream({
+        db, env, agent, stream, key, trace,
+        // 定时那一轮主人写下的额外要求在这封信里，装配不回查排程行。
+        directive: mail.meta?.dreaming?.instruction ?? null,
+      });
+    } catch (error) {
+      const code = String(upstreamCode(error, "dream_failed"));
+      await finish(db, mailId, "failed", code);
+      return { status: "failed", mode: "dreaming", error: code };
+    }
+    await finish(db, mailId, "done", null);
+    // 归并那一轮永远不进群，所以 silent 是常量；这一轮到底并没并出动静看 dream（ok / noop / superseded）。
+    return { status: "done", mode: "dreaming", dream: outcome.status, silent: true, ms: 0 };
   }
 
   let prepared = await assemble({ db, agent, stream });
@@ -416,6 +443,18 @@ export async function runTask({ db, env, mailId }) {
   const handledSeq = { current: Number(trigger?.seq ?? mail.trigger_seq ?? 0) };
   const watch = interruptWatcher({ db, mailId, handledSeq });
   const absorbed = [];
+  // 被这次运行消化掉的插话不会另起任务，但群里的投递状态只有邮箱行这一个来源：不给它们补回执，
+  // 那几条 @ 会一直显示"未读"。回执的状态跟着这封的结局走——掐断后取消的那几轮也不能装作没发生过。
+  const settleAbsorbed = async (status, error) => {
+    for (const item of absorbed) {
+      await db.mail.insert({
+        id: newId(), agent_id: agent.id, stream_id: stream.id, message_id: item.id,
+        trigger_seq: item.seq, priority: 1, status, error, slice_count: 0,
+        created_at: now(), started_at: now(), finished_at: now(), updated_at: now(),
+        meta: { receipt: "steer", from_mail: mailId },
+      }, { columns: "id" });
+    }
+  };
   let reply;
   for (let steer = 0; ; steer += 1) {
     try {
@@ -446,11 +485,15 @@ export async function runTask({ db, env, mailId }) {
       }
       if (error.payload.stopped) {
         await finish(db, mailId, "cancelled", "interrupted");
+        await settleAbsorbed("cancelled", "interrupted");
         return { status: "cancelled", error: "interrupted" };
       }
       const next = error.payload.message_id ? await db.messages.byId(error.payload.message_id) : null;
       if (!next || steer >= 2) {
+        // 掐断到第 3 次就不再重跑：再插下去的这条也不会有回应，所以它和前面几轮吞掉的消息一起结在 cancelled。
+        if (next) absorbed.push({ id: next.id, seq: Number(next.seq ?? 0) });
         await finish(db, mailId, "cancelled", "interrupted");
+        await settleAbsorbed("cancelled", "interrupted");
         return { status: "cancelled", error: "interrupted" };
       }
       // 插话生效后把新消息当成触发消息重跑一次：半截输出留作提示，不静默丢弃。
@@ -512,15 +555,7 @@ export async function runTask({ db, env, mailId }) {
     source: "agent", created_at: now(), updated_at: now(),
   }, { columns: "id" });
   await fanout({ db, env, stream, message, mentions, hops: Number(mail.meta?.hops ?? 0) + 1, agentId: agent.id });
-  // 被这次运行消化掉的插话不会另起任务，补一条回执，群里那条消息才不会一直显示“未读”。
-  for (const item of absorbed) {
-    await db.mail.insert({
-      id: newId(), agent_id: agent.id, stream_id: stream.id, message_id: item.id,
-      trigger_seq: item.seq, priority: 1, status: "done", slice_count: 0, error: null,
-      created_at: now(), started_at: now(), finished_at: now(), updated_at: now(),
-      meta: { receipt: "steer", from_mail: mailId },
-    }, { columns: "id" });
-  }
+  await settleAbsorbed("done", null);
   // 回完才发现期间有人插过话（流式循环没来得及掐断）：把它转成一条待办任务，插话不会被吞掉。
   const fresh = await db.mail.byId(mailId, { columns: "id,status,meta" });
   const leftover = fresh?.meta?.interrupt ?? null;
@@ -555,6 +590,17 @@ async function queueCompression(db, { agentId, streamId }) {
     created_at: now(), started_at: null, finished_at: null, updated_at: now(),
     meta: { kind: "compress" },
   }, { columns: "id" });
+}
+
+/**
+ * 压缩之后按主人的开关补一封归并信。
+ * 开关挂在 users.prefs.dreaming_auto（只有 auth.patch 那一个写入口），不在员工档案上：
+ * 归并的产物是主人级的记忆，挂在某个员工身上就会出现"同一个主人两份互相矛盾的开关"。
+ */
+async function autoDream(db, { agent, streamId }) {
+  const owner = await db.users.byId(agent.owner_id, { columns: "id,prefs" });
+  if (!owner?.prefs?.dreaming_auto) return;
+  await queueDreaming(db, { ownerId: agent.owner_id, agentId: agent.id, streamId, reason: "auto" });
 }
 
 function streamBudget(stream, agent) {
@@ -673,6 +719,9 @@ async function assemble({
     columns: "id,kind,content,covers_through_seq,created_at", order: ["created_at", { ascending: false }], limit: 30,
   });
   const summary = streamMemory.find((m) => m.kind === "summary");
+  // 全局记忆按"这个员工的主人"读，不按群的主人读：别人的员工进了你的群时，
+  // 让它读你的跨群结论等于把你的家底交给别人家的模型。
+  const ownerMemory = await ownerDream(db, agent.owner_id);
   const from = summary?.covers_through_seq ?? 0;
   const { rows, truncated } = await history(db, stream.id, {
     from,
@@ -691,7 +740,10 @@ async function assemble({
       || (Number(m.covers_through_seq) > from && Number(m.covers_through_seq) < windowHead))
     // 升序渲染，新 note 追加到块尾而不是改写块头；取的时候按降序限 30，拿到的仍是最近 30 条。
     .reverse();
-  return { common, notes, summary: summary?.content ?? "", windowStart: from, window: rows, truncated };
+  return {
+    common, notes, owner: ownerMemory?.content ?? "",
+    summary: summary?.content ?? "", windowStart: from, window: rows, truncated,
+  };
 }
 
 const HISTORY_PAGE = 200;

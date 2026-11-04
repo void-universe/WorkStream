@@ -4,6 +4,7 @@ import { actions as agents } from "./agents.mjs";
 import { actions as chat } from "./chat.mjs";
 import { actions as cron } from "./cron.mjs";
 import { actions as delegate } from "./delegate.mjs";
+import { actions as dreaming } from "./dream.mjs";
 import { actions as engine } from "./engine.mjs";
 import { handleMcp } from "./mcp.mjs";
 import { actions as plugins } from "./plugins.mjs";
@@ -21,7 +22,7 @@ const PUBLIC = new Set([
   "auth.register", "auth.verify", "auth.login", "mcp", "site.meta",
 ]);
 
-const ROUTES = { ...accounts, ...agents, ...rooms, ...chat, ...cron, ...delegate, ...engine, ...vms, ...skills, ...registries, ...plugins, ...trajectory };
+const ROUTES = { ...accounts, ...agents, ...rooms, ...chat, ...cron, ...delegate, ...dreaming, ...engine, ...vms, ...skills, ...registries, ...plugins, ...trajectory };
 
 async function siteMeta({ db, env }) {
   void db;

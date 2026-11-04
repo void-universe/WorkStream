@@ -5,7 +5,7 @@ export type User = {
   display_name: string;
   avatar?: string | null;
   at_channel: "virtual" | "real_email";
-  prefs: { theme?: "light" | "dark" | "system"; notify_real_email?: boolean };
+  prefs: { theme?: "light" | "dark" | "system"; notify_real_email?: boolean; dreaming_auto?: boolean };
   delegate: {
     agent_id: string | null;
     start_at: string | null;
@@ -198,6 +198,8 @@ export type Schedule = {
   name: string;
   instruction: string;
   kind: "every" | "daily";
+  /** 这条排程到点干什么：留空是普通干活，"dreaming" 是归并全局记忆。建好后不能改。 */
+  purpose?: "dreaming" | null;
   interval_minutes: number | null;
   at_time: string | null;
   weekdays: number[] | null;
@@ -208,6 +210,29 @@ export type Schedule = {
   created_at: string;
   updated_at: string;
   upcoming: string[];
+};
+
+/** dreaming.get 的返回：全局记忆那一行 + 开关 + 定时 + 上一次归并那封信。 */
+export type DreamState = {
+  auto: boolean;
+  memory: {
+    id: string;
+    content: string;
+    agent_id: string;
+    /** 已归并到的水位线：{"员工 id:群 id": 覆盖到的序号}。同一个群里两个员工各有一份摘要，键要两个 id 才认得出是哪一份。 */
+    covers_streams: Record<string, number>;
+    updated_at: string;
+  } | null;
+  /** 归并排程不在这里：那是 cron.list 的账，界面从已经拿到的排程列表里数。 */
+  last_run: {
+    mail_id: string;
+    agent_id: string;
+    stream_id: string;
+    status: "queued" | "running" | "done" | "failed" | "cancelled";
+    error: string | null;
+    reason: string | null;
+    finished_at: string | null;
+  } | null;
 };
 
 export type Member = {

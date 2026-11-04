@@ -108,6 +108,8 @@ export const actions = {
       const prefs = { ...(user.prefs ?? {}) };
       if (body.prefs.theme !== undefined) prefs.theme = oneOf(body.prefs.theme, ["light", "dark", "system"], "theme");
       prefs.notify_real_email = Boolean(body.prefs.notify_real_email ?? prefs.notify_real_email);
+      // 压缩之后自动归并全局记忆：开关只有这一个写入口，dream.mjs 只读不写。
+      prefs.dreaming_auto = Boolean(body.prefs.dreaming_auto ?? prefs.dreaming_auto);
       values.prefs = prefs;
     }
     const updated = await db.users.patch([["id", user.id]], values, { returning: true });

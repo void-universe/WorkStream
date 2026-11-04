@@ -208,6 +208,13 @@ export class Interrupted extends Error {
   }
 }
 
+/**
+ * 这一类信跑的是一次性提问（后台摘要、跨群归并）：一个字不进群，没有可掐断的半截正文，
+ * 也就从来不去读 `meta.interrupt`。@ 落到它们头上不算插话——登记成插话会让那条消息既没有任务行、
+ * 也等不到回执，在群里永远显示未读；叫停同理，掐不动的东西不该回"已经掐了"。
+ */
+export const interruptibleMail = (meta) => meta?.kind !== "compress" && meta?.kind !== "dreaming";
+
 export function truncate(value, max) {
   const chars = Array.from(String(value));
   return chars.length > max ? `${chars.slice(0, max).join("")}…` : chars.join("");

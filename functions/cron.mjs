@@ -9,6 +9,7 @@
 // 输的那个直接跳过，不"退而求其次"去投第二封——否则群里同一件事会被念好几遍。
 import { requireMembership } from "./perm.mjs";
 import { streamWeight } from "./chat.mjs";
+import { DREAM_PURPOSE, dreamingPending, normalizePurpose } from "./dream.mjs";
 import { Halt, int, json, newId, now, oneOf, text, uuid } from "./util.mjs";
 
 const KINDS = ["every", "daily"];
@@ -29,7 +30,7 @@ const MAX_PER_OWNER = 20;
  */
 const MAX_CATCHUP = 500;
 
-export const SCHEDULE_COLUMNS = "id,owner_id,agent_id,stream_id,name,instruction,kind,"
+export const SCHEDULE_COLUMNS = "id,owner_id,agent_id,stream_id,name,instruction,kind,purpose,"
   + "interval_minutes,at_time,weekdays,tz_offset_minutes,next_run_at,last_run_at,merged_runs,created_at,updated_at";
 
 /* ---------- 到时计算：全部是纯函数，入口校验过，这里只信已入库的形状 ---------- */
@@ -140,12 +141,16 @@ export async function dueOwnerIds(db, { nowMs = Date.now(), limit = 50 } = {}) {
 
 const iso = (ms) => new Date(ms).toISOString();
 
-/** 这个排程是否已经有一封还没跑完的 cron 信：有就把新欠的对点并进它，不另起一封。 */
-async function cronMailPending(db, { agentId, streamId, scheduleId }) {
+/**
+ * 这个排程是否已经有一封还没跑完的信：有就把新欠的对点并进它，不另起一封。
+ * 信的种类跟着排程的 purpose 走（普通排程投 cron 信，做梦排程投归并信），
+ * 两边读同一个判定，否则一条做梦排程能在队里堆出好几封归并信。
+ */
+async function cronMailPending(db, { agentId, streamId, scheduleId, kind = "cron" }) {
   const rows = await db.mail.list([
     ["agent_id", agentId], ["stream_id", streamId], ["status", ["queued", "running"]],
   ], { columns: "id,meta", limit: 60 });
-  return rows.some((row) => row.meta?.kind === "cron" && String(row.meta?.schedule_id ?? "") === String(scheduleId));
+  return rows.some((row) => row.meta?.kind === kind && String(row.meta?.schedule_id ?? "") === String(scheduleId));
 }
 
 /**
@@ -170,9 +175,16 @@ export async function fireDueSchedules(db, { ownerId, nowMs = Date.now(), limit 
       outcomes.push({ schedule_id: row.id, agent_id: row.agent_id, stream_id: row.stream_id, paused: Boolean(paused), reason: "agent_not_in_stream" });
       continue;
     }
-    const folded = await cronMailPending(db, {
-      agentId: row.agent_id, streamId: row.stream_id, scheduleId: row.id,
-    });
+    // 做梦排程和普通排程共用这一个时钟，只差投出去的那封信是哪一种：
+    // 归并那一轮不看群里的转录、也不往群里说话，所以它必须是独立的一种信。
+    const letterKind = row.purpose === DREAM_PURPOSE ? "dreaming" : "cron";
+    // 归并那一种按「主人」去重而不是按 (员工, 群, 排程)：全局记忆一个主人只有一行，
+    // 同一个主人手上已经有一封没跑完的归并信时，这条排程到点也只是又欠了一个对点。
+    const folded = letterKind === "dreaming"
+      ? await dreamingPending(db, row.owner_id)
+      : await cronMailPending(db, {
+        agentId: row.agent_id, streamId: row.stream_id, scheduleId: row.id, kind: letterKind,
+      });
     // 已经投出的那封算一次，被并进旧信的对点全记进合并计数：界面上要能看出"这一轮替我少发了几条"。
     // 推进的实参逐字写出：dev/check-schema.mjs 认得出对象字面量的键，传一个变量进去这张表的
     // "NOT NULL 列有没有人写"就对不上账了。
@@ -195,9 +207,12 @@ export async function fireDueSchedules(db, { ownerId, nowMs = Date.now(), limit 
         status: "queued", slice_count: 0, error: null,
         created_at: now(), started_at: null, finished_at: null, updated_at: now(),
         meta: {
-          kind: "cron",
+          kind: letterKind,
           schedule_id: row.id,
-          cron: {
+          // 归并的信要记下是谁叫醒的：界面上「上一次归并」读这个字段，手动和定时得能分开。
+          ...(letterKind === "dreaming" ? { reason: "cron" } : {}),
+          // 归并那一轮的额外要求要在这封信里就能复原：轨迹读的是 meta，不回查排程行。
+          [letterKind === "dreaming" ? "dreaming" : "cron"]: {
             name: row.name,
             instruction: row.instruction,
             // 到点时刻与欠的对点数进了信里，这一轮模型看到什么就能从这封信复原，不用回查排程行。
@@ -291,14 +306,20 @@ export const actions = {
    */
   async "cron.set"({ db, user, body }) {
     const name = text(body.name, { max: 60, name: "name" });
-    const instruction = text(body.instruction, { max: 2000, name: "instruction" });
+    // purpose 决定这封信是"干活"还是"归并全局记忆"，和员工/群一样属于排程的目标：
+    // 建好之后改它会让同一条排程忽然换一种活法，界面上看不出来——要换就删了重建。
+    const purpose = normalizePurpose(body.purpose);
+    // 归并那一轮的素材是各群的摘要，不是这句话，所以它只是额外交代，允许留空；
+    // 干活的那条仍然必填——空正文等于让模型在群里说没话说。
+    const instruction = text(body.instruction, { max: 2000, required: purpose !== DREAM_PURPOSE, name: "instruction" });
     const agentId = uuid(body.agent_id, "agent_id");
     const streamId = uuid(body.stream_id, "stream_id");
     const spec = specFromBody(body);
     await assertRunnable(db, user, agentId, streamId);
     const id = body.id ? uuid(body.id, "id") : null;
     const existing = id ? await ownedSchedule(db, user, id) : null;
-    if (id && (existing.agent_id !== agentId || existing.stream_id !== streamId)) {
+    if (id && (existing.agent_id !== agentId || existing.stream_id !== streamId
+      || (existing.purpose ?? null) !== purpose)) {
       throw new Halt("schedule_target_locked", 400);
     }
     if (!existing) {
@@ -313,6 +334,7 @@ export const actions = {
     const row = existing
       ? await db.schedules.patch([["id", existing.id]], {
         kind: spec.kind,
+        purpose,
         interval_minutes: spec.interval_minutes,
         at_time: spec.at_time,
         weekdays: spec.weekdays,
@@ -333,6 +355,7 @@ export const actions = {
         name,
         instruction,
         kind: spec.kind,
+        purpose,
         interval_minutes: spec.interval_minutes,
         at_time: spec.at_time,
         weekdays: spec.weekdays,
@@ -379,7 +402,9 @@ export const actions = {
     ], { columns: "id,meta", limit: 100 });
     let cancelled = 0;
     for (const mail of pending) {
-      if (mail.meta?.kind !== "cron" || String(mail.meta?.schedule_id ?? "") !== String(row.id)) continue;
+      // 做梦排程投的是 dreaming 信：删排程同样要撤回它那封还没跑的信，种类不同不代表可以留下。
+      const kindOfLetter = mail.meta?.kind === "cron" || mail.meta?.kind === "dreaming";
+      if (!kindOfLetter || String(mail.meta?.schedule_id ?? "") !== String(row.id)) continue;
       // 只撤 queued：正在生成的那一封让它跑完，掐断是 scheduler.interrupt 的活，删排程不该越权掐人。
       const claimed = await db.mail.claim([["id", mail.id], ["status", "queued"]], {
         status: "cancelled", error: "schedule_deleted",

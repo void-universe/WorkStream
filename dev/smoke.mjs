@@ -18,9 +18,10 @@ import { store } from "../functions/store.mjs";
 import { closeOrphanSteps, createStepWriter } from "../functions/steps.mjs";
 import { askCloudAgent, flattenPrompt, parseAgentId, QcaError } from "../functions/qca.mjs";
 import { completeForAgent } from "../functions/agents.mjs";
-import { Interrupted } from "../functions/util.mjs";
+import { Interrupted, newId } from "../functions/util.mjs";
 import { createFixtureClient } from "./fixture-supabase.mjs";
 import { fileRenderers, registerFileRenderer, renderGroupFile } from "../src/lib/renderers/index.mjs";
+import { hitRateOf, newUsage, tallyUsage } from "../src/lib/usageStats.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "ws-smoke-"));
 const file = join(dir, "db.json");
@@ -75,12 +76,14 @@ const step = (title) => console.log(`\n${title}`);
  */
 function startMockUpstream() {
   const seen = [];
-  // 压缩信的那次调用按剧本换德性：ok 正常出摘要，empty 只回空正文，boom 直接 500。
+  // 压缩信的那次调用按剧本换德性：ok 正常出摘要，empty 只回空正文，boom 直接 500，long 一次吐满摘要上限，
+  // slow 慢慢吐（用来在折叠正跑着的时候插一次 @）。
   // 折不动时水位线该不该动是摘要覆盖对不对得上的关键，所以两种坏德性都要能重跑。
+  // 归并（dreaming）同样三种德性：它的空正文和 5xx 都不许抬覆盖水位，所以也做成开关而不是关键词。
   // chat 是自建通道整条链路的故障开关（ok / 500 / eof / half）：坏上游的用例要能随跑随切，
   // 不能用触发关键词认剧本——上一轮的转录里也带着那个词，会把本来正常的轮次一起带坏，
   // 于是"这轮为什么失败"永远说不清。形状照云端那条的 state.mode（见 startMockQca）。
-  const scripts = { compress: "ok", chat: "ok" };
+  const scripts = { compress: "ok", chat: "ok", dream: "ok" };
   const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
   const server = createServer((req, res) => {
     let raw = "";
@@ -101,10 +104,18 @@ function startMockUpstream() {
       const trig = String(system.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "");
       // 排程那一轮没有触发消息，按排程块认剧本：静默巡检只回空正文（正文空着才是这一轮的正当结局），其余一次说清。
       const cronBlock = String(system.split("\n\n").find((b) => b.startsWith("这一轮是你自己的排程到点了")) ?? "");
+      // 接龙剧本（§30）认的是「谁在说话」：设定块第一句带着员工名，两个员工才能各自回敬对方。
+      const speakerOf = (text) => /你是虚拟员工「(.+?)」/.exec(text)?.[1] ?? "";
       // 压缩剧本 boom 要在 SSE 头发出之前决定状态码，所以这一条单独前置。
       if (system.includes("压成不超过 600 字") && scripts.compress === "boom") {
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "mock_compress_boom" } }));
+        return;
+      }
+      // 归并剧本 boom 同样要在 SSE 头之前定状态码：失败时覆盖水位不许动，这条得能重跑。
+      if (system.includes("主人全局记忆") && scripts.dream === "boom") {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "mock_dream_boom" } }));
         return;
       }
       // 交付登记之后上游第二轮崩：这一轮没有回复落群，卡片也就不该发出去。
@@ -113,8 +124,9 @@ function startMockUpstream() {
         res.end(JSON.stringify({ error: { message: "mock_present_then_boom" } }));
         return;
       }
-      // 故障开关只管真人 @ 那一链路：压缩信与排程轮次各按自己的剧本走，别被一起带坏。
-      if (scripts.chat !== "ok" && !system.includes("压成不超过 600 字") && !cronBlock) {
+      // 故障开关只管真人 @ 那一链路：压缩信、排程轮次、归并信各按自己的剧本走，别被一起带坏。
+      if (scripts.chat !== "ok" && !system.includes("压成不超过 600 字")
+        && !system.includes("主人全局记忆") && !cronBlock) {
         const sseHead = { "content-type": "text/event-stream", "cache-control": "no-store" };
         const frame = (delta, finishReason = null) => `data: ${JSON.stringify({ id: "mock", choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
         if (scripts.chat === "500") {
@@ -200,8 +212,22 @@ function startMockUpstream() {
         finish();
       };
       const last = body.messages?.[body.messages.length - 1];
+      // 归并信按剧本回正文：空正文等于一个群都没并进去，覆盖水位不该抬（boom 那条在前置分支里给状态码）。
+      if (system.includes("主人全局记忆")) {
+        if (scripts.dream === "empty") { send({}, "stop"); finish(); return; }
+        sayFast("全局记忆归并结果（哨标DREAMOUT）：跨群都成立的稳定事实与未办完的待办。");
+        return;
+      }
       // 压缩信按剧本回空正文：一条都没折进摘要，就不该把水位线抬上去（5xx 那条在前置分支里直接给状态码）。
       if (system.includes("压成不超过 600 字") && scripts.compress === "empty") { send({}, "stop"); finish(); return; }
+      // slow：摘要一字一字慢慢吐，好让自检有机会在这封信正跑着的时候 @ 一次员工。
+      if (system.includes("压成不超过 600 字") && scripts.compress === "slow") { await say("正在慢慢折这一段", 140); return; }
+      // long：一次就吐满引擎那一侧的摘要上限（600 字），用来把某个群的摘要堆到够长。
+      // 归并的输入预算压不到 2000 字以下，所以要撞预算只能让摘要本身长，不是把群开得更多。
+      if (system.includes("压成不超过 600 字") && scripts.compress === "long") {
+        sayFast("要点：跨群的稳定事实与还没办完的待办。".repeat(60));
+        return;
+      }
       // 排程那一轮的剧本（cronBlock 已在前面按槽位认出）：静默巡检只回空正文，其余一次说清。
       if (cronBlock) {
         if (cronBlock.includes("静默巡检")) { send({}, "stop"); finish(); return; }
@@ -218,12 +244,26 @@ function startMockUpstream() {
         sayFast("排程巡检：一切正常，无需同事动手。");
         return;
       }
+      // 连续插话剧本：插话之后的重跑也保持慢，否则一轮就回完了，撞不到重跑上限。
+      // 这条排在下面"插话重排"之前：重跑那一轮的上下文里同时带着半截提示和这条新的触发消息，
+      // 先认提示会让它秒回，就再也掐不出第二次插话。
+      if (trig.includes("慢慢改")) { await say("正在慢慢改这一版，一行一行来", 140); return; }
       if (system.includes("被 @ 你的新消息打断")) { sayFast("已按插话重排：一、准备；二、执行；三、复盘。"); return; }
       // 真人 @ 的那轮回空正文是失败（同事在等回答），和排程那一轮的"没事就不说话"是两种德性。
       if (trig.includes("空手回话")) { send({}, "stop"); finish(); return; }
       if (trig.includes("突发甲")) { sayFast("回甲已落群"); return; }
       if (trig.includes("突发乙")) { sayFast("回乙已落群"); return; }
       if (trig.includes("慢慢写")) { await say("正在慢慢写这段长正文", 140); return; }
+      // 接龙剧本（§30）：回复正文里 @ 谁由测试现场给名字，改档案名不用动剧本。
+      // 互点那一支挑「说话者之外那一个」，两个员工才接得起来，也才撞得到跳数上限。
+      if (trig.includes("接下去")) {
+        const names = scripts.chain ?? [];
+        sayFast(`@${names.find((n) => n && n !== speakerOf(system)) ?? ""} 这段请接下去（哨标CHAIN）`);
+        return;
+      }
+      // 自己接自己、@ 一个指定名字（真人 / 不在本群 / 已停用）：fanout 的三条分支各占一种。
+      if (trig.includes("接给自己")) { sayFast(`@${speakerOf(system)} 我自己接（哨标CHAIN）`); return; }
+      if (trig.includes("接给指定")) { sayFast(`@${scripts.chainPick ?? ""} 请看这段（哨标CHAIN）`); return; }
       // 按剧本换用量形状：同一个上游的三种回报德性，落库的空/有数要当场分出来。
       if (trig.includes("用量只报总数")) { usageMode = "bare"; sayFast("这轮的用量只有两个总数。"); return; }
       if (trig.includes("用量子桶越界")) { usageMode = "sketchy"; sayFast("这轮把缓存数报得比输入数还大。"); return; }
@@ -1123,6 +1163,76 @@ async function main() {
     strangerStop.status === 403 && strangerStop.payload.error === "agent_not_owned", strangerStop.payload);
   const noRun = await call("scheduler.interrupt", { token: ana, body: { stream_id: streamId, agent_id: mockAgentId } });
   check("没在跑时叫停给出明确错误", noRun.status === 409 && noRun.payload.error === "nothing_running", noRun.payload);
+
+  // 连续插话：插话重跑有上限，撞上限时这一封和它吞掉的每一条 @ 都要有明确下文，群里没有悬空的未读。
+  const sideStreamId = (await call("streams.create", {
+    token: ana, body: { name: "隔壁组", agent_ids: [mockAgentId] },
+  })).payload.stream?.id;
+  const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  // 数落库的回复条数，不数 messages.list 返回的那一页：这一页有上限，多一条新回复可能正好挤掉一条旧的。
+  const agentReplyCount = async () => (await db.messages.list(
+    [["stream_id", streamId], ["sender_type", "agent"], ["sender_id", mockAgentId]], { columns: "id", limit: 900 },
+  )).length;
+  const chainSend = (content, to = streamId) => call("messages.send", {
+    token: ana, body: { stream_id: to, content, mentions: [{ type: "agent", id: mockAgentId }] },
+  });
+  const x8bSeenFrom = mock.seen.length;
+  const x8bFirst = await chainSend("@小M 慢慢改第一版");
+  const x8bTick = call("scheduler.tick", { token: ana, method: "GET" });
+  await pause(600);
+  const x8bSide = await chainSend("@小M 隔壁群的事", sideStreamId);
+  const x8bSecond = await chainSend("@小M 慢慢改第二版");
+  await pause(700);
+  const x8bThird = await chainSend("@小M 慢慢改第三版");
+  await pause(700);
+  const x8bFourth = await chainSend("@小M 慢慢改第四版");
+  const x8bRan = await x8bTick;
+
+  check("插话只掐本群：别的群里 @ 同一个员工是新任务，不打扰这边正在跑的",
+    (x8bSide.payload.interrupted ?? []).length === 0 && (x8bSide.payload.queued ?? []).length === 1, x8bSide.payload);
+  check("连着插到第三次不再重排：这一封按 cancelled/interrupted 收尾",
+    (x8bRan.payload.ran ?? []).some((r) => r.status === "cancelled" && r.error === "interrupted"), x8bRan.payload);
+  const x8bMails = async (messageId) => db.mail.list([["agent_id", mockAgentId], ["message_id", messageId]], {
+    columns: "id,status,error,meta", limit: 10,
+  });
+  const x8bOrigin = await x8bMails(x8bFirst.payload.message?.id);
+  check("被插话掐断的那封只有一条任务行，收尾是 cancelled",
+    x8bOrigin.length === 1 && x8bOrigin[0].status === "cancelled" && x8bOrigin[0].error === "interrupted", x8bOrigin);
+  const x8bAbsorbed = await Promise.all([x8bSecond, x8bThird, x8bFourth]
+    .map(async (res) => ({ id: res.payload.message?.id, rows: await x8bMails(res.payload.message?.id) })));
+  check("吞掉的每一条插话都补一条 cancelled 回执：群里不会一直显示未读",
+    x8bAbsorbed.every(({ rows }) => rows.length === 1 && rows[0].status === "cancelled"
+      && rows[0].error === "interrupted" && rows[0].meta?.receipt === "steer" && rows[0].meta?.from_mail === x8bOrigin[0]?.id),
+    x8bAbsorbed);
+  // 半截正文要能复原：重跑那一轮的系统提示里带着它，这是"模型可见的必须可复原"在插话路径上的落点。
+  // 只数这一段窗口里的请求：前面那次单插话测试也留过重跑提示，全量数会把两件事算成一件事。
+  const x8bSteerNotes = mock.seen.slice(x8bSeenFrom)
+    .map((body) => String(body.messages?.[0]?.content ?? ""))
+    .filter((system) => system.includes("上一条回复说到一半被 @ 你的新消息打断了"));
+  check("第 3 次插话后不再重排：上游只接到两次带半截正文的重跑请求",
+    x8bSteerNotes.length === 2
+    && x8bSteerNotes.every((system) => system.includes("已输出的半截是："))
+    && x8bSteerNotes.some((system) => system.includes("正在慢慢")),
+    x8bSteerNotes.map((system) => system.slice(system.indexOf("上一条回复说到一半"), system.indexOf("请以这条插话为准") + 8)));
+  check("掐断的半截正文不落群：这一节里没有一句以它开头的话",
+    ((await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items ?? [])
+      .filter((m) => m.sender_id === mockAgentId)
+      .every((m) => !String(m.content).includes("慢慢改")),
+    ((await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items ?? [])
+      .filter((m) => m.sender_id === mockAgentId).map((m) => m.content));
+  // 排空隔壁组那条新任务：留在队列里会被后面每一节的"最新一封信"看见，把调度顺序的问题伪装成产品缺陷。
+  for (let round = 0; round < 6; round += 1) {
+    const drained = await db.mail.list([["agent_id", mockAgentId], ["stream_id", sideStreamId]], {
+      columns: "id,status", limit: 10,
+    });
+    if (drained.every((row) => row.status === "done" || row.status === "failed" || row.status === "cancelled")) break;
+    await call("scheduler.tick", { token: ana, method: "GET" });
+  }
+  const x8bSideDone = await db.mail.list([["agent_id", mockAgentId], ["stream_id", sideStreamId]], {
+    columns: "id,status,error", limit: 10,
+  });
+  check("对照：隔壁组那条不受这边掐断的影响，自己跑完了",
+    x8bSideDone.length === 1 && x8bSideDone[0].status === "done", x8bSideDone);
   step("8c. 上下文窗口：预算够就装全量，装不下就取最新并自动补齐摘要");
   await call("agents.update", { token: ana, body: { id: mockAgentId, context_chars: 200000 } });
   for (let i = 0; i < 405; i += 1) {
@@ -1281,6 +1391,64 @@ async function main() {
     { ctrlRun, sample: ctrlTexts[0]?.slice(0, 160) });
   await call("agents.update", { token: ana, body: { id: mockAgentId, context_chars: 8000 } });
 
+  step("8c4. 后台折叠那一轮不吃插话：@ 照常排队，叫停如实说掐不动");
+  // 折叠与归并是一次性提问、一个字不进群，也就从来不看 meta.interrupt。
+  // 把落在这类信上的 @ 登记成"已被这轮消化"，这条消息既没有任务行也等不到回执，等于被静静吞掉。
+  const foldRunning = async () => (await db.mail.list(
+    [["agent_id", mockAgentId], ["stream_id", streamId], ["status", "running"]],
+    { columns: "id,meta", limit: 10 },
+  )).find((row) => row.meta?.kind === "compress") ?? null;
+  await call("agents.update", { token: ana, body: { id: mockAgentId, context_chars: 2000 } });
+  const coversBeforeFold = await readCovers();
+  const repliesBeforeFold = await agentReplyCount();
+  await call("messages.send", {
+    token: ana, body: { stream_id: streamId, content: "@小M 先把积压折一下", mentions: [{ type: "agent", id: mockAgentId }] },
+  });
+  mock.scripts.compress = "slow";
+  let foldMail = null;
+  for (let round = 0; round < 8 && !foldMail; round += 1) {
+    const tick = call("scheduler.tick", { token: ana, method: "GET" });
+    await pause(200);
+    foldMail = await foldRunning();
+    if (foldMail) break;
+    await tick;
+  }
+  check("夹具：这一封后台压缩信确实在跑（摘要正一字一字吐出来）", Boolean(foldMail), foldMail);
+  const foldSteer = await call("messages.send", {
+    token: ana, body: { stream_id: streamId, content: "@小M 折的时候插一句", mentions: [{ type: "agent", id: mockAgentId }] },
+  });
+  check("折叠期间一条 @ 不算插话：它照常排成一条新任务，等折叠让出这一群",
+    (foldSteer.payload.interrupted ?? []).length === 0 && (foldSteer.payload.queued ?? []).length === 1, foldSteer.payload);
+  const foldStop = await call("scheduler.interrupt", { token: ana, body: { stream_id: streamId, agent_id: mockAgentId } });
+  check("叫停落在掐不动的那一轮：如实报没在跑，不假装掐断了",
+    foldStop.status === 409 && foldStop.payload.error === "nothing_running", foldStop.payload);
+  mock.scripts.compress = "ok";
+  const foldInsertMailId = foldSteer.payload.queued?.[0]?.mail_id;
+  for (let round = 0; round < 10; round += 1) {
+    const status = (await db.mail.byId(foldInsertMailId, { columns: "id,status" }))?.status;
+    if (status === "done" || status === "failed" || status === "cancelled") break;
+    await call("scheduler.tick", { token: ana, method: "GET" });
+  }
+  const foldInsertMail = await db.mail.byId(foldInsertMailId, { columns: "id,status,error" });
+  const foldMailRow = await db.mail.byId(foldMail?.id, { columns: "id,status,error" });
+  check("对照：那条 @ 没被折叠轮吞掉，自己排队跑完并回了正文",
+    foldInsertMail?.status === "done" && (await agentReplyCount()) > repliesBeforeFold,
+    { foldInsertMail, 回复数: [repliesBeforeFold, await agentReplyCount()] });
+  check("折叠那一轮不受打扰：压缩信照样跑完，水位线照样往前推",
+    foldMailRow?.status === "done" && (await readCovers()) > coversBeforeFold,
+    { foldMailRow, coversBeforeFold, now: await readCovers() });
+  // 预算压到 2000 才逼得出正在跑的折叠轮，代价是每一轮回复都补投一封压缩信。
+  // 不把这份 backlog 排空就交给 8d/§20，那边的"最新一封信"会取到后台压缩信，把调度顺序的问题伪装成产品缺陷。
+  await call("agents.update", { token: ana, body: { id: mockAgentId, context_chars: 8000 } });
+  for (let round = 0; round < 12; round += 1) {
+    const pending = await db.mail.list(
+      [["agent_id", mockAgentId], ["status", ["queued", "running"]]],
+      { columns: "id", limit: 20 },
+    );
+    if (pending.length === 0) break;
+    await call("scheduler.tick", { token: ana, method: "GET" });
+  }
+
   step("8d. 前缀缓存：稳定态下上一轮窗口整段可复用");
   for (const word of ["前缀甲", "前缀乙"]) {
     await call("messages.send", {
@@ -1417,6 +1585,24 @@ async function main() {
     demoComposed.promptSlots.map(([id]) => id).join(",") === composed.promptSlots.map(([id]) => id).join(",")
     && demoComposed.system.includes("按需调用对应工具") && !demoComposed.system.includes("本次由云端 Agent 作答"),
     demoComposed.promptSlots.map(([id]) => id));
+  const ownedSlots = composeSystemPrompt({
+    ...slotCtx,
+    prepared: { ...slotCtx.prepared, owner: "跨群结论：甲那边数字是 3（哨标DREAMBLOCK）" },
+  });
+  check("全局记忆落在稳定档：它进的是可复用的前缀，缓存断点不许被它提前",
+    ownedSlots.promptSlots.map(([id]) => id).join(",")
+      === "identity,signature,guide,announcement,skills,history.access,memory.owner,memory.common,summary,transcript,memory.stream,trigger"
+    && PROMPT_SECTIONS.find((section) => section.id === "memory.owner")?.volatile === false
+    && CACHE_BREAKPOINT_ID === "memory.common",
+    { 槽位: ownedSlots.promptSlots.map(([id]) => id) });
+  // 演示模型按抬头挑可摘录的块：全局记忆看着和两段记忆同类，但它是跨群归并出来的结论，
+  // 在这个群里念出来就是串群——所以它必须在清单外，而本群那两段必须在清单内。
+  const demoPick = (systemText) => systemText.split("\n\n")
+    .filter((block) => DEMO_QUOTABLE_HEADERS.some((header) => block.startsWith(header)))
+    .join("\n");
+  check("全局记忆不进演示模型可摘录的那几块：对照本群长期记忆照样被摘（同一把尺子的两侧）",
+    !demoPick(ownedSlots.system).includes("哨标DREAMBLOCK") && demoPick(ownedSlots.system).includes("长期记忆甲"),
+    { 摘录: demoPick(ownedSlots.system) });
   step("8e. 突发排队：同群第二封的上下文里必须带着第一封刚落的回复");
   const burst = async (content) => call("messages.send", {
     token: ana,
@@ -1881,11 +2067,25 @@ async function main() {
   const x18DefaultId = x18DefaultFlag.payload.skill?.id;
   check("skills.upload：私有技能也能标成默认，供主人以后的员工自动装",
     x18DefaultFlag.payload.skill?.is_default === true && x18DefaultFlag.payload.skill?.is_public === false, x18DefaultFlag.payload);
+  // 默认位是"建档时自动装"那一侧的开关，所以两个方向都要新建一个员工来看：只验会装、不验会不装，
+  // 撤标记写错成 no-op 也照样全绿。
+  const x18OnAgent = await call("agents.create", {
+    token: ana, body: { name: "默认在岗", role: "对照", api_base_url: "demo://local", api_key: "demo-key-18", model: "demo" },
+  });
+  check("默认位开着：主人新建的员工自动装上它",
+    (await call("skills.installed", { token: ana, method: "GET", body: { agent_id: x18OnAgent.payload.agent?.id } })).payload.items
+      ?.some((row) => row.id === x18DefaultId), x18OnAgent.payload);
   const x18DefaultOff = await call("skills.setDefault", { token: bToken, body: { skill_id: x18DefaultId, is_default: true } });
   check("skills.setDefault：别人改不了你的默认标记", x18DefaultOff.status === 403
     && x18DefaultOff.payload.error === "skill_forbidden", x18DefaultOff.payload);
   const x18DefaultUnset = await call("skills.setDefault", { token: ana, body: { skill_id: x18DefaultId, is_default: false } });
   check("skills.setDefault：主人能把默认取消掉", x18DefaultUnset.payload.skill?.is_default === false, x18DefaultUnset.payload);
+  const x18OffAgent = await call("agents.create", {
+    token: ana, body: { name: "默认撤位", role: "对照", api_base_url: "demo://local", api_key: "demo-key-19", model: "demo" },
+  });
+  check("对照：默认位撤掉后新建的员工不再自动装它（撤标记真的写进了那一行）",
+    (await call("skills.installed", { token: ana, method: "GET", body: { agent_id: x18OffAgent.payload.agent?.id } })).payload.items
+      ?.every((row) => row.id !== x18DefaultId), x18OffAgent.payload);
   const x18BuiltinDownload = await call("skills.download", { token: ana, body: { id: builtinId } });
   check("skills.download：内置技能不占计数", x18BuiltinDownload.payload.skill?.downloads === 0, x18BuiltinDownload.payload);
   const x18DownloadForbidden = await call("skills.download", { token: bToken, body: { id: privSkillId } });
@@ -1896,6 +2096,9 @@ async function main() {
     && Number(x18D2.payload.skill?.downloads) === 2, { 第一次: x18D1.payload.skill?.downloads, 第二次: x18D2.payload.skill?.downloads });
   const x18Install = await call("skills.install", { token: ana, body: { skill_id: privSkillId, agent_id: mockAgentId } });
   check("skills.install：私有技能能装到自家员工", x18Install.payload.installed === true, x18Install.payload);
+  check("装完模型上下文里读得到它：技能块真的进了这一轮装配",
+    (await skillPrompt(store(supabase), mockAgentId)).includes("Ana 的私有手册"),
+    (await skillPrompt(store(supabase), mockAgentId)).slice(0, 400));
   const x18InstallsBefore = (await call("skills.get", { token: ana, method: "GET", body: { id: privSkillId } })).payload.skill?.installs;
   const x18Locked = await call("skills.uninstall", { token: ana, body: { agent_id: agentId, skill_id: builtinId } });
   check("skills.uninstall：内置技能卸不掉", x18Locked.status === 400
@@ -1909,9 +2112,24 @@ async function main() {
     && !(x18InstalledAfter.payload.items ?? []).some((row) => row.name === "Ana 的私有手册"), x18InstalledAfter.payload);
   const x18InstallsAfter = (await call("skills.get", { token: ana, method: "GET", body: { id: privSkillId } })).payload.skill?.installs;
   check("卸载后安装数 -1", Number(x18InstallsAfter) === Number(x18InstallsBefore) - 1, { before: x18InstallsBefore, after: x18InstallsAfter });
+  // 列表里没有只说明"界面看不见了"；真正要的是模型那一侧也读不到，以及关联行没有留在库里等下一次装配捡回来。
+  const x18PromptOff = await skillPrompt(store(supabase), mockAgentId);
+  check("卸载后模型上下文里读不到它：技能块不再进任何一轮请求体",
+    !x18PromptOff.includes("Ana 的私有手册"), x18PromptOff.slice(0, 400));
+  const x18LinkRows = await db.agent_skills.list([["agent_id", mockAgentId], ["skill_id", privSkillId]], {
+    columns: "id", limit: 10,
+  });
+  check("关联行删干净：不留一条指向已卸技能的幽灵行", x18LinkRows.length === 0, x18LinkRows);
+  check("卸载只摘关联，技能本体还留在主人的市场里",
+    (await call("skills.market", { token: ana, method: "GET" })).payload.items?.some((row) => row.id === privSkillId));
   const x18UninstallAgain = await call("skills.uninstall", { token: ana, body: { agent_id: mockAgentId, skill_id: privSkillId } });
   check("重复卸载给 404 skill_not_installed", x18UninstallAgain.status === 404
     && x18UninstallAgain.payload.error === "skill_not_installed", x18UninstallAgain.payload);
+  const x18Reinstall = await call("skills.install", { token: ana, body: { skill_id: privSkillId, agent_id: mockAgentId } });
+  check("对照：卸掉的技能重新装回来，上下文又读得到（卸载不是把技能拉黑）",
+    x18Reinstall.payload.installed === true
+      && (await skillPrompt(store(supabase), mockAgentId)).includes("Ana 的私有手册"), x18Reinstall.payload);
+  await call("skills.uninstall", { token: ana, body: { agent_id: mockAgentId, skill_id: privSkillId } });
   const x18MemDelete = await call("agents.memory.delete", { token: ana, body: { agent_id: agentId, id: mem.payload.id } });
   check("agents.memory.delete：主人能删自己的记忆", x18MemDelete.payload.id === mem.payload.id, x18MemDelete.payload);
   const x18MemList = await call("agents.memory.list", { token: ana, method: "GET", body: { agent_id: agentId, scope: "common" } });
@@ -2173,6 +2391,29 @@ async function main() {
   check("对照：口径收成空不影响这一轮跑完，正文照样落群",
     (await db.mail.byId(noneMail, { columns: "status" }))?.status === "done"
       && String(noneStep?.detail?.content ?? "").includes("没有用量块"), noneMail);
+  // 命中率读数本身：口径住在 src/lib/usageStats.mjs（StreamFlow 显示的就是它），落库这四封正好凑齐四种德性。
+  const x20UsageOf = (rows) => {
+    const usage = newUsage();
+    tallyUsage(usage, rows);
+    return usage;
+  };
+  const x20MixedUsage = x20UsageOf([x20Steps[0], bareStep, sketchyStep, noneStep]);
+  check("命中率只收上游两个数都回报的轮：四封里只有一封进分母",
+    x20MixedUsage.rounds === 4 && x20MixedUsage.reported === 1
+    && x20MixedUsage.input === 812 && x20MixedUsage.cached === 640 && hitRateOf(x20MixedUsage) === "79%", x20MixedUsage);
+  const x20NoNumberUsage = x20UsageOf([bareStep, sketchyStep, noneStep]);
+  check("整组都没可信用量时读数是不进统计的破折号，不拿 0% 冒充没命中",
+    x20NoNumberUsage.rounds === 3 && x20NoNumberUsage.reported === 0 && hitRateOf(x20NoNumberUsage) === "—", x20NoNumberUsage);
+  // 加权口径：一轮长一轮短时按 token 加权才是真实省钱比例，按每轮百分比求平均会把长轮次的成本摊薄。
+  const x20Weighted = x20UsageOf([
+    { kind: "model", input_tokens: 1000, cached_tokens: 900 },
+    { kind: "model", input_tokens: 100, cached_tokens: 0 },
+  ]);
+  check("命中率按 token 加权：长短两轮读的是 82%，不是每轮百分比的平均 45%",
+    hitRateOf(x20Weighted) === "82%" && Math.round(((900 / 1000 + 0 / 100) / 2) * 100) === 45, x20Weighted);
+  const x20ToolRound = x20UsageOf(x20Steps);
+  check("工具步不进模型轮的账：一封带工具的只算两条模型轮，读数按这两条出",
+    x20ToolRound.rounds === 2 && x20ToolRound.reported === 2 && hitRateOf(x20ToolRound) === "79%", x20ToolRound);
   check("首字延迟被单独记成一个数", x20Steps[0]?.first_token_ms !== null
     && Number.isFinite(Number(x20Steps[0]?.first_token_ms)), x20Steps[0]?.first_token_ms);
   check("工具步把参数与结果原文都留在轨迹里", x20Steps[1]?.name === "search_history"
@@ -2441,6 +2682,19 @@ async function main() {
   check("重复装同一员工不建第二条快照", x22Again.payload.skill?.id === snapId
     && x22Again.payload.install?.agents?.[0]?.duplicate === true, x22Again.payload);
   check("重复装不加安装数", Number((await call("skills.get", { token: ana, method: "GET", body: { id: snapId } })).payload.skill?.installs) === 1);
+  // 远端快照的卸载要单独验一次：它和本地上传的技能在库里是同一张表，但正文是抄来的，
+  // 卸完该留的是那份抄来的正文，该走的是员工上下文里的那一块。
+  const x22SnapOff = await call("skills.uninstall", { token: ana, body: { agent_id: mockAgentId, skill_id: snapId } });
+  check("远端快照卸掉后：上下文读不到这一块，快照行与版本还在",
+    x22SnapOff.payload.ok === true
+      && !(await skillPrompt(store(supabase), mockAgentId)).includes("### release-check 技能")
+      && (await call("skills.get", { token: ana, method: "GET", body: { id: snapId } })).payload.skill?.version === "1.2.0",
+    (await skillPrompt(store(supabase), mockAgentId)).slice(0, 400));
+  const x22SnapBack = await call("skills.install", { token: ana, body: { skill_id: snapId, agent_id: mockAgentId } });
+  check("对照：重新装回来，出处那一行原样回到上下文",
+    x22SnapBack.payload.installed === true
+      && (await skillPrompt(store(supabase), mockAgentId)).includes("### release-check 技能（远端源「社区技能源」的 release-check，快照 1.2.0）"),
+    x22SnapBack.payload);
 
   const x22AgentCount = (await call("agents.list", { token: ana, method: "GET" })).payload.items?.length;
   const x22All = await call("skills.remoteInstall", { token: ana, body: { registry_id: regId, slug: "release-check", all_agents: true } });
@@ -2650,9 +2904,26 @@ async function main() {
   check("令牌不对时自检如实报 qca_access_denied",
     deniedPing.payload.result?.reachable === false && deniedPing.payload.result?.error === "qca_access_denied", deniedPing.payload);
   await call("agents.update", { token: ana, body: { id: qcaId, api_key: PAT } });
-  const switchBack = await call("agents.update", { token: ana, body: { id: agentId, backend: "qca", qca_agent_id: "agent_abc" } });
+  // 用一个新建的临时员工做换后端，不动 agentId：它是后面几节还在用的在岗员工，
+  // 真给他换到云端会把"调度顺序不对"伪装成"产品缺陷"。
+  const x23Swap = await call("agents.create", {
+    token: ana,
+    body: { name: "换后端", role: "x", api_base_url: "demo://local", api_key: "demo-key-23", model: "demo" },
+  });
+  const x23SwapId = x23Swap.payload.agent?.id;
+  const switchBack = await call("agents.update", {
+    token: ana, body: { id: x23SwapId, backend: "qca", qca_agent_id: "agent_abc", api_base_url: qca.origin },
+  });
   check("切后端必须同时换令牌（自建端点的 Key 在云上没用）",
     switchBack.payload.error === "agent_key_required_for_backend", switchBack.payload);
+  const switchWithKey = await call("agents.update", {
+    token: ana,
+    body: { id: x23SwapId, backend: "qca", qca_agent_id: "agent_abc", api_base_url: qca.origin, api_key: PAT },
+  });
+  check("对照：同一处改动带上云端令牌就放行（拦的是缺令牌，不是不许换后端）",
+    switchWithKey.payload.ok === true && switchWithKey.payload.agent?.backend === "qca"
+      && switchWithKey.payload.agent?.qca_agent_id === "agent_abc", switchWithKey.payload);
+  await call("agents.delete", { token: ana, body: { id: x23SwapId } });
 
   await call("streams.agents.add", { token: ana, body: { stream_id: streamId, agent_id: qcaId } });
   const qcaSend = await call("messages.send", {
@@ -3759,6 +4030,500 @@ async function main() {
     [x28HalfAgain?.status, (await x28MailOf(x28EofMail))?.status, (await x28MailOf(x28BoomMail))?.status]
       .every((status) => status === "failed"), x28HalfAgain);
   await x28Mock.close();
+
+  step("\n§29 dreaming：各群的压缩摘要归并成主人级全局记忆（三个入口、覆盖水位与跨群隐私）");
+  // 输入预算放宽到装得下这台机器上攒出来的全部摘要：§8~§28 那些群也有摘要，第一轮归并看得见它们是真实行为，
+  // 但这一节要断言的是"两个新群的要点都进了那次请求"，所以先把预算这个旋钮调到不影响判断的地方。
+  process.env.WORKSTREAM_DREAM_INPUT_CHARS = "60000";
+  const x29Mock = await startMockUpstream();
+  const x29Agent = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小D", role: "归并试验", api_base_url: `http://127.0.0.1:${x29Mock.port}/v1`,
+      api_key: "mock-key-dream", model: "mock", context_chars: 2000,
+    },
+  });
+  const x29Id = x29Agent.payload.agent?.id;
+  const roomA = await call("streams.create", { token: ana, body: { name: "归并甲组", agent_ids: [x29Id] } });
+  const roomB = await call("streams.create", { token: ana, body: { name: "归并乙组", agent_ids: [x29Id] } });
+  const roomAId = roomA.payload.stream?.id;
+  const roomBId = roomB.payload.stream?.id;
+  const x29Tick = async (wantMode, sid) => {
+    for (let round = 0; round < 10; round += 1) {
+      const tick = await call("scheduler.tick", { token: ana, method: "GET" });
+      const hit = (tick.payload.ran ?? []).find((row) => row.mode === wantMode && row.stream_id === sid);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  // 小D 的预算只有 2000 字，回复窗口按八折封顶（1600 字）：五条各三百多字才把尾窗撑到字符上限之外
+  // （truncated），这一轮才会补投后台压缩信；条数还得过 SUMMARY_MIN_ROWS=4 才真折得动。
+  const foldRoom = async (sid, mention = { name: "小D", id: x29Id }) => {
+    for (const word of ["素材甲", "素材乙", "素材丙", "素材丁", "素材戊"]) {
+      await call("messages.send", {
+        token: ana,
+        body: { stream_id: sid, content: `攒一段可折的记录 ${word} ${"补一段上下文让窗口装不下".repeat(30)}` },
+      });
+    }
+    await call("messages.send", {
+      token: ana,
+      body: { stream_id: sid, content: `@${mention.name} 攒一段好折的对话`, mentions: [{ type: "agent", id: mention.id }] },
+    });
+    return x29Tick("compress", sid);
+  };
+  const x29State = (token = ana) => call("dreaming.get", { token, method: "GET" });
+  // 水位线的键是 (员工, 群)：同一个群里两个员工各折一份摘要，只按群记就会互盖序号（小D 名下就是它自己）。
+  const x29Key = (sid) => `${x29Id}:${sid}`;
+  // 轨迹的 detail 每个字段落库前都过一遍 asText，数组回来就是 JSON 串——读它按那个口径读。
+  const x29List = (value) => {
+    if (Array.isArray(value)) return value;
+    try { return JSON.parse(String(value ?? "[]")); } catch { return []; }
+  };
+  /** 归并那封信的模型步 detail：这一节有好几处要问「这一轮到底吃了哪些素材」。 */
+  const x29DetailOf = async (mailId) => {
+    if (!mailId) return {};
+    const steps = (await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: mailId } })).payload.steps ?? [];
+    return steps.find((row) => row.kind === "model")?.detail ?? {};
+  };
+  const x29Reqs = () => x29Mock.seen.filter((body) => String(body.messages?.[0]?.content ?? "").includes("主人全局记忆"));
+  const x29Pending = async () => (await db.mail.list([["agent_id", x29Id], ["status", "queued"]], { columns: "meta", limit: 60 }))
+    .filter((row) => row.meta?.kind === "dreaming").length;
+
+  check("未登录读不到别人的全局记忆", (await x29State(null)).status === 401);
+  const x29Fresh = (await x29State()).payload;
+  check("还没归并过：记忆是空的、上一次归并也是空的，界面不该拿 null 装作跑过",
+    x29Fresh.ok === true && x29Fresh.memory === null && x29Fresh.last_run === null && x29Fresh.auto === false, x29Fresh);
+
+  const foldA = await foldRoom(roomAId);
+  const foldB = await foldRoom(roomBId);
+  check("两个群各折出一份压缩摘要：归并的素材是这两段摘要，不是两份转录",
+    Boolean(foldA) && Boolean(foldB), { foldA, foldB });
+  const x29Summaries = await db.memories.list(
+    [["agent_id", x29Id], ["scope", "stream"], ["kind", "summary"]],
+    { columns: "stream_id,covers_through_seq", limit: 20 },
+  );
+  check("两份摘要都带着覆盖水位：归并只看比上次更新的段",
+    x29Summaries.length === 2 && x29Summaries.every((row) => Number(row.covers_through_seq) > 0), x29Summaries);
+
+  const borrowDream = await call("dreaming.run", { token: bToken, body: { agent_id: x29Id, stream_id: roomAId } });
+  check("别人不能借我的员工归并：那是在烧我的 Key、并我的家底",
+    borrowDream.status === 403 && borrowDream.payload.error === "agent_not_owned", borrowDream.payload);
+  // 用 §26 那台没进这个群的员工：§26 末尾把「未入群」那台夹具员工删了，这里再拿它的 id 只会撞到 agent_not_found。
+  const loneDream = await call("dreaming.run", { token: ana, body: { agent_id: cronAgentId, stream_id: roomAId } });
+  check("员工不在那个群：这封信落不进任何邮箱，就地拒",
+    loneDream.status === 400 && loneDream.payload.error === "agent_not_in_stream", loneDream.payload);
+  // 放行那条要用 Bo 自己的群：dreaming.run 在归属之后还要查群成员，拿 Ana 的群只会撞到「不在群里」。
+  const boRoom = await call("streams.create", { token: bToken, body: { name: "Bo 的归并组", agent_ids: [boAgentId] } });
+  const boDream = await call("dreaming.run", {
+    token: bToken, body: { agent_id: boAgentId, stream_id: boRoom.payload.stream?.id },
+  });
+  check("对照：Bo 给自己名下的员工、自己的群归并放行（越权那条不是把所有 run 都挡掉）",
+    boDream.payload.ok === true && boDream.payload.queued === true, boDream.payload);
+
+  const x29Run = await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomAId } });
+  check("手动按钮只投信，不在请求里等模型跑完", x29Run.payload.queued === true && Boolean(x29Run.payload.mail_id), x29Run.payload);
+  const x29Twice = await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomBId } });
+  check("全局记忆一个主人只有一行：同一主人手上已经有一封没跑完的归并信就不重复投（换个群也一样）",
+    x29Twice.payload.queued === false && x29Twice.payload.reason === "already_pending", x29Twice.payload);
+  const x29DreamRun = await x29Tick("dreaming", roomAId);
+  const x29Mail = await db.mail.byId(x29Run.payload.mail_id, { columns: "id,status,error,message_id,meta" });
+  check("归并那一轮跑完且一个字不进群：silent 是这一类的固定德性",
+    x29DreamRun?.status === "done" && x29DreamRun.mode === "dreaming"
+      && x29DreamRun.dream === "ok" && x29DreamRun.silent === true, x29DreamRun);
+  check("这封归并信不挂在某条消息上：它不是替谁回话",
+    x29Mail?.message_id === null && x29Mail?.status === "done" && x29Mail?.meta?.reason === "manual", x29Mail);
+  const x29RoomMsgs = (await call("messages.list", { token: ana, method: "GET", body: { stream_id: roomAId } })).payload.items ?? [];
+  check("归并没有往群里塞话：群里只有同事那条 @ 和员工本人的回复",
+    x29RoomMsgs.filter((row) => row.sender_id === x29Id).length === 1, x29RoomMsgs.map((row) => row.content));
+
+  const x29After = (await x29State()).payload;
+  check("全局记忆落成主人级那一行：内容是模型回的正文，抬头带哨标才能证明它真出自这次归并",
+    String(x29After.memory?.content).includes("哨标DREAMOUT") && x29After.memory !== null, x29After.memory);
+  check("覆盖水位按素材记：两个新群各有一份在里面",
+    Number(x29After.memory?.covers_streams?.[x29Key(roomAId)]) > 0 && Number(x29After.memory?.covers_streams?.[x29Key(roomBId)]) > 0,
+    x29After.memory?.covers_streams);
+  const x29Boat = (await x29State(bToken)).payload;
+  check("跨群隐私：Bo 读自己那份读到的是空，Ana 的归并结论一个字都不会漏给他",
+    x29Boat.memory === null, x29Boat);
+  const x29Req = x29Reqs().at(-1);
+  check("上游收到的那一轮确实是拿摘要喂的：两个群的摘要抬头都在素材里",
+    String(x29Req?.messages?.[1]?.content).includes("【群「归并甲组」摘要")
+      && String(x29Req?.messages?.[1]?.content).includes("【群「归并乙组」摘要"), String(x29Req?.messages?.[1]?.content).slice(0, 200));
+  check("喂的是摘要不是转录：素材里找不到群里那些原始记录",
+    !String(x29Req?.messages?.[1]?.content).includes("攒一段可折的记录"), String(x29Req?.messages?.[1]?.content).slice(0, 160));
+  const x29Traj = await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: x29Run.payload.mail_id } });
+  const x29Step = (x29Traj.payload.steps ?? []).find((row) => row.kind === "model");
+  check("这一轮进了轨迹：并了哪几份素材、各并到哪个水位、有没有被预算挤出去，都写在这一步里",
+    x29Step?.status === "done" && x29List(x29Step.detail?.merged_streams).length >= 2,
+    { 步骤: x29Step?.status, 归并: x29Step?.detail?.merged_streams });
+  check("思考链不进群：它只落在这一步的 detail 里",
+    String(x29Step?.detail?.reasoning).length > 0 && !x29RoomMsgs.some((row) => String(row.content).includes("先看上下文")), x29Step?.detail?.reasoning);
+
+  const x29ReqsBefore = x29Reqs().length;
+  const x29Noop = await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomAId } });
+  const x29NoopRun = await x29Tick("dreaming", roomAId);
+  check("没有新要点的那一轮直接算没事：不付那次模型调用，信也照样结掉",
+    x29NoopRun?.status === "done" && x29NoopRun.dream === "noop", { 跑: x29NoopRun, 信: x29Noop.payload.mail_id });
+  check("对照：noop 这一轮上游一封归并请求都没多出来（只有真并的那一次付了模型调用）",
+    x29ReqsBefore === 1 && x29Reqs().length === x29ReqsBefore, x29Reqs().length);
+
+  const x29NextRound = await call("messages.send", {
+    token: ana, body: { stream_id: roomBId, content: "@小D 全局记忆进提示词了吗", mentions: [{ type: "agent", id: x29Id }] },
+  });
+  let x29Carried = null;
+  for (let round = 0; round < 5 && !x29Carried; round += 1) {
+    await call("scheduler.tick", { token: ana, method: "GET" });
+    x29Carried = x29Mock.seen.find((body) => {
+      // 认触发块而不是整句：主人显示名在这个群里是别的写法，硬抄上一节的「安娜：」会永远匹配不上。
+      const system = String(body.messages?.[0]?.content ?? "");
+      return (system.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "").includes("@小D 全局记忆进提示词了吗");
+    });
+  }
+  check("归并出来的全局记忆下一轮就被装配：模型可见的必须能从这一轮的请求里看见",
+    String(x29Carried?.messages?.[0]?.content).includes("我的全局记忆"), {
+      触发: x29NextRound.payload.ok,
+      块: String(x29Carried?.messages?.[0]?.content).slice(0, 120),
+      最近请求: x29Mock.seen.slice(-3).map((body) => String(body.messages?.[0]?.content ?? "").slice(-90)),
+    });
+
+  // 坏德性两条（空正文 / 5xx）都不许抬覆盖水位：并不动的素材要还能被下一轮看见。
+  await foldRoom(roomAId);
+  const x29WaterBefore = Number((await x29State()).payload.memory?.covers_streams?.[x29Key(roomAId)] ?? 0);
+  x29Mock.scripts.dream = "empty";
+  const x29EmptyRun = await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomAId } });
+  const x29Empty = await x29Tick("dreaming", roomAId);
+  check("上游回空正文等于一个群都没并进去：这封如实结成 dream_failed 家的 dream_empty",
+    x29Empty?.status === "failed" && x29Empty?.error === "dream_empty", x29Empty);
+  check("失败不抬水位线：那几段摘要下一轮还是新素材",
+    Number((await x29State()).payload.memory?.covers_streams?.[x29Key(roomAId)] ?? 0) === x29WaterBefore, await x29State());
+  x29Mock.scripts.dream = "boom";
+  const x29BoomRun = await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomAId } });
+  const x29Boom = await x29Tick("dreaming", roomAId);
+  check("上游自己崩了落成有名字的码，不是裸状态串",
+    x29Boom?.status === "failed" && x29Boom?.error === "upstream_server_error", x29Boom);
+  x29Mock.scripts.dream = "ok";
+  await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomAId } });
+  const x29Back = await x29Tick("dreaming", roomAId);
+  check("对照：开关拨回正常后重新归并跑得成，水位线从原地推进（失败不锁信）",
+    x29Back?.status === "done" && x29Back.dream === "ok"
+      && Number((await x29State()).payload.memory?.covers_streams?.[x29Key(roomAId)] ?? 0) > x29WaterBefore, x29Back);
+  const x29EmptyAgain = await db.mail.byId(x29EmptyRun.payload.mail_id, { columns: "id,status,error" });
+  const x29BoomAgain = await db.mail.byId(x29BoomRun.payload.mail_id, { columns: "id,status,error" });
+  check("坏掉的那两封仍停在 failed 并带着各自的码：恢复只认新的一封信，不回头改写旧结局",
+    x29EmptyAgain?.status === "failed" && x29EmptyAgain?.error === "dream_empty"
+      && x29BoomAgain?.status === "failed" && x29BoomAgain?.error === "upstream_server_error",
+    { 空正文: x29EmptyAgain, 上游崩: x29BoomAgain });
+
+  // 输出预算收在能看见最终正文的那一处：模型回得再长，落库与每轮提示词里的那份都不许超。
+  process.env.WORKSTREAM_DREAM_OUTPUT_CHARS = "10";
+  await foldRoom(roomBId);
+  await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomBId } });
+  const x29Capped = await x29Tick("dreaming", roomBId);
+  const x29CappedText = String((await x29State()).payload.memory?.content ?? "");
+  check("正文超预算时按完整结果收口：落库那份被截到预算内并留省略号",
+    x29Capped?.dream === "ok" && x29CappedText.length === 11 && x29CappedText.endsWith("…"), x29CappedText);
+  delete process.env.WORKSTREAM_DREAM_OUTPUT_CHARS;
+
+  const x29Cleared = await call("dreaming.clear", { token: ana, body: {} });
+  check("清空全局记忆：删的是主人级那一行，连同每群的覆盖水位",
+    x29Cleared.payload.ok === true && (await x29State()).payload.memory === null, x29Cleared.payload);
+  await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomAId } });
+  const x29Redo = await x29Tick("dreaming", roomAId);
+  check("对照：清掉水位之后同一批摘要算新素材，再归并一次照样并得出来",
+    x29Redo?.dream === "ok" && Object.keys((await x29State()).payload.memory?.covers_streams ?? {}).length >= 2, await x29State());
+
+  // 预算装不下全部素材时：被挤出去的那份不算"已归并"，水位不推，留到下一次。
+  // 输入预算压不下去（INPUT_CHARS_MIN=2000），所以素材得真攒到那么长：再开两个群，并让摘要一次折满
+  // 引擎那一侧的 600 字上限——四份各 600 字的摘要，一口气就装不进 2000 字。
+  const roomCId = (await call("streams.create", { token: ana, body: { name: "归并丙组", agent_ids: [x29Id] } })).payload.stream?.id;
+  const roomDId = (await call("streams.create", { token: ana, body: { name: "归并丁组", agent_ids: [x29Id] } })).payload.stream?.id;
+  x29Mock.scripts.compress = "long";
+  const x29LongFolds = [];
+  for (const sid of [roomAId, roomBId, roomCId, roomDId]) x29LongFolds.push(await foldRoom(sid));
+  x29Mock.scripts.compress = "ok";
+  check("四个群各折出一份摘要：预算那一条要撞得动，先把素材摆够",
+    x29LongFolds.every(Boolean), x29LongFolds);
+  process.env.WORKSTREAM_DREAM_INPUT_CHARS = "2000";
+  await call("dreaming.clear", { token: ana, body: {} });
+  const x29TightRun = await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomAId } });
+  const x29Tight = await x29Tick("dreaming", roomAId);
+  const x29TightCovers = Object.keys((await x29State()).payload.memory?.covers_streams ?? {}).length;
+  const x29TightSteps = (await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: x29TightRun.payload.mail_id } })).payload.steps ?? [];
+  const x29TightDetail = x29TightSteps.find((row) => row.kind === "model")?.detail ?? {};
+  const x29TightMerged = x29List(x29TightDetail.merged_streams);
+  check("四份长摘要装不进 2000 字预算：只并得下前几份，水位线如实停在这儿而不是全抬上去",
+    x29Tight?.dream === "ok" && x29TightMerged.length > 0
+      && x29TightCovers === x29TightMerged.length && x29TightCovers < 4,
+    { 并了: x29TightMerged.length, 水位: x29TightCovers, 清单: x29TightDetail.merged_streams });
+  check("被预算挤出去的那份如实记进 skipped_streams：它的结论没被当成已归并",
+    x29List(x29TightDetail.skipped_streams).length > 0, x29TightDetail.skipped_streams);
+  delete process.env.WORKSTREAM_DREAM_INPUT_CHARS;
+  const x29LooseRun = await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomAId } });
+  const x29Loose = await x29Tick("dreaming", roomAId);
+  const x29LooseSteps = (await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: x29LooseRun.payload.mail_id } })).payload.steps ?? [];
+  const x29LooseDetail = x29LooseSteps.find((row) => row.kind === "model")?.detail ?? {};
+  const x29LooseCovers = Object.keys((await x29State()).payload.memory?.covers_streams ?? {}).length;
+  const x29LooseMerged = x29List(x29LooseDetail.merged_streams);
+  const x29LooseKeys = new Set(x29LooseMerged.map((row) => `${row.agent_id}:${row.stream_id}`));
+  // 这一轮是增量归并：水位是历次累计的，所以它等于「这轮并了几份」只在清空过一次后才成立。
+  // 放开预算真正要证明的是上一轮被挤出去的那几份这一次全补上了，于是逐个点名，不数总数。
+  const x29TightSkipped = x29List(x29TightDetail.skipped_streams);
+  check("对照：预算放开后上一轮欠着的那几份全并进来了，这一步没有素材再被挤出去",
+    x29Loose?.dream === "ok" && x29LooseCovers > x29TightCovers
+      && x29List(x29LooseDetail.skipped_streams).length === 0
+      && x29TightSkipped.every((row) => x29LooseKeys.has(`${row.agent_id}:${row.stream_id}`)),
+    { 之前: x29TightCovers, 之后: x29LooseCovers, 这轮并了: x29LooseMerged.length, 上轮欠的: x29TightSkipped.length });
+
+  // 同一个群里两个员工：各自折出自己那一份摘要，两份素材的覆盖序号互不相干。
+  // 水位键只按群记时后写的那条会把前一条盖掉——被盖掉的要么每轮重并（白付调用），要么被当成已归并而永久漏掉，
+  // 两种都不会报错，所以这条要单独钉住，不能只靠注释。
+  const x29Peer = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小F", role: "归并同群", api_base_url: `http://127.0.0.1:${x29Mock.port}/v1`,
+      api_key: "mock-key-peer", model: "mock", context_chars: 2000,
+    },
+  });
+  const x29PeerId = x29Peer.payload.agent?.id;
+  const roomEId = (await call("streams.create", {
+    token: ana, body: { name: "归并戊组", agent_ids: [x29Id, x29PeerId] },
+  })).payload.stream?.id;
+  const x29PeerFolds = [];
+  for (const id of [x29Id, x29PeerId]) x29PeerFolds.push(await foldRoom(roomEId, { name: id === x29Id ? "小D" : "小F", id }));
+  check("同一个群里两位员工各折出一份摘要：先把两份素材摆出来，键少一个维度就撞不上",
+    x29PeerFolds.every(Boolean), x29PeerFolds);
+  const x29PairRun = await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomEId } });
+  const x29Pair = await x29Tick("dreaming", roomEId);
+  const x29PairCovers = (await x29State()).payload.memory?.covers_streams ?? {};
+  check("归并的键带得上员工：同一个群里两份摘要各记各的水位，谁也不盖谁的序号",
+    x29Pair?.dream === "ok" && x29PairRun.payload.queued === true
+      && Number(x29PairCovers[`${x29Id}:${roomEId}`] ?? 0) > 0
+      && Number(x29PairCovers[`${x29PeerId}:${roomEId}`] ?? 0) > 0, x29PairCovers);
+  await call("dreaming.run", { token: ana, body: { agent_id: x29Id, stream_id: roomEId } });
+  const x29PairAgain = await x29Tick("dreaming", roomEId);
+  // 这一轮允许再并，但只能并「这之后新折出来的素材」：同一条素材带着同一个水位再进一次请求体，
+  // 就是水位键少了一个维度时那种每轮重并（每轮白付一次调用）的样子。
+  const x29PairPaid = new Set(x29List((await x29DetailOf(x29PairRun.payload.mail_id)).merged_streams)
+    .map((row) => `${row.agent_id}:${row.stream_id}:${row.covers}`));
+  const x29AgainPaid = x29List((await x29DetailOf(x29PairAgain?.mail_id)).merged_streams);
+  check("对照：戊组那两份不并第二遍——水位认得出它们已经并过，盖掉序号的那种错账在这里露出来",
+    ["ok", "noop"].includes(x29PairAgain?.dream)
+      && x29AgainPaid.every((row) => !x29PairPaid.has(`${row.agent_id}:${row.stream_id}:${row.covers}`)),
+    { 这轮并的: x29AgainPaid, 上轮并的: [...x29PairPaid] });
+
+  // 入口二：群一折叠历史就顺手归并，开关挂在主人身上而不是员工身上。
+  const x29AutoOn = await call("auth.patch", { token: ana, body: { prefs: { dreaming_auto: true } } });
+  check("开关只有一个写入口：主人改掉之后 dreaming.get 读到的就是新的",
+    x29AutoOn.payload.ok === true && (await x29State()).payload.auto === true, (await x29State()).payload);
+  const x29BeforeAuto = await x29Pending();
+  // foldRoom 自己就把这一轮的折叠跑完了（它就是靠找 compress 那行返回的），归并信正是在那一步里补投的：
+  // 这里再 tick 一次等的是一份不会来的第二封，那一轮的结局要读的是 foldRoom 的返回值。
+  const x29AutoCompress = await foldRoom(roomAId);
+  check("摘要真推进了才谈得上归并：这一轮确实折动了", x29AutoCompress?.status === "done", x29AutoCompress);
+  const x29AutoRun = await x29Tick("dreaming", roomAId);
+  check("开了开关：群一折叠完就自动补一封归并信，并且如实记下是折叠叫醒的",
+    x29AutoRun?.status === "done" && x29AutoRun.dream === "ok", x29AutoRun);
+  const x29AutoMail = await db.mail.byId(x29AutoRun?.mail_id ?? "00000000-0000-0000-0000-000000000000", { columns: "id,meta" });
+  check("这封信的 reason 是 auto：界面上的「上一次归并」要能分清三个入口",
+    x29AutoMail?.meta?.kind === "dreaming" && x29AutoMail?.meta?.reason === "auto", x29AutoMail);
+  await call("auth.patch", { token: ana, body: { prefs: { dreaming_auto: false } } });
+  const x29OffBefore = await x29Pending();
+  const x29OffCompress = await foldRoom(roomBId);
+  check("对照：关了开关折叠照旧跑——关的只是归并那一步，不是把压缩一起停了",
+    x29OffCompress?.status === "done", x29OffCompress);
+  check("对照：关了开关之后同一次折叠不再补归并信（开关不是摆设，也不是无条件开刀）",
+    (await x29Pending()) === x29OffBefore && x29OffBefore === x29BeforeAuto,
+    { 开之前: x29BeforeAuto, 关之后: await x29Pending() });
+
+  // 入口三：定时归并复用排程那一个时钟，只差投出去的信是哪一种。
+  const x29BadPurpose = await call("cron.set", { token: ana, body: { ...spec(), purpose: "nightly" } });
+  check("不认识的 purpose 就地拒：宁可少一种排程，也不留一个没人认领的种类",
+    x29BadPurpose.status === 400 && x29BadPurpose.payload.error === "invalid_purpose", x29BadPurpose.payload);
+  const x29DreamSpec = await call("cron.set", {
+    token: ana,
+    body: {
+      name: "晚间归并", instruction: "只并待办和数字", agent_id: x29Id, stream_id: roomAId,
+      kind: "every", interval_minutes: 60, purpose: "dreaming",
+    },
+  });
+  const x29DreamScheduleId = x29DreamSpec.payload.schedule?.id;
+  check("做梦排程建得成：正文是额外交代，不是必填（干活那类仍然必填）",
+    x29DreamSpec.payload.ok === true && x29DreamSpec.payload.schedule?.purpose === "dreaming", x29DreamSpec.payload);
+  const x29DreamNoText = await call("cron.set", {
+    token: ana,
+    body: { name: "晚间归并二", instruction: "", agent_id: x29Id, stream_id: roomAId, kind: "every", interval_minutes: 60, purpose: "dreaming" },
+  });
+  check("对照：归并这一类允许留空正文，落库是空串而不是悄悄补一句默认话术",
+    x29DreamNoText.payload.ok === true && x29DreamNoText.payload.schedule?.instruction === "", x29DreamNoText.payload);
+  const x29DreamWork = await call("cron.set", {
+    token: ana, body: { name: "干活也要空正文", instruction: "", agent_id: x29Id, stream_id: roomAId, kind: "every", interval_minutes: 60 },
+  });
+  check("干活那一类留空正文仍然被拒：空正文等于让模型在群里没话说",
+    x29DreamWork.status === 400 && x29DreamWork.payload.error === "invalid_instruction", x29DreamWork.payload);
+  const x29SwitchPurpose = await call("cron.set", {
+    token: ana, body: { id: x29DreamScheduleId, name: "晚间归并", instruction: "只并待办和数字", agent_id: x29Id, stream_id: roomAId, kind: "every", interval_minutes: 60 },
+  });
+  check("同一条排程不许从归并改成干活：换 purpose 和换员工一样是换了语义，要改就删了重建",
+    x29SwitchPurpose.status === 400 && x29SwitchPurpose.payload.error === "schedule_target_locked", x29SwitchPurpose.payload);
+  const x29KeepPurpose = await call("cron.set", {
+    token: ana, body: { id: x29DreamScheduleId, name: "晚间归并改个名", instruction: "只并待办和数字", agent_id: x29Id, stream_id: roomAId, kind: "every", interval_minutes: 120, purpose: "dreaming" },
+  });
+  check("对照：同 purpose 内改节奏和名字放行（锁的只是那三样目标）", x29KeepPurpose.payload.ok === true, x29KeepPurpose.payload);
+
+  await foldRoom(roomAId);
+  await db.schedules.patch([["id", x29DreamScheduleId]], { next_run_at: isoAt(Date.now() - 5 * MINUTE) });
+  const x29CronTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  const x29CronFired = (x29CronTick.payload.cron ?? []).find((row) => row.schedule_id === x29DreamScheduleId);
+  check("到点的归并排程投出的是归并信：种类写在 meta 里，不是回查排程行",
+    Boolean(x29CronFired?.mail_id) && (await db.mail.byId(x29CronFired.mail_id, { columns: "id,meta" })).meta?.kind === "dreaming",
+    x29CronFired);
+  const x29CronMail = await db.mail.byId(x29CronFired?.mail_id ?? "00000000-0000-0000-0000-000000000000", { columns: "id,status,error,meta" });
+  check("这一轮跑成，并如实记下是排程叫醒的；主人额外交代那句话进了这封信",
+    x29CronMail?.meta?.reason === "cron" && String(x29CronMail?.meta?.dreaming?.instruction).includes("只并待办和数字"), x29CronMail);
+  const x29CronReq = x29Reqs().at(-1);
+  check("额外交代进了模型看到的正文：指令进了请求体就得能从这一步复原",
+    String(x29CronReq?.messages?.[0]?.content).includes("主人这次额外交代：只并待办和数字"), String(x29CronReq?.messages?.[0]?.content).slice(-160));
+  const x29CronRan = (x29CronTick.payload.ran ?? []).find((row) => row.mail_id === x29CronFired?.mail_id);
+  check("定时那一轮同样不进群：模式标 dreaming、silent 恒真",
+    x29CronRan?.mode === "dreaming" && x29CronRan?.silent === true, x29CronRan);
+
+  // 删排程要把还没跑的那封归并信一起撤回：用户删的是排程，不是"以后不排、这一下照旧跑"。
+  const x29QueuedMail = await db.mail.insert({
+    id: newId(), agent_id: x29Id, stream_id: roomAId, message_id: null, trigger_seq: 0,
+    priority: 1, status: "queued", slice_count: 0, error: null,
+    created_at: new Date().toISOString(), started_at: null, finished_at: null, updated_at: new Date().toISOString(),
+    meta: { kind: "dreaming", schedule_id: x29DreamScheduleId, dreaming: { name: "晚间归并改个名", instruction: "只并待办和数字" } },
+  }, { columns: "id" });
+  const x29Delete = await call("cron.delete", { token: ana, body: { id: x29DreamScheduleId } });
+  check("删掉归并排程时那封还没跑的信一并撤回：种类不同不代表可以留下",
+    x29Delete.payload.cancelled >= 1
+      && (await db.mail.byId(x29QueuedMail?.id ?? "00000000-0000-0000-0000-000000000000", { columns: "id,status" }))?.status === "cancelled",
+    x29Delete.payload);
+  await call("dreaming.clear", { token: ana, body: {} });
+  delete process.env.WORKSTREAM_DREAM_INPUT_CHARS;
+  delete process.env.WORKSTREAM_DREAM_OUTPUT_CHARS;
+  await x29Mock.close();
+
+  step("\n§30 接龙：员工回复里的 @ 交给下一位，跳数有上限、只认本群在岗成员");
+  // 员工 @ 员工走的是 fanout：回复落群时把 @ 到的员工投成一封新任务，跳数记在 meta.hops 上。
+  // 上限存在的理由是「两个模型互相 @ 可以永远说下去」，所以这一节既验接得起来，也验停得下来。
+  const x30Mock = await startMockUpstream();
+  const x30Url = `http://127.0.0.1:${x30Mock.port}/v1`;
+  const x30Make = (name) => call("agents.create", {
+    token: ana,
+    body: { name, role: "接龙", api_base_url: x30Url, api_key: "mock-key-30", model: "mock", context_chars: 8000 },
+  });
+  const x30JiaId = (await x30Make("甲一")).payload.agent?.id;
+  const x30YiId = (await x30Make("乙二")).payload.agent?.id;
+  const x30WaiId = (await x30Make("丙三")).payload.agent?.id;
+  const x30Room = await call("streams.create", { token: ana, body: { name: "接龙组", agent_ids: [x30JiaId, x30YiId] } });
+  const x30RoomId = x30Room.payload.stream?.id;
+  x30Mock.scripts.chain = ["甲一", "乙二"];
+  const x30Ask = (content) => call("messages.send", {
+    token: ana, body: { stream_id: x30RoomId, content, mentions: [{ type: "agent", id: x30JiaId }] },
+  });
+  const x30Replies = () => db.messages.list(
+    [["stream_id", x30RoomId], ["sender_type", "agent"]], { columns: "id,seq,sender_id,mentions,content", limit: 200 },
+  );
+  const x30Mails = (agentId) => db.mail.list([["agent_id", agentId], ["stream_id", x30RoomId]], {
+    columns: "id,status,error,meta,message_id", limit: 50,
+  });
+  const x30MailsFor = (messageId) => db.mail.list([["message_id", messageId]], {
+    columns: "id,agent_id,status,meta", limit: 20,
+  });
+  const x30LastReply = async (needle) => (await x30Replies()).filter((m) => String(m.content).includes(needle)).at(-1);
+  // 一次「甲一 回一句 @ 指定名字」的完整来回，返回那条回复和因它投出去的信。
+  const x30Handoff = async () => {
+    await x30Ask("@甲一 这段接给指定");
+    await call("scheduler.tick", { token: ana, method: "GET" });
+    const reply = await x30LastReply("请看这段");
+    return { reply, mailed: await x30MailsFor(reply?.id) };
+  };
+
+  await x30Ask("@甲一 把这段接下去");
+  const x30Hop1 = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("第一跳由真人起：@ 甲一 这一封先跑完",
+    (x30Hop1.payload.ran ?? []).some((r) => r.agent_id === x30JiaId && r.status === "done"), x30Hop1.payload.ran);
+  const x30JiaReply = await x30LastReply("这段请接下去");
+  check("员工回复里的 @ 被认成本群成员：mentions 记到乙二",
+    (x30JiaReply?.mentions ?? []).some((m) => m.type === "agent" && m.id === x30YiId), x30JiaReply);
+  const x30HopMail = (await x30Mails(x30YiId)).find((row) => row.message_id === x30JiaReply?.id);
+  check("接出来的那封如实带 hops=1 与 from_agent：跳数是这一轮跑出来的事实，不是事后猜的",
+    x30HopMail?.status === "queued" && Number(x30HopMail?.meta?.hops) === 1 && x30HopMail?.meta?.from_agent === x30JiaId,
+    x30HopMail);
+  const x30Chain = [...(x30Hop1.payload.ran ?? [])];
+  for (let round = 0; round < 8; round += 1) {
+    const tick = await call("scheduler.tick", { token: ana, method: "GET" });
+    x30Chain.push(...(tick.payload.ran ?? []));
+    if (x30Chain.some((r) => r.error === "hop_limit")) break;
+  }
+  check("互相 @ 停在跳数上限：撞上限那一封结成 failed hop_limit",
+    x30Chain.some((r) => r.status === "failed" && r.error === "hop_limit"), x30Chain);
+  check("上限之内每跳都真的接住了：这一条链一共只回了 3 条，不是无限接龙",
+    (await x30Replies()).length === 3, (await x30Replies()).map((m) => m.content));
+  const x30StopMail = (await x30Mails(x30YiId)).find((row) => row.error === "hop_limit");
+  const x30ByAgent = (await x30Replies()).reduce((acc, m) => ({ ...acc, [m.sender_id]: (acc[m.sender_id] ?? 0) + 1 }), {});
+  check("撞上限那一封只结失败、不回帖：乙二 接住第一跳，第二跳被上限挡在门外",
+    Number(x30ByAgent[x30JiaId]) === 2 && Number(x30ByAgent[x30YiId]) === 1
+      && Number(x30StopMail?.meta?.hops) === 3, { x30ByAgent, x30StopMail });
+  await x30Ask("@甲一 重新起一段接下去");
+  const x30RestartTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("对照：真人重新 @ 一次跳数从 0 起，接龙照样跑得动（hop_limit 不是把员工拉黑）",
+    (x30RestartTick.payload.ran ?? []).some((r) => r.agent_id === x30JiaId && r.status === "done")
+      && (await x30Mails(x30YiId)).some((row) => Number(row.meta?.hops) === 1 && row.status === "queued"),
+    x30RestartTick.payload.ran);
+  // 排空重起的那条链：本节结束时队列要干净，否则下一节的 tick 会接到上一节的接龙信。
+  for (let round = 0; round < 8; round += 1) {
+    const pending = await db.mail.list(
+      [["stream_id", x30RoomId], ["status", ["queued", "running"]]], { columns: "id", limit: 20 },
+    );
+    if (!pending.length) break;
+    await call("scheduler.tick", { token: ana, method: "GET" });
+  }
+
+  await x30Ask("@甲一 这段接给自己");
+  await call("scheduler.tick", { token: ana, method: "GET" });
+  const x30SelfReply = await x30LastReply("我自己接");
+  check("员工 @ 自己：那条 @ 记在 mentions 里读得出，但不给自己投新任务",
+    (x30SelfReply?.mentions ?? []).some((m) => m.id === x30JiaId)
+      && (await x30MailsFor(x30SelfReply?.id)).length === 0,
+    { mentions: x30SelfReply?.mentions, 投出去的信: await x30MailsFor(x30SelfReply?.id) });
+
+  x30Mock.scripts.chainPick = "Ana";
+  const x30Human = await x30Handoff();
+  const x30HumanNotes = await db.outbox.list([["stream_id", x30RoomId], ["user_id", anaId]], {
+    columns: "id,kind,subject", limit: 20,
+  });
+  check("员工 @ 真人：那条 @ 进真人的虚拟邮箱，不落成任务",
+    x30HumanNotes.some((row) => row.kind === "mention" && String(row.subject).includes("虚拟员工 甲一"))
+      && x30Human.mailed.length === 0,
+    { 通知: x30HumanNotes, 投出去的信: x30Human.mailed });
+
+  x30Mock.scripts.chainPick = "丙三";
+  const x30Outsider = await x30Handoff();
+  check("员工 @ 一个不在本群的员工：名字对不上成员，mentions 为空也不投信",
+    (x30Outsider.reply?.mentions ?? []).length === 0 && x30Outsider.mailed.length === 0, x30Outsider);
+  x30Mock.scripts.chainPick = "乙二";
+  const x30InRoom = await x30Handoff();
+  check("对照：同一个位置换成群里的乙二就接得住（拒的是「不在本群」，不是接龙本身）",
+    x30InRoom.mailed.length === 1 && x30InRoom.mailed[0].agent_id === x30YiId
+      && Number(x30InRoom.mailed[0].meta?.hops) === 1, x30InRoom);
+  await call("agents.update", { token: ana, body: { id: x30YiId, status: "paused" } });
+  const x30Paused = await x30Handoff();
+  check("员工 @ 一个已停用的员工：不投信，那条 @ 留在回复正文里看得见",
+    x30Paused.mailed.length === 0 && String(x30Paused.reply?.content ?? "").includes("@乙二"), x30Paused);
+  await call("agents.update", { token: ana, body: { id: x30YiId, status: "active" } });
+  const x30Active = await x30Handoff();
+  check("对照：拨回在岗后同一句 @ 照样接出去（拦的是状态，不是这个员工本身）",
+    x30Active.mailed.length === 1 && x30Active.mailed[0].status === "queued", x30Active);
+  for (let round = 0; round < 8; round += 1) {
+    const pending = await db.mail.list(
+      [["stream_id", x30RoomId], ["status", ["queued", "running"]]], { columns: "id", limit: 20 },
+    );
+    if (!pending.length) break;
+    await call("scheduler.tick", { token: ana, method: "GET" });
+  }
+  await x30Mock.close();
 
   console.log(`\n结果：${passed} 项通过，${failures.length} 项失败`);
   if (failures.length) {
