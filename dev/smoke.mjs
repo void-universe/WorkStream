@@ -8,9 +8,11 @@ import { makeHandler } from "../functions/handler.mjs";
 import { serveSite } from "../functions/adapter.mjs";
 import { executeTool, INTERNAL_TOOL_NAMES } from "../functions/mcp.mjs";
 import { connectorToolDefs } from "../functions/plugins.mjs";
+import { catchUp, clockToMs, dueOwnerIds, fireDueSchedules, nextOccurrence, upcomingOccurrences } from "../functions/cron.mjs";
 import { isUpdateAvailable } from "../functions/registries.mjs";
 import { CACHE_BREAKPOINT_ID, DEMO_QUOTABLE_HEADERS, PROMPT_SECTIONS, composeSystemPrompt } from "../functions/prompt.mjs";
 import { delegateWindow } from "../functions/delegate.mjs";
+import { BACKENDS, BACKEND_IDS, DEMO_BASE_URL, backendFor, validateBackends } from "../functions/backends.mjs";
 import { skillPrompt } from "../functions/skills.mjs";
 import { store } from "../functions/store.mjs";
 import { closeOrphanSteps, createStepWriter } from "../functions/steps.mjs";
@@ -75,7 +77,10 @@ function startMockUpstream() {
   const seen = [];
   // 压缩信的那次调用按剧本换德性：ok 正常出摘要，empty 只回空正文，boom 直接 500。
   // 折不动时水位线该不该动是摘要覆盖对不对得上的关键，所以两种坏德性都要能重跑。
-  const scripts = { compress: "ok" };
+  // chat 是自建通道整条链路的故障开关（ok / 500 / eof / half）：坏上游的用例要能随跑随切，
+  // 不能用触发关键词认剧本——上一轮的转录里也带着那个词，会把本来正常的轮次一起带坏，
+  // 于是"这轮为什么失败"永远说不清。形状照云端那条的 state.mode（见 startMockQca）。
+  const scripts = { compress: "ok", chat: "ok" };
   const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
   const server = createServer((req, res) => {
     let raw = "";
@@ -92,10 +97,42 @@ function startMockUpstream() {
       seen.push(body);
       res.on("error", () => {});
       const system = String(body.messages?.[0]?.content ?? "");
+      // 按触发消息本身认剧本：下一轮的转录里也带着上一轮的关键词，按全文匹配会把两封混成一份。
+      const trig = String(system.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "");
+      // 排程那一轮没有触发消息，按排程块认剧本：静默巡检只回空正文（正文空着才是这一轮的正当结局），其余一次说清。
+      const cronBlock = String(system.split("\n\n").find((b) => b.startsWith("这一轮是你自己的排程到点了")) ?? "");
       // 压缩剧本 boom 要在 SSE 头发出之前决定状态码，所以这一条单独前置。
       if (system.includes("压成不超过 600 字") && scripts.compress === "boom") {
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "mock_compress_boom" } }));
+        return;
+      }
+      // 交付登记之后上游第二轮崩：这一轮没有回复落群，卡片也就不该发出去。
+      if (trig.includes("交付后崩") && body.messages.some((m) => m.role === "tool")) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "mock_present_then_boom" } }));
+        return;
+      }
+      // 故障开关只管真人 @ 那一链路：压缩信与排程轮次各按自己的剧本走，别被一起带坏。
+      if (scripts.chat !== "ok" && !system.includes("压成不超过 600 字") && !cronBlock) {
+        const sseHead = { "content-type": "text/event-stream", "cache-control": "no-store" };
+        const frame = (delta, finishReason = null) => `data: ${JSON.stringify({ id: "mock", choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
+        if (scripts.chat === "500") {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "mock_chat_boom" } }));
+          return;
+        }
+        if (scripts.chat === "eof") {
+          // 表头给完、一个字节没吐就挂断：连接是通的，回的是"没有回复"这件事。
+          res.writeHead(200, sseHead);
+          res.end();
+          return;
+        }
+        // half：正文吐到一半，既没有 finish_reason 也没有 [DONE]，然后挂断。
+        res.writeHead(200, sseHead);
+        res.write(frame({ content: "这段回复" }));
+        res.write(frame({ content: "说到一半" }));
+        res.end();
         return;
       }
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
@@ -148,12 +185,42 @@ function startMockUpstream() {
         send({}, "stop");
         finish();
       };
+      // 交付剧本共用的两轮形状：第一轮把 present 的 tool_call 分片吐完，第二轮才成正文。
+      const presentCall = (index, id, name, note) => ({
+        index, id,
+        args: `{"name":${JSON.stringify(name)},"note":${JSON.stringify(note)}}`,
+      });
+      const presentRound = async (calls) => {
+        send({ tool_calls: calls.map(({ index, id }) => ({ index, id, type: "function", function: { name: "present" } })) });
+        await sleep(5);
+        for (const { index, args } of calls) {
+          send({ tool_calls: [{ index, function: { arguments: args } }] });
+        }
+        send({}, "tool_calls");
+        finish();
+      };
       const last = body.messages?.[body.messages.length - 1];
       // 压缩信按剧本回空正文：一条都没折进摘要，就不该把水位线抬上去（5xx 那条在前置分支里直接给状态码）。
       if (system.includes("压成不超过 600 字") && scripts.compress === "empty") { send({}, "stop"); finish(); return; }
+      // 排程那一轮的剧本（cronBlock 已在前面按槽位认出）：静默巡检只回空正文，其余一次说清。
+      if (cronBlock) {
+        if (cronBlock.includes("静默巡检")) { send({}, "stop"); finish(); return; }
+        // 排程那一轮只交文件、正文留空：交付优先于静默，否则活干完了群里看不见（§27）。
+        if (cronBlock.includes("交付巡检")) {
+          if (body.tools?.length && !body.messages.some((m) => m.role === "tool")) {
+            await presentRound([presentCall(0, "call_present_7", "排程巡检表.md", "巡检表按排程交出来")]);
+            return;
+          }
+          send({}, "stop");
+          finish();
+          return;
+        }
+        sayFast("排程巡检：一切正常，无需同事动手。");
+        return;
+      }
       if (system.includes("被 @ 你的新消息打断")) { sayFast("已按插话重排：一、准备；二、执行；三、复盘。"); return; }
-      // 按触发消息本身认剧本：下一轮的转录里也带着上一轮的关键词，按全文匹配会把两封混成一份。
-      const trig = String(system.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "");
+      // 真人 @ 的那轮回空正文是失败（同事在等回答），和排程那一轮的"没事就不说话"是两种德性。
+      if (trig.includes("空手回话")) { send({}, "stop"); finish(); return; }
       if (trig.includes("突发甲")) { sayFast("回甲已落群"); return; }
       if (trig.includes("突发乙")) { sayFast("回乙已落群"); return; }
       if (trig.includes("慢慢写")) { await say("正在慢慢写这段长正文", 140); return; }
@@ -211,6 +278,39 @@ function startMockUpstream() {
         return;
       }
       if (trig.includes("插件天气")) { sayFast("杭州晴 26 度，已经报回群里。"); return; }
+      // 交付物剧本：第一轮调 present 登记群文件，第二轮才成正文（§27）。
+      if (body.tools?.length && !body.messages.some((m) => m.role === "tool") && trig.includes("交付台账")) {
+        think("台账已经传上来了，标成交付物。");
+        await presentRound([presentCall(0, "call_present_1", "交付台账.md", "按这份台账验收（哨标DELIVNOTE）")]);
+        return;
+      }
+      if (trig.includes("交付台账")) { sayFast("台账交出去了，验收照它来。"); return; }
+      // 同一件文件在一轮里交两遍：只该有一张卡片，后一次的说明盖掉前一次。
+      if (body.tools?.length && !body.messages.some((m) => m.role === "tool") && trig.includes("交付两遍")) {
+        await presentRound([
+          presentCall(0, "call_present_2", "交付台账.md", "第一遍的口径"),
+          presentCall(1, "call_present_3", "交付台账.md", "第二遍改了口径"),
+        ]);
+        return;
+      }
+      if (trig.includes("交付两遍")) { sayFast("两遍说的是同一份台账。"); return; }
+      // 别的群才有的文件：本群的 present 找不到它，卡片也不该跨群挂过去。
+      if (body.tools?.length && !body.messages.some((m) => m.role === "tool") && trig.includes("交付别群文件")) {
+        await presentRound([presentCall(0, "call_present_4", "别群的秘密.md", "想把那个群的台账交过来")]);
+        return;
+      }
+      if (trig.includes("交付别群文件")) { sayFast("那个文件不在本群，我没交。"); return; }
+      // 只交文件、正文一个字不写：卡片照样是这一轮的结局。
+      if (body.tools?.length && !body.messages.some((m) => m.role === "tool") && trig.includes("只交文件")) {
+        await presentRound([presentCall(0, "call_present_5", "只交的清单.txt", "这一轮只交了文件")]);
+        return;
+      }
+      if (trig.includes("只交文件")) { send({}, "stop"); finish(); return; }
+      // 交付登记之后第二轮崩（状态码在前置分支里给）：这一轮没有回复，也就没有卡片。
+      if (body.tools?.length && !body.messages.some((m) => m.role === "tool") && trig.includes("交付后崩")) {
+        await presentRound([presentCall(0, "call_present_6", "交付后崩的台账.md", "交完就崩")]);
+        return;
+      }
       if (body.tools?.length) { sayFast("查到 3 条历史记录，已按时间排好。"); return; }
       sayFast("收到，我按上下文回应。");
     });
@@ -879,8 +979,8 @@ async function main() {
   const skillTool = await executeTool(db, scope, "read_skill", { name: "WorkStream 平台技能" });
   check("内部工具能读到内置技能全文", String(skillTool.body ?? "").includes("create_stream"), skillTool);
   const devSkill = await executeTool(db, scope, "read_skill", { name: "DevStream 群文件与公告" });
-  check("内置 DevStream 技能覆盖文件与公告工具",
-    ["list_files", "read_file", "upload_file", "delete_file", "get_announcement", "set_announcement"]
+  check("内置 DevStream 技能覆盖文件、交付与公告工具",
+    ["list_files", "read_file", "upload_file", "delete_file", "present", "get_announcement", "set_announcement"]
       .every((name) => String(devSkill.body ?? "").includes(name)), devSkill);
   const skillList = await executeTool(db, scope, "list_skills", {});
   check("内置技能有两个（平台 + DevStream）",
@@ -1226,7 +1326,7 @@ async function main() {
     trigger: { sender_name: "安娜", content: "@小S 干活" },
     skills: "### 技能正文",
     steerNote: "",
-    cloud: false,
+    backend: backendFor({ backend: "openai" }),
   };
   const composed = composeSystemPrompt(slotCtx);
   check("落下的槽位与顺序按表分配（这一份夹具应当是这十一个块）",
@@ -1250,9 +1350,9 @@ async function main() {
     trimmed.promptSlots.map(([id]) => id).join(",") === "identity,history.access,transcript,trigger"
     && trimmed.system.split("\n\n").length === 4 && !trimmed.system.includes("\n\n\n"),
     { 实际: trimmed.promptSlots.map(([id]) => id) });
-  const clouded = composeSystemPrompt({ ...slotCtx, agent: { ...slotCtx.agent, backend: "qca" }, cloud: true });
+  const clouded = composeSystemPrompt({ ...slotCtx, agent: { ...slotCtx.agent, backend: "qca" }, backend: backendFor({ backend: "qca" }) });
   check("云端通道只多一块云端须知、只换这两处措辞，其余块和它们的顺序照旧",
-    clouded.promptSlots.map(([id]) => id).filter((id) => id !== "backend.cloud").join(",")
+    clouded.promptSlots.map(([id]) => id).filter((id) => id !== "backend.tools").join(",")
       === composed.promptSlots.map(([id]) => id).join(",")
     && clouded.system.includes("本次由云端 Agent 作答")
     && clouded.system.includes("由 WorkStream 侧补给你")
@@ -1266,6 +1366,57 @@ async function main() {
   check("演示模型允许摘录的抬头都真的出现在装配出来的正文里",
     DEMO_QUOTABLE_HEADERS.every((header) => composed.system.includes(header)),
     { 缺: DEMO_QUOTABLE_HEADERS.filter((header) => !composed.system.includes(header)) });
+
+  step("8d3. 后端清单：这条通道吃不吃工具是字段，不是注释");
+  check("三条通道的能力位都在表上，只有不吃工具的那条带措辞",
+    BACKENDS.map((entry) => entry.id).join(",") === "openai,demo,qca"
+    && BACKENDS.every((entry) => typeof entry.caps.tools === "boolean")
+    && BACKENDS.filter((entry) => !entry.caps.tools).map((entry) => entry.id).join(",") === "qca"
+    && BACKENDS.every((entry) => entry.caps.tools || Boolean(entry.noToolsNotice)),
+    BACKENDS.map((entry) => ({ id: entry.id, transport: entry.transport, tools: entry.caps.tools })));
+  const badTables = [
+    { 坏在哪: "id 重复（后一条会静默覆盖前一条）", entries: [...BACKENDS, { ...BACKENDS[0] }] },
+    { 坏在哪: "不吃工具却没给提示词措辞", entries: BACKENDS.map((entry) => (entry.id === "qca" ? { ...entry, noToolsNotice: "" } : entry)) },
+    { 坏在哪: "没声明 caps.tools", entries: BACKENDS.map((entry) => (entry.id === "demo" ? { ...entry, caps: {} } : entry)) },
+    { 坏在哪: "backend 列能写的 id 不在表里", entries: BACKENDS.filter((entry) => entry.id !== "openai") },
+  ];
+  check("坏表就地抛，不留到运行时选错分支",
+    badTables.every((item) => {
+      try {
+        validateBackends(item.entries);
+        return false;
+      } catch {
+        return true;
+      }
+    }), badTables.map((item) => item.坏在哪));
+  check("对照：清单本身过得了同一套校验（不是校验写坏了）", (() => {
+    try {
+      validateBackends(BACKENDS);
+      return true;
+    } catch {
+      return false;
+    }
+  })(), BACKEND_IDS);
+  check("员工档案 → 通道：列只分自建/云端，演示那条从地址认；空档按自建算",
+    backendFor({}).id === "openai"
+    && backendFor({ backend: "openai", api_base_url: "https://api.example.com/v1" }).id === "openai"
+    && backendFor({ backend: "openai", api_base_url: DEMO_BASE_URL }).id === "demo"
+    && backendFor({ backend: "qca", api_base_url: DEMO_BASE_URL }).id === "qca"
+    && backendFor({ backend: "qca", api_base_url: "https://qoder.cn" }).transport === "cloud",
+    [{}, { backend: "openai", api_base_url: "https://api.example.com/v1" }, { backend: "openai", api_base_url: DEMO_BASE_URL }, { backend: "qca", api_base_url: DEMO_BASE_URL }]
+      .map((row) => backendFor(row).id));
+  let unknownBackend = null;
+  try {
+    backendFor({ backend: "claude" });
+  } catch (error) {
+    unknownBackend = error;
+  }
+  check("列里出现清单没有的值就地抛，不静默按自建处理", unknownBackend?.code === "unknown_backend", unknownBackend?.code);
+  const demoComposed = composeSystemPrompt({ ...slotCtx, backend: backendFor({ backend: "openai", api_base_url: DEMO_BASE_URL }) });
+  check("演示通道吃工具：它拿的是本地那一套措辞（能力位不是按地址划的）",
+    demoComposed.promptSlots.map(([id]) => id).join(",") === composed.promptSlots.map(([id]) => id).join(",")
+    && demoComposed.system.includes("按需调用对应工具") && !demoComposed.system.includes("本次由云端 Agent 作答"),
+    demoComposed.promptSlots.map(([id]) => id));
   step("8e. 突发排队：同群第二封的上下文里必须带着第一封刚落的回复");
   const burst = async (content) => call("messages.send", {
     token: ana,
@@ -1964,12 +2115,20 @@ async function main() {
   const newestMail = async () => (await db.mail.list([["agent_id", mockAgentId]], {
     columns: "id,status,message_id", order: ["created_at", { ascending: false }], limit: 1,
   }))[0]?.id;
+  // 一次 tick 不一定就跑到这封：前面可能还压着上一节没排空的信。等到这封落终态为止（最多 8 次），
+  // 否则调用方按关键词翻回复会翻到旧的那一条，把调度顺序的问题伪装成产品缺陷。
   const sendFor = async (content) => {
     await call("messages.send", {
       token: ana, body: { stream_id: streamId, content, mentions: [{ type: "agent", id: mockAgentId }] },
     });
-    await call("scheduler.tick", { token: ana, method: "GET" });
-    return newestMail();
+    let mailId = null;
+    for (let round = 0; round < 8; round += 1) {
+      await call("scheduler.tick", { token: ana, method: "GET" });
+      mailId = await newestMail();
+      const status = mailId ? (await db.mail.byId(mailId, { columns: "id,status" }))?.status : null;
+      if (status === "done" || status === "failed" || status === "cancelled") return mailId;
+    }
+    return mailId;
   };
 
   const x20Mail = await sendFor("@小M 查历史里的发布清单（轨迹样本）");
@@ -2459,6 +2618,27 @@ async function main() {
   check("云端后端照旧过 SSRF：元数据地址被拒",
     qcaProd.status === 400 && qcaProd.payload.error === "private_api_base_url", qcaProd.payload);
 
+  // 通道由地址与后端列一起决定（functions/backends.mjs 的 backendFor），这一对凑错了就不能跑：
+  // 云端后端挂演示地址只会连不上。建档/改档都拒，别留到员工上岗后每轮任务都失败在取地址上。
+  const qcaDemoUrl = await call("agents.create", {
+    token: ana,
+    body: { name: "云演示", role: "x", backend: "qca", qca_agent_id: "agent_ok", api_base_url: "demo://local", api_key: PAT },
+  });
+  check("云端后端 + 演示地址在建档就被拒", qcaDemoUrl.payload.error === "qca_needs_real_origin", qcaDemoUrl.payload);
+  check("对照：同一个后端配真实 origin 能建档（拒的是这一对组合，不是云端建档本身）",
+    qcaAgent.payload.ok === true && qcaAgent.payload.agent?.backend === "qca", qcaAgent.payload.error);
+  const demoStandIn = await call("agents.create", {
+    token: ana,
+    body: { name: "演示换型", role: "x", api_base_url: "demo://local", api_key: "demo-key-pair", model: "demo" },
+  });
+  const demoId = demoStandIn.payload.agent?.id;
+  const demoModelSwap = await call("agents.update", { token: ana, body: { id: demoId, model: "gpt-4o" } });
+  check("演示地址上的员工改模型名被拒：这个地址只选中内置演示模型",
+    demoModelSwap.payload.error === "demo_needs_demo_model", demoModelSwap.payload);
+  const demoRoleSwap = await call("agents.update", { token: ana, body: { id: demoId, role: "换个岗位" } });
+  check("对照：同一员工改不相干的字段照样放行", demoRoleSwap.payload.ok === true, demoRoleSwap.payload.error);
+  await call("agents.delete", { token: ana, body: { id: demoId } });
+
   const qcaPing = await call("agents.test", { token: ana, body: { id: qcaId } });
   check("连接自检打通云端：报出可见模型数量",
     qcaPing.payload.result?.reachable === true && qcaPing.payload.result?.mode === "qca"
@@ -2500,13 +2680,19 @@ async function main() {
   check("第一轮建出的 environment 记回员工档案",
     qca.count("POST", /\/environments$/) === 1 && qcaAgentRow?.qca_environment_id === "env_mock_1", qcaAgentRow);
 
+  const sessionRound1 = await db.qca_sessions.list([["agent_id", qcaId], ["stream_id", streamId]], { columns: "id,session_id", limit: 20 });
   await call("messages.send", {
     token: ana,
     body: { stream_id: streamId, content: "@小C 再补一句", mentions: [{ type: "agent", id: qcaId }] },
   });
   const qcaTick2 = await call("scheduler.tick", { token: ana, method: "GET" });
   check("第二轮也跑完", (qcaTick2.payload.ran ?? []).some((r) => r.status === "done"), qcaTick2.payload);
-  check("同群第二轮复用同一条云端 session", qca.count("POST", /\/sessions$/) === 1, qca.requests.map((r) => r.path));
+  // 数落库的那一条，不数 POST /sessions 的次数：压缩那一轮的一次性会话也开新 session，
+  // 它不落库、也不算"这条群对话没复用"。
+  const sessionRound2 = await db.qca_sessions.list([["agent_id", qcaId], ["stream_id", streamId]], { columns: "id,session_id", limit: 20 });
+  check("同群第二轮复用同一条云端 session",
+    sessionRound1.length === 1 && sessionRound2.length === 1
+    && sessionRound1[0].session_id === sessionRound2[0].session_id, { 第一轮: sessionRound1, 第二轮: sessionRound2 });
   check("environment 记下来之后不再每轮重探", qca.count("GET", /\/environments$/) === 1, qca.requests.map((r) => r.path));
   const qcaSessions = await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id,stream_id,session_id", limit: 20 });
   check("每个 (员工,群) 只存一条云端 session", qcaSessions.length === 1, qcaSessions);
@@ -2519,9 +2705,12 @@ async function main() {
   });
   await call("scheduler.tick", { token: ana, method: "GET" });
   const qcaSessions2 = await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id,stream_id,session_id", limit: 20 });
+  // 数的是落库的那两条而不是出网次数：压缩那一轮的一次性会话也走 POST /sessions，
+  // 它不该落库，也就不能算进"换群换 session"这笔账。
   check("换群就换云端 session：不同群不会在云上串台",
-    qca.count("POST", /\/sessions$/) === 2 && qcaSessions2.length === 2
-    && new Set(qcaSessions2.map((r) => r.session_id)).size === 2, qcaSessions2);
+    qcaSessions2.length === 2
+    && new Set(qcaSessions2.map((r) => r.session_id)).size === 2
+    && new Set(qcaSessions2.map((r) => r.stream_id)).size === 2, qcaSessions2);
 
   qca.state.mode = "error";
   const errorSend = await call("messages.send", {
@@ -2588,6 +2777,19 @@ async function main() {
     qca.count("POST", /\/sessions$/) === sessionsBeforeEphemeral + 1
     && (await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id", limit: 20 })).length === rowsBeforeEphemeral,
     { 出网次数: qca.count("POST", /\/sessions$/) });
+  // 上面那两枪直连 askCloudAgent，绕过了分流口——分流口漏传一个参数时它们照样是绿的。
+  // 压缩那一轮走的是 completeForAgent，这一枪才管得住"一次性提问"经不经得起分流。
+  const routedBefore = qca.count("POST", /\/sessions$/);
+  const routedRows = (await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id", limit: 20 })).length;
+  const routed = await completeForAgent({
+    db, agent: qcaRow, streamId: qcaRoomId, key: PAT,
+    messages: [{ role: "system", content: "压成不超过 600 字" }, { role: "user", content: "旧对话" }],
+    persistSession: false,
+  });
+  check("经分流口的一次性提问照样开新会话、不落进群里那条（压缩走的就是这条路）",
+    routed.mode === "qca" && qca.count("POST", /\/sessions$/) === routedBefore + 1
+    && (await db.qca_sessions.list([["agent_id", qcaId]], { columns: "id", limit: 20 })).length === routedRows,
+    { 出网次数: qca.count("POST", /\/sessions$/), 落库行数: routedRows });
   qca.state.mode = "slow";
   let interruptSeen = 0;
   let interrupted = null;
@@ -2983,6 +3185,581 @@ async function main() {
     PROMPT_SECTIONS.find((section) => section.id === "delegate")?.volatile === true);
   check("不是替身的那一轮不落这一块", !composed.promptSlots.some(([id]) => id === "delegate"));
 
+  step("\n§26 排程：虚拟员工按自己的时刻表醒来，不等人 @");
+  const MINUTE = 60 * 1000;
+  const HOURM = 60 * MINUTE;
+  const DAYM = 24 * HOURM;
+  const isoAt = (ms) => new Date(ms).toISOString();
+  // 2026-01-10 是周六：周一 01-12、周五 01-16、下周一 01-19。周几过滤全靠这几个日子对表。
+  const SAT = Date.parse("2026-01-10T00:00:00Z");
+  const everyRow = (nextRunMs, intervalMinutes = 30) => ({
+    kind: "every", interval_minutes: intervalMinutes, at_time: null, weekdays: null,
+    tz_offset_minutes: null, next_run_at: isoAt(nextRunMs),
+  });
+  const dailyRow = (nextRunMs, { atTime = "09:00", weekdays = null, offset = 480 } = {}) => ({
+    kind: "daily", interval_minutes: null, at_time: atTime, weekdays, tz_offset_minutes: offset,
+    next_run_at: isoAt(nextRunMs),
+  });
+
+  // 到时与追补是纯函数：投递路径和界面读同一把尺子，所以先把尺子本身钉死。
+  check("还没到点：不追补，也不动时钟", catchUp(everyRow(SAT, 30), SAT - 25 * MINUTE) === null);
+  check("时钟写空就是暂停：没有第二个真值源可对，也就不会追补",
+    catchUp({ ...everyRow(SAT), next_run_at: null }, SAT + DAYM) === null);
+  const onLine = catchUp(everyRow(SAT, 30), SAT);
+  check("正好压在界线上算一个对点：到点即醒，不留到下一格",
+    onLine?.runs === 1 && onLine.dueAt === SAT && onLine.nextRunAt === SAT + 30 * MINUTE, onLine);
+  const owed = catchUp(everyRow(SAT, 30), SAT + 100 * MINUTE);
+  check("每半小时、欠了一百分钟：认四个对点，时钟推到将来",
+    owed?.runs === 4 && owed.dueAt === SAT + 90 * MINUTE && owed.nextRunAt === SAT + 120 * MINUTE, owed);
+  const dailyDue = catchUp(dailyRow(SAT + 2 * DAYM + HOURM), SAT + 4 * DAYM + 5 * HOURM);
+  check("每天 09:00（UTC+8）从周一欠到周三早上：三次，下一次落在周四 09:00",
+    dailyDue?.runs === 3 && dailyDue.dueAt === Date.parse("2026-01-14T01:00:00Z")
+      && dailyDue.nextRunAt === Date.parse("2026-01-15T01:00:00Z"), dailyDue);
+  const workdays = catchUp(dailyRow(SAT + 2 * DAYM + HOURM, { weekdays: [1, 5] }), Date.parse("2026-01-18T00:00:00Z"));
+  check("只排周一和周五：中间三天跳过，下一次跳到下周一",
+    workdays?.runs === 2 && workdays.dueAt === Date.parse("2026-01-16T01:00:00Z")
+      && workdays.nextRunAt === Date.parse("2026-01-19T01:00:00Z"), workdays);
+  const flooded = catchUp(dailyRow(SAT, { atTime: "00:00", offset: 0 }), SAT + 600 * DAYM);
+  check("掉线六百年回来：追补封顶 500 个对点，不无限补历史", flooded?.runs === 500, flooded?.runs);
+  check("封顶之后时钟重锚到将来，那一串迟到的旧任务不往群里灌",
+    flooded?.nextRunAt > SAT + 600 * DAYM, flooded && new Date(flooded.nextRunAt).toISOString());
+  check("时刻不合法当场炸，不悄悄按 00:00 排", (() => {
+    try { clockToMs("25:00"); return false; } catch (error) { return error.error === "invalid_at_time"; }
+  })());
+  check("时刻要两位补零：界面与库共用一种写法", (() => {
+    try { clockToMs("9:00"); return false; } catch (error) { return error.error === "invalid_at_time"; }
+  })());
+  check("等长周期往后推就是一个间隔", nextOccurrence({ kind: "every", intervalMs: 45 * MINUTE }, SAT) === SAT + 45 * MINUTE);
+  const previews = upcomingOccurrences(everyRow(SAT + 12 * MINUTE, 30));
+  check("界面上的「下一次」按这一行自己的时钟走：每半小时不会被此刻重锚成 :12/:42",
+    previews.length === 3 && previews.every((v, i) => Date.parse(v) === SAT + 12 * MINUTE + i * 30 * MINUTE), previews);
+  check("暂停的排程读不出「下一次」：界面不该装作它还在跑",
+    upcomingOccurrences({ ...everyRow(SAT), next_run_at: null }).length === 0);
+
+  // ---- 入口与权限 ----
+  // 8b 那个假上游已经关掉了：这一节自己开一个，断言才落在"对方确实接到了什么"上。
+  const cronMock = await startMockUpstream();
+  const cronAgent = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小C", role: "值班巡检", api_base_url: `http://127.0.0.1:${cronMock.port}/v1`,
+      api_key: "mock-key-cron", model: "mock", context_chars: 8000,
+    },
+  });
+  const cronAgentId = cronAgent.payload.agent?.id;
+  const cronStream = await call("streams.create", { token: ana, body: { name: "排程值班组", agent_ids: [cronAgentId] } });
+  const cronStreamId = cronStream.payload.stream?.id;
+  const loneAgent = await call("agents.create", {
+    token: ana,
+    body: { name: "小N", role: "未入群", api_base_url: "demo://local", api_key: "demo-key-lone", model: "demo" },
+  });
+  const loneAgentId = loneAgent.payload.agent?.id;
+  const boAgent = await call("agents.create", {
+    token: bToken,
+    body: { name: "小B", role: "Bo 的员工", api_base_url: "demo://local", api_key: "demo-key-bob", model: "demo" },
+  });
+  const boAgentId = boAgent.payload.agent?.id;
+  const spec = (over = {}) => ({
+    name: "晨间巡检", instruction: "看一眼线上告警，把要紧的报出来",
+    agent_id: cronAgentId, stream_id: cronStreamId, kind: "every", interval_minutes: 30, ...over,
+  });
+  const cronMailsOf = async (scheduleId) => (await db.mail.list(
+    [["agent_id", cronAgentId], ["stream_id", cronStreamId]], { columns: "id,meta,status", limit: 200 },
+  )).filter((row) => row.meta?.kind === "cron" && String(row.meta?.schedule_id ?? "") === String(scheduleId));
+
+  check("未登录不能排班", (await call("cron.set", { body: spec() })).status === 401);
+  const borrow = await call("cron.set", { token: bToken, body: spec() });
+  check("借别人的虚拟员工排班被拒：跑的是别人的 Key、烧的是别人的额度",
+    borrow.status === 403 && borrow.payload.error === "agent_not_owned", borrow.payload);
+  const outsider = await call("cron.set", { token: bToken, body: spec({ agent_id: boAgentId }) });
+  check("不是群成员不能在这个群里排班", outsider.status === 403 && outsider.payload.error === "not_stream_member", outsider.payload);
+  const loneTry = await call("cron.set", { token: ana, body: spec({ agent_id: loneAgentId }) });
+  check("员工不在本群：排程投出去也没人接，就地拒",
+    loneTry.status === 400 && loneTry.payload.error === "agent_not_in_stream", loneTry.payload);
+  const morning = await call("cron.set", { token: ana, body: spec() });
+  const morningId = morning.payload.schedule?.id;
+  check("对照：给自己名下的员工、自己所在的群排班放行",
+    morning.payload.ok === true && Date.parse(morning.payload.schedule?.next_run_at ?? 0) > Date.now(), morning.payload);
+  check("新建的排程没有历史欠款", morning.payload.schedule?.merged_runs === 0 && morning.payload.schedule.last_run_at === null, morning.payload.schedule);
+  await call("streams.agents.add", { token: ana, body: { stream_id: cronStreamId, agent_id: loneAgentId } });
+  const backup = await call("cron.set", { token: ana, body: spec({ agent_id: loneAgentId, name: "备份巡检" }) });
+  const backupId = backup.payload.schedule?.id;
+  check("对照：把员工拉进群后，同一条排程就建得成", backup.payload.ok === true, backup.payload);
+  const boApply = await call("streams.apply", { token: bToken, body: { stream_uuid: cronStreamId } });
+  await call("streams.decide", { token: ana, body: { request_id: boApply.payload.request_id, approve: true } });
+  await call("streams.agents.add", { token: bToken, body: { stream_id: cronStreamId, agent_id: boAgentId } });
+  const boSchedule = await call("cron.set", {
+    token: bToken,
+    body: spec({ agent_id: boAgentId, name: "Bo 的日报", instruction: "把 Bo 名下的告警汇总一份" }),
+  });
+  const boScheduleId = boSchedule.payload.schedule?.id;
+  check("对照：入群之后 Bo 能在同一个群里给自己名下的员工排班", boSchedule.payload.ok === true, boSchedule.payload);
+
+  check("间隔小于 1 分钟被拒：排程是主动干活，不是往群里灌消息的定时器",
+    (await call("cron.set", { token: ana, body: spec({ interval_minutes: 0 }) })).payload.error === "invalid_interval_minutes");
+  check("不认识的 kind 被拒", (await call("cron.set", { token: ana, body: spec({ kind: "cron" }) })).payload.error === "invalid_kind");
+  check("每天型不给几点：入库前就炸",
+    (await call("cron.set", { token: ana, body: { ...spec(), kind: "daily", interval_minutes: null } })).payload.error === "invalid_at_time");
+  check("每天型不按时区：09:00 是谁的 09:00 说不清，不猜",
+    (await call("cron.set", {
+      token: ana, body: { ...spec(), kind: "daily", at_time: "09:00", interval_minutes: null },
+    })).payload.error === "invalid_tz_offset_minutes");
+  check("周几越界被拒", (await call("cron.set", {
+    token: ana,
+    body: { ...spec(), kind: "daily", at_time: "09:00", tz_offset_minutes: 480, weekdays: [8], interval_minutes: null },
+  })).payload.error === "invalid_weekdays");
+  check("时区偏移越界被拒", (await call("cron.set", {
+    token: ana, body: { ...spec(), kind: "daily", at_time: "09:00", tz_offset_minutes: 900, interval_minutes: null },
+  })).payload.error === "invalid_tz_offset_minutes");
+  const weekly = await call("cron.set", {
+    token: ana,
+    body: { ...spec(), name: "周一站会", kind: "daily", at_time: "09:30", tz_offset_minutes: 480, weekdays: [1], interval_minutes: null },
+  });
+  const weeklyId = weekly.payload.schedule?.id;
+  const weeklyLocal = new Date(Date.parse(weekly.payload.schedule?.next_run_at ?? 0) + 480 * MINUTE);
+  check("每天型填全了就落在填写的墙钟上：周一 09:30（UTC+8）",
+    weekly.payload.ok === true && weeklyLocal.getUTCDay() === 1
+      && weeklyLocal.getUTCHours() === 9 && weeklyLocal.getUTCMinutes() === 30, weekly.payload.schedule);
+  const switchTarget = await call("cron.set", {
+    token: ana, body: { ...spec(), id: weeklyId, agent_id: loneAgentId, kind: "daily", at_time: "09:30", tz_offset_minutes: 480 },
+  });
+  check("改排程时换员工或换群被拒：时钟与历史都挂在原来那个（员工,群）上",
+    switchTarget.status === 400 && switchTarget.payload.error === "schedule_target_locked", switchTarget.payload);
+
+  const anaList = await call("cron.list", { token: ana, method: "GET", body: { stream_id: cronStreamId } });
+  check("排程列表只回自己名下的：Bo 那条不出现在 Ana 的表里",
+    (anaList.payload.items ?? []).length > 0 && anaList.payload.items.every((row) => row.owner_id === anaId)
+      && !anaList.payload.items.some((row) => row.id === boScheduleId), anaList.payload.items?.map((r) => r.id));
+  check("每条都带往后几个对点，界面上的「下一次」要能自证口径",
+    (anaList.payload.items ?? []).every((row) => Array.isArray(row.upcoming) && row.upcoming.length <= 3), anaList.payload.items);
+  check("列表把限额一起给出：前端不用把 20 条和 1 分钟抄成两份",
+    anaList.payload.limits?.max_per_owner === 20 && anaList.payload.limits.min_interval_minutes === 1, anaList.payload.limits);
+  const stealPause = await call("cron.pause", { token: bToken, body: { id: morningId } });
+  check("别人停不掉我的排程", stealPause.status === 403 && stealPause.payload.error === "schedule_not_owned", stealPause.payload);
+  const stealDelete = await call("cron.delete", { token: bToken, body: { id: morningId } });
+  check("别人删不掉我的排程：只比 id 不比主人会永远成立",
+    stealDelete.status === 403 && stealDelete.payload.error === "schedule_not_owned", stealDelete.payload);
+
+  // ---- 到时投递与执行 ----
+  await db.schedules.patch([["id", morningId]], { next_run_at: isoAt(Date.now() - 100 * MINUTE) });
+  check("空闲的 worker 也找得到该醒的主人：没有一封排队信时排程照样有人驱动",
+    (await dueOwnerIds(db, { nowMs: Date.now() })).includes(anaId), await dueOwnerIds(db, { nowMs: Date.now() }));
+  check("对照：只有将来时钟的主人不在到期名单里",
+    !(await dueOwnerIds(db, { nowMs: Date.now() })).includes(boId));
+  const fireTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  const fired = (fireTick.payload.cron ?? []).find((row) => row.schedule_id === morningId);
+  check("到点的排程在这一轮投出信：欠四个对点也只投一封",
+    fired?.runs === 4 && Boolean(fired.mail_id), fired);
+  const firedMail = await db.mail.byId(fired?.mail_id ?? "00000000-0000-0000-0000-000000000000");
+  check("排程信不挂在某条消息上：它不是替谁回话",
+    firedMail?.message_id === null && firedMail?.status === "done",
+    firedMail && { message_id: firedMail.message_id, status: firedMail.status });
+  check("同一轮就把这封信跑掉，模式标成 cron",
+    (fireTick.payload.ran ?? []).some((r) => r.mail_id === fired?.mail_id && r.status === "done" && r.mode === "cron"),
+    fireTick.payload.ran);
+  check("信里带着到点时刻、排程名与合并数：这一轮看到什么，从这封信就能复原",
+    firedMail?.meta?.kind === "cron" && firedMail.meta.cron?.merged === 3
+      && firedMail.meta.cron.name === "晨间巡检" && String(firedMail.meta.cron.instruction).includes("线上告警"), firedMail?.meta);
+  const morningRow = await db.schedules.byId(morningId);
+  check("时钟推到最后欠的那个对点之后，并把那个对点记成最近一次",
+    Date.parse(morningRow?.next_run_at ?? 0) > Date.now() && morningRow?.last_run_at === firedMail?.meta?.cron?.due_at, morningRow);
+  check("合并掉的三个对点全记进合并计数：界面上要能看出这一轮替我少发了几条",
+    morningRow?.merged_runs === 3, morningRow?.merged_runs);
+  const morningSeen = cronMock.seen.filter((body) => String(body.messages?.[0]?.content ?? "").includes("看一眼线上告警"));
+  check("上游确实收到排程块：排程名、合并数与要办的事都进了提示词",
+    morningSeen.length === 1 && String(morningSeen[0].messages[0].content).includes("合并了 3 个")
+      && String(morningSeen[0].messages[0].content).includes("看一眼线上告警"), morningSeen.length);
+  check("排程那一轮没有原始消息，触发块如实说明是谁醒的，不谎称补发任务",
+    String(morningSeen[0]?.messages?.[0]?.content ?? "").includes("没有人 @ 你，这一轮是你自己的排程醒的"));
+  const patrol = ((await call("messages.list", { token: ana, method: "GET", body: { stream_id: cronStreamId } })).payload.items ?? [])
+    .find((m) => m.sender_id === cronAgentId);
+  check("巡检结果落进群", String(patrol?.content).includes("排程巡检"), patrol);
+  check("群里不念内部指令：排程块与要办的事都留在提示词里",
+    !String(patrol?.content).includes("这一轮是你自己的排程") && !String(patrol?.content).includes("要办的事"), patrol?.content);
+  const idleTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("没到点的一轮不再投：时钟已经推到将来",
+    (idleTick.payload.cron ?? []).every((row) => row.schedule_id !== morningId), idleTick.payload.cron);
+
+  await db.schedules.patch([["id", morningId]], { next_run_at: isoAt(Date.now() - 31 * MINUTE) });
+  const twin = await Promise.all([
+    call("scheduler.tick", { token: ana, method: "GET" }),
+    call("scheduler.tick", { token: ana, method: "GET" }),
+  ]);
+  const morningMails = await cronMailsOf(morningId);
+  check("两个驱动同时看见同一个到期行：只有一个赢，群里不多念一遍",
+    morningMails.length === 2, morningMails.map((m) => m.status));
+  check("对照：并发那一轮也真的把活干了", twin.every((t) => t.payload.ok === true), twin.map((t) => t.status));
+
+  const noon = await call("cron.set", { token: ana, body: spec({ name: "午间巡检", instruction: "午间巡检：核对昨天的构建产物" }) });
+  const noonId = noon.payload.schedule?.id;
+  await db.mail.insert({
+    id: crypto.randomUUID(), agent_id: cronAgentId, stream_id: cronStreamId, message_id: null,
+    trigger_seq: 0, priority: 1, status: "queued", slice_count: 0, error: null,
+    created_at: isoAt(Date.now()), started_at: null, finished_at: null, updated_at: isoAt(Date.now()),
+    meta: {
+      kind: "cron", schedule_id: noonId,
+      cron: { name: "午间巡检", instruction: "午间巡检：核对昨天的构建产物", due_at: isoAt(Date.now()), runs: 1, merged: 0 },
+    },
+  }, { columns: "id" });
+  await db.schedules.patch([["id", noonId]], { next_run_at: isoAt(Date.now() - 95 * MINUTE) });
+  const foldTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  const foldedRow = (foldTick.payload.cron ?? []).find((row) => row.schedule_id === noonId);
+  check("上一轮那封还没跑完：新欠的对点并进它，不另起一封",
+    foldedRow?.merged_into_pending === true && foldedRow.runs === 4, foldedRow);
+  check("对照：这一轮午间巡检确实只有一封信", (await cronMailsOf(noonId)).length === 1, await cronMailsOf(noonId));
+  check("并进旧信的对点全记进合并计数（不减掉那一封自己）",
+    (await db.schedules.byId(noonId))?.merged_runs === 4, await db.schedules.byId(noonId));
+
+  // 投递失败这一支只有一处写入能走到，而它决定"欠的那个对点会不会被时钟白白带走"。
+  // 换一份 mail.insert 会炸的 db 视图来打这一轮：不改动共享的 db，也不影响后面的用例。
+  // db 是 Proxy（属性名即表名），展开它只会得到空对象；用原型链继承、只遮一个 mail。
+  const flaky = await call("cron.set", { token: ana, body: spec({ name: "回拨巡检", instruction: "回拨巡检：这一轮投不出去" }) });
+  const flakyId = flaky.payload.schedule?.id;
+  await db.schedules.patch([["id", flakyId]], { next_run_at: isoAt(Date.now() - 7 * MINUTE) });
+  const beforeFlaky = await db.schedules.byId(flakyId);
+  const brokenDb = Object.create(db, {
+    mail: { value: { ...db.mail, insert: async () => { throw new Error("fixture：邮箱写不进"); } } },
+  });
+  const flakyOutcome = (await fireDueSchedules(brokenDb, { ownerId: anaId }))
+    .find((row) => row.schedule_id === flakyId);
+  const afterFlaky = await db.schedules.byId(flakyId);
+  check("邮箱写失败：这条排程的错如实报出去，不静默丢",
+    flakyOutcome?.error === "cron_mail_write_failed" && !flakyOutcome.mail_id, flakyOutcome);
+  check("回拨成自己刚读到的那个值：时钟不白走，欠的对点下一轮重新判到点",
+    afterFlaky?.next_run_at === beforeFlaky?.next_run_at
+      && afterFlaky?.last_run_at === beforeFlaky?.last_run_at
+      && afterFlaky?.merged_runs === beforeFlaky?.merged_runs,
+    { before: beforeFlaky?.next_run_at, after: afterFlaky?.next_run_at });
+  const flakyTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("对照：写入恢复后同一个对点照样投出去，一次失败不永久丢掉这条排程",
+    (flakyTick.payload.cron ?? []).some((row) => row.schedule_id === flakyId && row.mail_id), flakyTick.payload.cron);
+
+  const night = await call("cron.set", { token: ana, body: spec({ name: "晚间值守", instruction: "晚间值守：核对一下值班表" }) });
+  const nightId = night.payload.schedule?.id;
+  const waitingCron = await db.mail.insert({
+    id: crypto.randomUUID(), agent_id: cronAgentId, stream_id: cronStreamId, message_id: null,
+    trigger_seq: 0, priority: 1, status: "queued", slice_count: 0, error: null,
+    created_at: isoAt(Date.now() - 2 * MINUTE), started_at: null, finished_at: null, updated_at: isoAt(Date.now() - 2 * MINUTE),
+    meta: {
+      kind: "cron", schedule_id: nightId,
+      cron: { name: "晚间值守", instruction: "晚间值守：核对一下值班表", due_at: isoAt(Date.now() - 2 * MINUTE), runs: 1, merged: 0 },
+    },
+  }, { columns: "id" });
+  const humanSend = await call("messages.send", {
+    token: ana,
+    body: { stream_id: cronStreamId, content: "@小C 现在有几条告警", mentions: [{ type: "agent", id: cronAgentId }] },
+  });
+  const humanMailId = humanSend.payload.queued?.[0]?.mail_id;
+  const priorityTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("同事在线等回答时先答人：这一轮跑 @ 的那封，排程留在队列里",
+    Boolean(humanMailId) && (priorityTick.payload.ran ?? []).some((r) => r.mail_id === humanMailId)
+      && !priorityTick.payload.ran.some((r) => r.mail_id === waitingCron?.id), priorityTick.payload.ran);
+  const nextTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  check("对照：排程没被吞掉，下一轮照样按时钟跑起来",
+    (nextTick.payload.ran ?? []).some((r) => r.mail_id === waitingCron?.id && r.mode === "cron"), nextTick.payload.ran);
+
+  const quiet = await call("cron.set", { token: ana, body: spec({ name: "静默巡检", instruction: "静默巡检：没事就别说话" }) });
+  const quietId = quiet.payload.schedule?.id;
+  const beforeCount = (await call("messages.list", { token: ana, method: "GET", body: { stream_id: cronStreamId } })).payload.items?.length ?? 0;
+  await db.schedules.patch([["id", quietId]], { next_run_at: isoAt(Date.now() - 40 * MINUTE) });
+  const quietTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  const firedQuiet = (quietTick.payload.cron ?? []).find((row) => row.schedule_id === quietId);
+  const quietRan = (quietTick.payload.ran ?? []).find((r) => r.mail_id === firedQuiet?.mail_id);
+  check("排程那一轮回空正文算完成，不算失败",
+    quietRan?.status === "done" && quietRan.mode === "cron" && quietRan.silent === true, quietRan);
+  check("没事就不说话：群里没有多出一条空消息",
+    ((await call("messages.list", { token: ana, method: "GET", body: { stream_id: cronStreamId } })).payload.items?.length ?? 0) === beforeCount,
+    { beforeCount });
+  const blankSend = await call("messages.send", {
+    token: ana,
+    body: { stream_id: cronStreamId, content: "@小C 空手回话一次", mentions: [{ type: "agent", id: cronAgentId }] },
+  });
+  const blankRan = (await call("scheduler.tick", { token: ana, method: "GET" })).payload.ran
+    ?.find((r) => r.mail_id === blankSend.payload.queued?.[0]?.mail_id);
+  check("对照：真人 @ 回空正文仍算失败，同事在等回答不能空手回一句",
+    blankRan?.status === "failed" && blankRan.error === "empty_reply", blankRan);
+
+  const doomed = await call("cron.set", { token: ana, body: spec({ name: "临时巡检", instruction: "临时巡检：这条马上被删掉" }) });
+  const doomedId = doomed.payload.schedule?.id;
+  const doomedMail = await db.mail.insert({
+    id: crypto.randomUUID(), agent_id: cronAgentId, stream_id: cronStreamId, message_id: null,
+    trigger_seq: 0, priority: 1, status: "queued", slice_count: 0, error: null,
+    created_at: isoAt(Date.now()), started_at: null, finished_at: null, updated_at: isoAt(Date.now()),
+    meta: {
+      kind: "cron", schedule_id: doomedId,
+      cron: { name: "临时巡检", instruction: "临时巡检：这条马上被删掉", due_at: isoAt(Date.now()), runs: 1, merged: 0 },
+    },
+  }, { columns: "id" });
+  const colleagueSend = await call("messages.send", {
+    token: ana,
+    body: { stream_id: cronStreamId, content: "@小C 这条别被删排程牵连", mentions: [{ type: "agent", id: cronAgentId }] },
+  });
+  const colleagueMailId = colleagueSend.payload.queued?.[0]?.mail_id;
+  const removed = await call("cron.delete", { token: ana, body: { id: doomedId } });
+  check("删排程：还在队里的那一封一起撤掉，用户删的是排程不是「以后不排、这一下照旧跑」",
+    removed.payload.cancelled === 1 && (await db.mail.byId(doomedMail?.id))?.status === "cancelled", removed.payload);
+  check("对照：同事刚 @ 出去的那封不受牵连",
+    (await db.mail.byId(colleagueMailId))?.status === "queued", await db.mail.byId(colleagueMailId));
+  await call("scheduler.tick", { token: ana, method: "GET" });
+
+  const pausedSchedule = await call("cron.pause", { token: ana, body: { id: weeklyId } });
+  check("对照：本人停得掉自己的排程：暂停把时钟写空，不删规格",
+    pausedSchedule.payload.ok === true && pausedSchedule.payload.next_run_at === null, pausedSchedule.payload);
+  check("暂停之后到点也不投：空时钟不进到期扫描",
+    ((await call("scheduler.tick", { token: ana, method: "GET" })).payload.cron ?? []).every((row) => row.schedule_id !== weeklyId));
+  const resumed = await call("cron.resume", { token: ana, body: { id: weeklyId } });
+  check("恢复按原规格重算，从今往后的第一个对点重新开始",
+    resumed.payload.ok === true && Date.parse(resumed.payload.next_run_at ?? 0) > Date.now(), resumed.payload);
+  check("暂停期间欠掉的不补：恢复之后这一轮不投迟到的旧任务",
+    ((await call("scheduler.tick", { token: ana, method: "GET" })).payload.cron ?? []).every((row) => row.schedule_id !== weeklyId));
+  const reanchored = await call("cron.set", { token: ana, body: { ...spec(), id: morningId, interval_minutes: 120 } });
+  check("改规格就把时钟重锚到新节奏：从 30 分钟改成 2 小时不该继续按旧锚点补历史",
+    reanchored.payload.ok === true
+      && Date.parse(reanchored.payload.schedule.next_run_at) - Date.now() <= 120 * MINUTE
+      && Date.parse(reanchored.payload.schedule.next_run_at) > Date.now(), reanchored.payload.schedule);
+  await call("cron.pause", { token: ana, body: { id: weeklyId } });
+  const pausedKeep = await call("cron.set", {
+    token: ana,
+    body: { ...spec(), id: weeklyId, name: "周一站会（改过文案）", kind: "daily", at_time: "09:30", tz_offset_minutes: 480, weekdays: [1] },
+  });
+  check("改文案不替用户打开他亲手停掉的排程：暂停态在编辑之后仍是暂停",
+    pausedKeep.payload.ok === true && pausedKeep.payload.schedule.next_run_at === null, pausedKeep.payload.schedule);
+
+  // 一个主人排到 20 条到顶：扫描按 (owner_id, next_run_at) 走索引，上限让最坏一轮的开销有界。
+  const filled = [];
+  let overflow = null;
+  for (let guard = 0; guard < 24; guard += 1) {
+    const made = await call("cron.set", { token: ana, body: spec({ name: `占位${guard}`, instruction: `占位排程第 ${guard} 条` }) });
+    if (made.payload.ok) { filled.push(made.payload.schedule.id); continue; }
+    overflow = made;
+    break;
+  }
+  check("排到第 21 条被拒：too_many_schedules，不是悄悄排上",
+    overflow?.payload.error === "too_many_schedules"
+      && (await call("cron.list", { token: ana, method: "GET" })).payload.items?.length === 20,
+    { filled: filled.length, error: overflow?.payload?.error });
+  for (const id of filled) await call("cron.delete", { token: ana, body: { id } });
+
+  await db.schedules.patch([["id", backupId]], { next_run_at: isoAt(Date.now() - 90 * MINUTE) });
+  const dropAgent = await call("agents.delete", { token: ana, body: { id: loneAgentId } });
+  check("删员工连带删掉他名下的排程：留着行只会按时投出必定失败的信",
+    dropAgent.payload.ok === true && (await db.schedules.list([["agent_id", loneAgentId]], { columns: "id", limit: 10 })).length === 0,
+    dropAgent.payload);
+
+  // 群停用走的是另一条连带：排程挂在 (员工,群) 上，行还在的话到点判定会继续为一个不存在的群投信。
+  const byeStream = await call("streams.create", { token: ana, body: { name: "排程散场组", agent_ids: [cronAgentId] } });
+  const byeStreamId = byeStream.payload.stream?.id;
+  const byeSchedule = await call("cron.set", { token: ana, body: spec({ stream_id: byeStreamId, name: "散场前的巡检" }) });
+  const dropStream = await call("streams.delete", { token: ana, body: { stream_id: byeStreamId } });
+  check("解散群连带删掉这个群里的排程：不给一个不存在的群留一条会醒的时刻表",
+    byeSchedule.payload.ok === true && dropStream.payload.ok === true
+      && (await db.schedules.list([["stream_id", byeStreamId]], { columns: "id", limit: 10 })).length === 0,
+    { schedule: byeSchedule.payload, drop: dropStream.payload });
+
+  const cronMemberRow = await db.members.first(
+    [["stream_id", cronStreamId], ["principal_type", "agent"], ["principal_id", cronAgentId]], { columns: "id" },
+  );
+  await call("streams.members.remove", { token: ana, body: { stream_id: cronStreamId, membership_id: cronMemberRow?.id } });
+  await db.schedules.patch([["id", morningId]], { next_run_at: isoAt(Date.now() - 30 * MINUTE) });
+  const leaveTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  const selfPaused = (leaveTick.payload.cron ?? []).find((row) => row.schedule_id === morningId);
+  check("员工已退群：这条排程自己停掉，不再每到一个对点白扫一次",
+    selfPaused?.paused === true && selfPaused.reason === "agent_not_in_stream", selfPaused);
+  check("自己停掉的排程时钟写空：界面上一条暂停的排程不该装作还在跑",
+    (await db.schedules.byId(morningId))?.next_run_at === null, await db.schedules.byId(morningId));
+
+  const withCron = composeSystemPrompt({
+    ...slotCtx,
+    cron: { name: "晨间巡检", due_at: "2026-01-12T01:00:00.000Z", instruction: "看一眼线上告警", merged: 3 },
+  });
+  check("排程这一轮单独成一块，位置在本群记忆之后、触发消息之前",
+    withCron.promptSlots.map(([id]) => id).join(",")
+      === "identity,signature,guide,announcement,skills,history.access,memory.common,summary,transcript,memory.stream,cron,trigger",
+    withCron.promptSlots.map(([id]) => id));
+  check("这块把合并数与要办的事都写进去，并允许这一轮留空正文",
+    withCron.system.includes("合并了 3 个") && withCron.system.includes("看一眼线上告警")
+      && withCron.system.includes("正文留空即可"), withCron.system.slice(0, 400));
+  check("这块说清正就是那条群消息：不许再补发一条把同一件事念两遍",
+    withCron.system.includes("正文会直接进群") && withCron.system.includes("别再补发一条"));
+  check("排程块标注为易变：它不该打断员工平时接活的那段前缀",
+    PROMPT_SECTIONS.find((section) => section.id === "cron")?.volatile === true);
+  check("不是排程的那一轮不落这一块", !composed.promptSlots.some(([id]) => id === "cron"));
+  await cronMock.close();
+
+  step("\n§27 交付物：present 工具、消息级卡片与提交点");
+  const presentMock = await startMockUpstream();
+  await call("agents.update", {
+    token: ana, body: { id: mockAgentId, api_base_url: `http://127.0.0.1:${presentMock.port}/v1` },
+  });
+  const x27Key = (await call("streams.mcpkey.rotate", { token: ana, body: { stream_id: streamId } })).payload.key;
+  const x27Ledger = await call("files.upload", {
+    token: ana, body: { stream_id: streamId, name: "交付台账.md", content: "# 交付台账\n灰度通过" },
+  });
+  await call("files.upload", { token: ana, body: { stream_id: streamId, name: "只交的清单.txt", content: "清单" } });
+  await call("files.upload", { token: ana, body: { stream_id: streamId, name: "交付后崩的台账.md", content: "崩前交完" } });
+  await call("files.upload", { token: ana, body: { stream_id: streamId, name: "排程巡检表.md", content: "巡检" } });
+  // 别的群才有的文件：present 只能指向本群的文件行。
+  const x27OtherStream = await call("streams.create", { token: ana, body: { name: "交付隔离组" } });
+  await call("files.upload", {
+    token: ana,
+    body: { stream_id: x27OtherStream.payload.stream?.id, name: "别群的秘密.md", content: "只有那个群有" },
+  });
+  const x27Chats = async () => (await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items ?? [];
+  const x27ReplyOf = async (keyword) => (await x27Chats())
+    .filter((row) => row.sender_id === mockAgentId).find((row) => String(row.content).includes(keyword));
+  const x27CardOf = async (fileName) => (await x27Chats())
+    .filter((row) => row.sender_id === mockAgentId).find((row) => (row.presented ?? []).some((item) => item.name === fileName));
+  const x27StepsOf = async (mailId) => (await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: mailId } })).payload.steps ?? [];
+
+  const x27Mail = await sendFor("@小M 把交付台账交出去（交付台账）");
+  const x27Reply = await x27ReplyOf("台账交出去了");
+  check("present 之后回复消息挂上交付卡片：文件名、大小与交付说明都在卡片上",
+    x27Reply?.presented?.length === 1 && x27Reply.presented[0].name === "交付台账.md"
+      && x27Reply.presented[0].file_id === x27Ledger.payload.file?.id
+      && String(x27Reply.presented[0].note).includes("按这份台账验收"), x27Reply?.presented);
+  check("卡片只带引用不带原件：正文仍在 app.files，翻页不会拖着文件内容",
+    Object.keys(x27Reply?.presented?.[0] ?? {}).sort().join(",") === "content_type,file_id,name,note,size_bytes"
+      && !JSON.stringify(x27Reply?.presented ?? []).includes("灰度通过"), x27Reply?.presented?.[0]);
+  const x27PresentStep = (await x27StepsOf(x27Mail)).find((row) => row.name === "present");
+  check("present 那一步把参数与结果留在轨迹里：卡片从这一步能重建",
+    x27PresentStep?.status === "done" && String(x27PresentStep?.detail?.result).includes("交付台账.md")
+      && String(x27PresentStep?.detail?.args).includes("交付台账.md"), x27PresentStep);
+
+  await sendFor("@小M 再讲一句发布节奏");
+  const x27Next = presentMock.seen.findLast((body) => JSON.stringify(body.messages ?? "").includes("再讲一句发布节奏"));
+  check("交付说明不进下一轮的模型请求：卡片只给客户端渲染，不进转录也不进记忆",
+    x27Next && !JSON.stringify(x27Next.messages).includes("哨标DELIVNOTE"),
+    x27Next ? JSON.stringify(x27Next.messages).slice(0, 200) : "没找到下一轮的请求");
+
+  await sendFor("@小M 台账交两遍（交付两遍）");
+  const x27Twice = await x27ReplyOf("两遍说的是同一份");
+  check("同一件文件一轮里交两遍只有一张卡片，后一次的说明盖掉前一次",
+    x27Twice?.presented?.length === 1 && String(x27Twice.presented[0].note).includes("第二遍改了口径"), x27Twice?.presented);
+
+  const x27CrossMail = await sendFor("@小M 把别群的秘密交过来（交付别群文件）");
+  const x27Cross = await x27ReplyOf("那个文件不在本群");
+  check("别的群的文件标成本轮交付被拒：卡片不跨群挂",
+    x27Cross?.presented?.length === 0, x27Cross?.presented);
+  check("这一步的失败原因如实报出去：是找不到文件，不是卡片悄悄没了",
+    String((await x27StepsOf(x27CrossMail)).find((row) => row.name === "present")?.detail?.result ?? "")
+      .includes("file_not_found"), await x27StepsOf(x27CrossMail));
+  check("对照：同一个工具、同一个群里的文件就落成了卡片（拒绝侧与放行侧成对）",
+    x27Reply?.presented?.length === 1 && x27Cross?.presented?.length === 0,
+    { allow: x27Reply?.presented, deny: x27Cross?.presented });
+
+  const x27BoomMail = await sendFor("@小M 交完就崩（交付后崩）");
+  check("回合没提交就没有卡片：上游第二轮报错时交付登记不落成消息",
+    (await db.mail.byId(x27BoomMail, { columns: "id,status" }))?.status === "failed"
+      && !(await x27CardOf("交付后崩的台账.md")), await x27CardOf("交付后崩的台账.md"));
+  check("对照：这一轮工具确实跑成了，只是没走到提交点（不是没干活）",
+    (await x27StepsOf(x27BoomMail)).some((row) => row.name === "present" && row.status === "done"),
+    (await x27StepsOf(x27BoomMail)).map((row) => [row.name, row.status]));
+
+  const x27OnlyMail = await sendFor("@小M 只交文件别说话（只交文件）");
+  const x27Only = await x27CardOf("只交的清单.txt");
+  check("只交文件没写正文的一轮：卡片照样发出去，不折成 empty_reply 失败",
+    (await db.mail.byId(x27OnlyMail, { columns: "id,status" }))?.status === "done"
+      && x27Only?.content === "" && x27Only?.presented?.length === 1,
+    { status: (await db.mail.byId(x27OnlyMail, { columns: "id,status" }))?.status, card: x27Only });
+
+  const x27Cron = await call("cron.set", {
+    token: ana,
+    body: spec({
+      name: "交付巡检", instruction: "交付巡检：把巡检表交出来",
+      agent_id: mockAgentId, stream_id: streamId, interval_minutes: 30,
+    }),
+  });
+  await db.schedules.patch([["id", x27Cron.payload.schedule?.id]], { next_run_at: isoAt(Date.now() - 5 * 60_000) });
+  const x27CronTick = await call("scheduler.tick", { token: ana, method: "GET" });
+  const x27CronCard = await x27CardOf("排程巡检表.md");
+  check("排程那一轮只交文件不写正文：交付优先于静默，到点干的活要在群里看得见",
+    (x27CronTick.payload.ran ?? []).some((row) => row.mode === "delivery" && row.status === "done")
+      && x27CronCard?.content === "" && x27CronCard?.presented?.length === 1,
+    { ran: x27CronTick.payload.ran?.map((row) => row.mode), card: x27CronCard });
+
+  const x27ToolScope = { agentId: mockAgentId, streamId, ownerId: anaId };
+  const x27LongNote = await toolSafe(x27ToolScope, "present", { name: "交付台账.md", note: "字".repeat(80) });
+  check("交付说明超上限整条拒绝，不悄悄截短", x27LongNote?.error === "invalid_note", x27LongNote);
+  const x27ShortNote = await toolSafe(x27ToolScope, "present", { name: "交付台账.md", note: "限内的一行说明" });
+  check("对照：限内的说明登记得成（同一把尺子的放行侧）",
+    x27ShortNote?.entry?.note === "限内的一行说明" && x27ShortNote?.entry?.file_id === x27Ledger.payload.file?.id,
+    x27ShortNote);
+  const x27NoSelector = await toolSafe(x27ToolScope, "present", { note: "没说要交哪个文件" });
+  check("既没 id 也没文件名：整条拒绝，不猜要交哪一个",
+    x27NoSelector?.error === "file_selector_required", x27NoSelector);
+
+  const x27McpTools = await rawMcp(x27Key, { jsonrpc: "2.0", id: 1, method: "tools/list" });
+  check("对外 MCP 的清单里没有 present：卡片要挂在员工回合上，外部调用不属于任何回合",
+    !(x27McpTools.result?.tools ?? []).some((row) => row.name === "present"),
+    (x27McpTools.result?.tools ?? []).map((row) => row.name));
+  const x27McpCall = await rawMcp(x27Key, {
+    jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "present", arguments: { name: "交付台账.md" } },
+  });
+  check("外部钥匙硬点 present 被挡在清单外", x27McpCall.error?.message === "tool_not_allowed", x27McpCall);
+  const x27McpFiles = await rawMcp(x27Key, {
+    jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_files", arguments: {} },
+  });
+  check("对照：外部钥匙照常读得到群文件，挡的只是这一件没有回合可挂的工具",
+    !x27McpFiles.result?.error && String(x27McpFiles.result?.content?.[0]?.text).includes("交付台账.md"),
+    x27McpFiles.result);
+  await presentMock.close();
+
+  step("\n§28 上游坏德性：半截与断流不算回复、状态码要有名字，修好后重新 @ 才再来一次");
+  const x28Mock = await startMockUpstream();
+  await call("agents.update", {
+    token: ana, body: { id: mockAgentId, api_base_url: `http://127.0.0.1:${x28Mock.port}/v1` },
+  });
+  const x28Chats = async () => (await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items ?? [];
+  const x28MailOf = async (mailId) => await db.mail.byId(mailId, { columns: "id,status,error" });
+  const x28StepsOf = async (mailId) => (await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: mailId } })).payload.steps ?? [];
+
+  x28Mock.scripts.chat = "half";
+  const x28HalfMail = await sendFor("@小M 这段说到一半就断");
+  const x28Half = await x28MailOf(x28HalfMail);
+  check("流走到尽头既没 [DONE] 也没 finish_reason：这轮标失败，不拿半截正文冒充回复",
+    x28Half?.status === "failed" && x28Half?.error === "upstream_stream_incomplete", x28Half);
+  const x28HalfRoom = (await x28Chats()).filter((row) => String(row.content).includes("这段回复"));
+  check("半截正文一个字都没进群：同事看不到一句缺尾巴的话", x28HalfRoom.length === 0, x28HalfRoom);
+  // messages.list 回的是按 seq 升序的一页，所以"最新那条"取末尾而不是取头。
+  const x28HalfSys = (await x28Chats())
+    .filter((row) => row.sender_type === "system" && String(row.content).includes("没能完成")).at(-1);
+  check("群里那句失败提示带错误码，并且不再谎称邮箱会自动重试（没有自动重投这条路）",
+    String(x28HalfSys?.content).includes("upstream_stream_incomplete")
+      && !String(x28HalfSys?.content).includes("可重试"), x28HalfSys?.content);
+  const x28HalfStep = (await x28StepsOf(x28HalfMail)).find((row) => row.kind === "model");
+  check("模型那一步在轨迹里落同一个码：界面那句为什么失败对得上后台记录",
+    x28HalfStep?.status === "failed" && x28HalfStep?.error === "upstream_stream_incomplete", x28HalfStep);
+  check("失败的那轮没有未合上的步骤：状态只在提交点发布",
+    (await x28StepsOf(x28HalfMail)).every((row) => row.status !== "running"),
+    (await x28StepsOf(x28HalfMail)).map((row) => [row.kind, row.status]));
+
+  x28Mock.scripts.chat = "eof";
+  const x28EofMail = await sendFor("@小M 一个字节都没吐就挂断");
+  const x28Eof = await x28MailOf(x28EofMail);
+  check("连着但空着：报的是断流，不塌成一句看不出原因的 empty_reply",
+    x28Eof?.status === "failed" && x28Eof?.error === "upstream_stream_incomplete", x28Eof);
+
+  x28Mock.scripts.chat = "500";
+  const x28BoomMail = await sendFor("@小M 上游自己崩了");
+  const x28Boom = await x28MailOf(x28BoomMail);
+  check("上游 5xx 落成有名字的码，不是裸状态串「500」",
+    x28Boom?.status === "failed" && x28Boom?.error === "upstream_server_error", x28Boom);
+
+  // 三条坏德性都是开关，不是关键词：拨回 ok 之后同一批人重新 @ 就该正常跑完，
+  // 否则前面那几条检查分不清"上游修好了"和"邮箱被上一封锁死了"。
+  x28Mock.scripts.chat = "ok";
+  const x28BackMail = await sendFor("@小M 上游修好了再来一次");
+  const x28Back = await x28MailOf(x28BackMail);
+  check("对照：开关拨回正常后重新 @ 的那封跑成并把正文落群（失败不锁邮箱）",
+    x28Back?.status === "done"
+      && (await x28Chats()).some((row) => row.sender_id === mockAgentId && String(row.content).includes("已按时间排好")),
+    { mail: x28Back, newest: (await x28Chats()).filter((row) => row.sender_id === mockAgentId).at(-1)?.content });
+  const x28HalfAgain = await x28MailOf(x28HalfMail);
+  check("坏掉的那三封仍停在 failed：恢复只认新的一封信，不回头改写旧结局",
+    [x28HalfAgain?.status, (await x28MailOf(x28EofMail))?.status, (await x28MailOf(x28BoomMail))?.status]
+      .every((status) => status === "failed"), x28HalfAgain);
+  await x28Mock.close();
+
   console.log(`\n结果：${passed} 项通过，${failures.length} 项失败`);
   if (failures.length) {
     console.log(`失败：\n- ${failures.join("\n- ")}`);
@@ -3005,4 +3782,9 @@ main()
     console.error("自检崩溃：", error);
     process.exitCode = 1;
   })
-  .finally(() => rmSync(dir, { recursive: true, force: true }));
+  .finally(() => {
+    rmSync(dir, { recursive: true, force: true });
+    // 半路崩了就没走到那些 .close()：假上游的监听还挂着，事件循环永远不空，
+    // npm run qa 会一直挂着而不报失败。等 stdout 排空再退，失败行不会被截掉。
+    if (process.exitCode) process.stdout.write("", () => process.exit(process.exitCode));
+  });

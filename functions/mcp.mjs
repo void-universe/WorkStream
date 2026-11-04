@@ -79,6 +79,18 @@ const TOOL_DEFINITIONS = [
   {
     type: "function",
     function: {
+      name: "present",
+      description: "把本群的一个群文件标成这次回答的交付物：你的回复下面会出现一张交付卡片，同事不必从正文里猜最终成果是哪个文件。文件得先在本群里（用 upload_file 传上来的），一轮里可以交好几件，同一件交两次只有一张卡片。",
+      parameters: shape({
+        id: { type: "string", description: "群文件 id，upload_file 的返回里带" },
+        name: { type: "string", description: "按文件名找，和 id 二选一" },
+        note: { type: "string", description: "一句话讲这份交付物怎么用，最多 200 字" },
+      }),
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "get_announcement",
       description: "读取本群当前公告与更新时间。",
       parameters: shape(),
@@ -216,6 +228,9 @@ const READ_TOOL_NAMES = [
   "list_skills", "read_skill", "list_my_resources",
 ];
 const INTERNAL_ONLY = new Set([
+  // present 只在员工回路里有意义：卡片要挂在本次回合那条回复上，对外 MCP 的调用不属于任何回合，
+  // 放它进来只会回一个 ok 而群里什么都没出现。
+  "present",
   "list_my_resources", "create_stream", "add_agent_to_stream", "register_vm", "grant_vm", "set_signature",
 ]);
 
@@ -466,6 +481,27 @@ const TOOL_HANDLERS = {
     } catch (error) {
       return { error: error?.error ?? "file_delete_failed" };
     }
+  },
+  present: async ({ db, args, streamId }) => {
+    const id = args.id ? uuid(args.id, "id") : null;
+    const wanted = args.name ? text(args.name, { max: 120, name: "name" }) : null;
+    if (!id && !wanted) return { error: "file_selector_required" };
+    const note = args.note ? text(args.note, { max: 200, name: "note" }) : "";
+    // 只在本群的文件行里找：别的群的同名文件不算，交付卡片也不许跨群挂过去。
+    const rows = await db.files.list([["stream_id", streamId]], {
+      columns: "id,name,size_bytes,content_type", limit: 200,
+    });
+    const file = rows.find((row) => (id ? row.id === id : row.name === wanted));
+    if (!file) return { error: "file_not_found" };
+    return {
+      ok: true,
+      // 这里只是把交付物登记给引擎：卡片要等这一轮的回复落群才发布，
+      // 中途报错或被叫停就没有那条回复，也就没有卡片。
+      entry: {
+        file_id: file.id, name: file.name, content_type: file.content_type,
+        size_bytes: file.size_bytes, note,
+      },
+    };
   },
   get_announcement: async ({ db, scope, args, env, streamId }) => {
     const stream = await db.streams.byId(streamId, {

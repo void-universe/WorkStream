@@ -2,6 +2,7 @@
 import { open, seal } from "./sec.mjs";
 import { agentPresence } from "./presence.mjs";
 import { askCloudAgent, checkCloudAccess, parseAgentId } from "./qca.mjs";
+import { BACKENDS, BACKEND_IDS, DEMO_BASE_URL, backendFor } from "./backends.mjs";
 import { DEMO_QUOTABLE_HEADERS } from "./prompt.mjs";
 import { installDefaultSkillsFor, skillsForAgent } from "./skills.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, Interrupted, avatarData, int, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
@@ -79,7 +80,7 @@ export const actions = {
   async "agents.create"({ db, user, body, env }) {
     const name = text(body.name, { max: 48, name: "name" });
     const role = text(body.role, { max: 400, name: "role" });
-    const backend = oneOf(body.backend ?? "openai", ["openai", "qca"], "backend");
+    const backend = oneOf(body.backend ?? "openai", BACKEND_IDS, "backend");
     const target = safeApiBaseUrl(body.api_base_url, { allowPrivate: privateAllowed(env) });
     const apiKey = text(body.api_key, { max: 400, name: "api_key" });
     // 云端 Agent 的模型由云上那份定义决定，本地只留一个展示名。
@@ -93,7 +94,7 @@ export const actions = {
     const contextChars = int(body.context_chars, {
       min: 2000, max: CONTEXT_CHARS_MAX, name: "context_chars", fallback: CONTEXT_CHARS_DEFAULT,
     });
-    if (backend === "openai" && target.scheme === "demo" && model !== "demo") throw new Halt("demo_needs_demo_model", 400);
+    assertBackendPair(backend, target.url, model);
     const sealed = await seal(apiKey, { supabase: db.client, env });
     const id = newId();
     const created = await db.agents.insert({
@@ -149,7 +150,7 @@ export const actions = {
     }
     if (body.status !== undefined) values.status = oneOf(body.status, ["active", "paused"], "status");
     if (body.backend !== undefined) {
-      const next = oneOf(body.backend, ["openai", "qca"], "backend");
+      const next = oneOf(body.backend, BACKEND_IDS, "backend");
       // 换后端等于换一类凭据（sk- 的 Key 和 pt- 的 PAT 不能混用），没给新凭据就挡住，
       // 别让员工带着错凭据上岗、每轮任务都失败在云端鉴权上。
       if (next !== (agent.backend ?? "openai") && !body.api_key) throw new Halt("agent_key_required_for_backend", 400);
@@ -181,6 +182,9 @@ export const actions = {
       // PAT 换了，云端那侧的 session 归属可能就变了；缓存一律作废，下一轮重新建。
       if ((agent.backend ?? "openai") === "qca") values.qca_environment_id = null;
     }
+    // 改档也要成对：只改地址或只改模型名都可能凑出"云端后端 + 演示地址"这种跑不通的组合。
+    assertBackendPair(values.backend ?? agent.backend ?? "openai",
+      values.api_base_url ?? agent.api_base_url, values.model ?? agent.model);
     const updated = await db.agents.claim([["id", agent.id], ["owner_id", user.id]], values);
     if (!updated) throw new Halt("agent_update_failed", 503);
     const cleared = values.backend === "openai" || values.qca_agent_id !== undefined
@@ -203,29 +207,32 @@ export const actions = {
     for (const link of links) await db.agent_skills.remove([["id", link.id]]);
     // 云端 session 是按 (员工,群) 缓存的对话上下文：员工没了留着只会让下一个同 id 档案串台。
     await db.qca_sessions.removeAll([["agent_id", agent.id]]);
+    // 排程也是挂在"这个员工还会干活"这个前提上的：留着行，时钟照旧一格少走，每次到点投一封注定失败的信。
+    await db.schedules.removeAll([["agent_id", agent.id]]);
     const removed = await db.agents.remove([["id", agent.id], ["owner_id", user.id]]);
     if (!removed) throw new Halt("agent_delete_failed", 503);
     return json({ ok: true, id: agent.id });
   },
 
-  /** 连接自检：自建端点发一条极短对话；云端 Agent 只验 PAT 与地址成对（不建 session，不动用量）。 */
+  /** 连接自检：云端 Agent 只验 PAT 与地址成对（不建 session，不动用量），其余通道走同一派发口发一条极短对话。 */
   async "agents.test"({ db, user, body, env }) {
     const agent = await ownedAgent(db, user, body.id);
     const secret = await db.agents.byId(agent.id, { columns: AGENT_SECRET_COLUMNS });
     const key = await open(secret?.api_key_cipher, { supabase: db.client, env });
+    const backend = backendFor(agent);
     const started = Date.now();
     try {
-      if ((agent.backend ?? "openai") === "qca") {
+      if (backend.transport === "cloud") {
         const check = await checkCloudAccess({ origin: agent.api_base_url, pat: key });
         return json({
           ok: true,
-          result: { reachable: true, ms: Date.now() - started, mode: "qca", note: `云端可达，可见模型 ${check.models} 个。` },
+          result: { reachable: true, ms: Date.now() - started, mode: backend.id, note: `云端可达，可见模型 ${check.models} 个。` },
         });
       }
-      const result = await chatCompletion({
-        baseUrl: agent.api_base_url,
-        apiKey: key,
-        model: agent.model,
+      const result = await completeForAgent({
+        db,
+        agent,
+        key,
         messages: [{ role: "user", content: "ping" }],
         maxTokens: 8,
         timeoutMs: 20000,
@@ -237,14 +244,7 @@ export const actions = {
     } catch (error) {
       return json({
         ok: true,
-        result: {
-          reachable: false,
-          ms: Date.now() - started,
-          error: upstreamCode(error),
-          note: (agent.backend ?? "openai") === "qca"
-            ? "云端没接受这次自检；检查个人访问令牌是否有效、API 地址是否与你所在区域一致。"
-            : "上游未接受该请求；Key、模型名与 base URL 需一致。",
-        },
+        result: { reachable: false, ms: Date.now() - started, error: upstreamCode(error), note: backend.testNote },
       });
     }
   },
@@ -303,7 +303,23 @@ export const actions = {
 
 const privateAllowed = (env) => env?.("WORKSTREAM_DEV") === "1";
 
-function upstreamCode(error) {
+/**
+ * 后端、地址与模型名三样要成对：demo://local 只在自建通道里有意义（它选中内置演示模型，
+ * 模型名跟着固定成 demo）。挂到云端后端会让这一轮注定连不上——建档/改档就拒，
+ * 别留到员工带着错组合上岗、每轮任务都失败在取不到地址上。
+ */
+function assertBackendPair(backendId, url, model) {
+  if (url !== DEMO_BASE_URL) return;
+  if (backendId === "qca") throw new Halt("qca_needs_real_origin", 400);
+  if (model !== "demo") throw new Halt("demo_needs_demo_model", 400);
+}
+
+/**
+ * 上游那一步到底哪坏了——邮箱、轨迹、界面那句「这次没能完成」都读这一个函数翻出来的码。
+ * 上层拿到的是 Error，不认状态码；码必须在源头就长出来，否则落到库里只剩一个裸的 500。
+ * fallback 管的是"这看着不像上游的毛病"：压缩那一轮填 compress_failed，别把自家代码的错报成连不上上游。
+ */
+export function upstreamCode(error, fallback = "upstream_unreachable") {
   const name = error?.name === "TimeoutError" ? "upstream_timeout" : null;
   if (name) return name;
   // 云端 Agent 的失败自带环节（PAT 被拒 / 找不到 agent / 限流），比笼统的 upstream_* 有用。
@@ -315,25 +331,18 @@ function upstreamCode(error) {
     if (error.status >= 500) return "upstream_server_error";
     return "upstream_bad_request";
   }
-  return error?.code ?? "upstream_unreachable";
+  return error?.code ?? fallback;
 }
 
 /**
  * OpenAI 兼容 /chat/completions 调用。
  * 请求走 SSE 流式：一边收增量一边在分片边界问上层“要不要停”，
  * 这样群里插话能在几百毫秒内掐断正在生成的回复，而不是等它写完。
- * `demo://local` 走内置演示模型：不联网，基于传入的 memory 与历史做抽取式回应，
- * 用来在没有任何真实 Key 时也能端到端跑通 @ 派发、队列、压缩与插话。
+ * 演示端点不走这里：地址等于 demo://local 的员工由清单解析成 demo 那条通道（见 functions/backends.mjs）。
  */
 export async function chatCompletion({
-  baseUrl, apiKey, model, messages, tools, maxTokens, timeoutMs = 120000, summary, onInterrupt,
+  baseUrl, apiKey, model, messages, tools, maxTokens, timeoutMs = 120000, onInterrupt,
 }) {
-  if (baseUrl === "demo://local") {
-    // 演示模型不联网：没有真实思考链和用量，字段一律留空，前端据此标注"演示模型不回报"，
-    // 而不是编一个数字让轨迹看起来像真的。
-    const result = demoComplete({ messages, tools, summary });
-    return { reasoning: "", usage: null, finish_reason: null, first_token_ms: null, ...result };
-  }
   const started = Date.now();
   const body = { model, messages, stream: true, stream_options: { include_usage: true } };
   if (maxTokens) body.max_tokens = maxTokens;
@@ -355,6 +364,9 @@ export async function chatCompletion({
     await response.text().catch(() => "");
     const error = new Error("upstream_rejected");
     error.status = response.status;
+    // 状态码在这里就翻成有名字的错误码：上层落 mail.error 与轨迹只读 error.code，
+    // 只挂 status 的话群里那句「这次没能完成」会写成裸的 500，分不清限流还是上游崩了。
+    error.code = upstreamCode(error);
     throw error;
   }
   if (!response.body) {
@@ -365,18 +377,46 @@ export async function chatCompletion({
   return readUpstreamStream(response.body, { onInterrupt, started });
 }
 
+/** 内置演示模型：不联网，基于传入的 memory 与历史做抽取式回应，用来在没有任何真实 Key 时
+ *  也能端到端跑通 @ 派发、队列、压缩与插话。没有真实思考链和用量，字段一律留空，
+ *  前端据此标注"演示模型不回报"，而不是编一个数字让轨迹看起来像真的。 */
+async function demoRound({ messages, tools, summary }) {
+  return { reasoning: "", usage: null, finish_reason: null, first_token_ms: null, ...demoComplete({ messages, tools, summary }) };
+}
+
 /**
- * 一轮模型调用的分流口：员工挂的是云端 Agent 就走 QCA，否则走 OpenAI 兼容端点。
- * 返回值形状一致（content/reasoning/usage/finish_reason/mode），引擎与轨迹不用关心后端。
- * 云端那条路径不吃 tools：工具在云端 agent 自己那边，我们的群工具不注入。
+ * transport → 实现。清单（functions/backends.mjs）声明了某条 transport 而这里缺一条，
+ * 冷启动就抛——照 mcp.mjs 扫「声明了但没实现」的形状，不留到运行时静默走成自建的分支。
+ * 云端那条的入参里没有 tools：工具在云端 agent 自己那边，我们的群工具不注入。
  */
-export async function completeForAgent({
-  db, agent, streamId, key, messages, tools, maxTokens, timeoutMs, summary, onInterrupt,
-}) {
-  if ((agent.backend ?? "openai") === "qca") {
-    return askCloudAgent({ db, agent, streamId, pat: key, messages, timeoutMs, onInterrupt });
+const TRANSPORT_ROUTES = {
+  chat: ({ agent, key, ...rest }) => chatCompletion({
+    baseUrl: agent.api_base_url, apiKey: key, model: agent.model, ...rest,
+  }),
+  demo: ({ messages, tools, summary }) => demoRound({ messages, tools, summary }),
+  cloud: ({ db, agent, streamId, key, messages, timeoutMs, onInterrupt, persistSession }) =>
+    askCloudAgent({ db, agent, streamId, pat: key, messages, timeoutMs, onInterrupt, persistSession }),
+};
+
+{
+  const implemented = new Set(Object.keys(TRANSPORT_ROUTES));
+  const declared = new Set(BACKENDS.map((entry) => entry.transport));
+  const missing = [...declared].filter((name) => !implemented.has(name));
+  const orphan = [...implemented].filter((name) => !declared.has(name));
+  if (missing.length || orphan.length) {
+    throw new Error(`后端路由对不上清单：${[...missing.map((name) => `缺实现 ${name}`), ...orphan.map((name) => `清单里没有 ${name}`)].join("、")}`);
   }
-  return chatCompletion({ baseUrl: agent.api_base_url, apiKey: key, model: agent.model, messages, tools, maxTokens, timeoutMs, summary, onInterrupt });
+}
+
+/**
+ * 一轮模型调用的唯一分流口：按员工档案解析出后端条目，再按它的 transport 派发。
+ * 返回值形状一致（content/reasoning/usage/finish_reason/mode），引擎与轨迹不用关心后端。
+ * 入参一律原样递给那条通道，各自只取自己要的：过去在这里手写分支时漏传过 persistSession，
+ * 压缩那轮"不复用群里 session"的注释就成了假话——加字段只要写进表和签名就不会再丢。
+ */
+export async function completeForAgent({ db, agent, streamId, key, messages, tools, maxTokens, timeoutMs, summary, onInterrupt, persistSession }) {
+  const route = TRANSPORT_ROUTES[backendFor(agent).transport];
+  return route({ db, agent, streamId, key, messages, tools, maxTokens, timeoutMs, summary, onInterrupt, persistSession });
 }
 
 const IDLE_MS = 800;
@@ -412,6 +452,7 @@ async function readUpstreamStream(stream, { onInterrupt, started }) {
   let usage = null;
   let finishReason = null;
   let firstTokenMs = null;
+  let sawDone = false;
   let inflight = null;
   const ensureRead = () => {
     if (!inflight) inflight = reader.read().then((result) => { inflight = null; return result; });
@@ -434,6 +475,7 @@ async function readUpstreamStream(stream, { onInterrupt, started }) {
     if (parsed?.error) {
       const error = new Error("upstream_rejected");
       error.status = Number(parsed.error.code) >= 100 && Number(parsed.error.code) < 600 ? Number(parsed.error.code) : 502;
+      error.code = upstreamCode(error);
       throw error;
     }
     const choice = parsed?.choices?.[0];
@@ -478,9 +520,18 @@ async function readUpstreamStream(stream, { onInterrupt, started }) {
       buffer = buffer.slice(newline + 1);
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
-      if (payload && payload !== "[DONE]") feed(payload);
+      if (payload === "[DONE]") sawDone = true;
+      else if (payload) feed(payload);
     }
     await abort();
+  }
+  // 走到流的尽头，既没等到 [DONE] 也没等到 finish_reason：这条连接是中途断的，半截正文不是回复。
+  // 照云端那条通道的做法如实报错（functions/qca.mjs 的 qca_stream_ended_unfinished），
+  // 别把断流当成"这轮说完了"——群里会留下一句永远缺尾巴的话，邮箱还标着 done。
+  if (!sawDone && !finishReason) {
+    const error = new Error("upstream_stream_incomplete");
+    error.code = "upstream_stream_incomplete";
+    throw error;
   }
   const calls = [...toolCalls.values()].filter((slot) => slot.name);
   return {

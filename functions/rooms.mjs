@@ -5,8 +5,9 @@ import { delegateStatus } from "./delegate.mjs";
 import { STREAM_COLUMNS, humanMembership, requireMembership, requireRole } from "./perm.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, email as emailOf, int, json, newId, now, oneOf, text, uuid } from "./util.mjs";
 
-const MESSAGE_COLUMNS =
-  "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,attachments,on_behalf_of,created_at";
+// 消息行的唯一列清单：写（这里）与读（chat.mjs 的翻页）共用一份，加一列只改一处。
+export const MESSAGE_COLUMNS =
+  "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,attachments,presented,on_behalf_of,created_at";
 const FILE_COLUMNS = "id,stream_id,name,size_bytes,content_type,store,uploaded_by,created_at";
 export const MAX_FILE_BYTES = 400_000;
 
@@ -104,7 +105,7 @@ export async function nextSeq(db, streamId) {
   throw new Halt("seq_contention", 503);
 }
 
-async function insertMessage(db, { streamId, senderType, senderId, senderName, content, mentions, replyTo, kind, attachments, onBehalfOf }) {
+async function insertMessage(db, { streamId, senderType, senderId, senderName, content, mentions, replyTo, kind, attachments, presented, onBehalfOf }) {
   const seq = await nextSeq(db, streamId);
   const row = await db.messages.insert({
     id: newId(),
@@ -119,6 +120,8 @@ async function insertMessage(db, { streamId, senderType, senderId, senderName, c
     kind: kind ?? (senderType === "system" ? "system" : "chat"),
     error: null,
     attachments: attachments ?? [],
+    // 这一轮交出的群文件卡片；正文空着但有交付时也算交出过东西，所以照样落一行。
+    presented: presented ?? [],
     // 替身代答时记下 ta 替谁说话：署名仍是替身自己，群里要看得见不是本人发言。
     on_behalf_of: onBehalfOf ?? null,
     created_at: now(),
@@ -551,6 +554,8 @@ export const actions = {
     await db.slice_prefs.removeAll([["stream_id", streamId]]);
     await db.qca_sessions.removeAll([["stream_id", streamId]]);
     await db.stream_vms.removeAll([["stream_id", streamId]]);
+    // 排程也是挂在(员工,群)上的配置：群停用就把行删掉，否则到点判定还在为一个不存在的群投信。
+    await db.schedules.removeAll([["stream_id", streamId]]);
     // 正文一律清空：系统提示里也带着文件名与公告正文，按 kind 只清聊天会漏出内容。
     await db.messages.patch([["stream_id", streamId]], {
       content: "[群已删除]", kind: "system", updated_at: now(),

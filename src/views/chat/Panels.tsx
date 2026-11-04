@@ -25,7 +25,7 @@ import { defaultFlashColors, readStreamFlash, saveFlashColors, type FlashColors,
 import { CopyButton, CopyChip, Notice, PersonAvatar, RoleBadge, SectionTitle, TextInput } from "../../lib/ui";
 // 只 import 清单文件：内置渲染器是在那里被登记进注册表的，直接 import fileRenderers 会拿到一张空表。
 import { renderGroupFile } from "../../lib/renderers/index.mjs";
-import type { AgentPresence, DelegateStatus, GroupFile, Member, Request, StreamDetail, Vm } from "../../types";
+import type { AgentPresence, DelegateStatus, GroupFile, Member, Presented, Request, StreamDetail, Vm } from "../../types";
 
 type Props = {
   detail: StreamDetail;
@@ -446,7 +446,7 @@ function AnnouncementSection({ detail, reload }: Pick<Props, "detail" | "reload"
 type Rendered = Awaited<ReturnType<typeof renderGroupFile>>;
 type Preview = { file: GroupFile; loading: boolean; content: string; signedUrl?: string; error: string; rendered: Rendered };
 
-export function FilesSection({ detail, reload }: Props) {
+export function FilesSection({ detail, reload, focus }: Props & { focus?: Presented | null }) {
   const [files, setFiles] = useState<GroupFile[]>(detail.files);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [name, setName] = useState("");
@@ -454,18 +454,44 @@ export function FilesSection({ detail, reload }: Props) {
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<Preview | null>(null);
 
-  async function refresh() {
+  // 返回这次列表拿到的行（失败返回 null），交付卡片定位原件时要靠它决定要不要再报一句"文件不在了"。
+  async function refresh(): Promise<GroupFile[] | null> {
     try {
       const result = await get<{ ok: true; items: GroupFile[] }>("files.list", { stream_id: detail.stream.id });
       setFiles(result.items);
+      return result.items;
     } catch (error) {
       toast.error(describeError(error));
+      return null;
     }
   }
 
   useEffect(() => {
     void refresh();
   }, [detail.stream.id]);
+
+  // 从交付卡片点进来：按 id 在群文件里找到原件，直接打开预览。
+  // 本地列表可能是上传/删除之前的，找不到时先刷一次再找；刷过还没有才说原件不在了。
+  useEffect(() => {
+    if (!focus) return;
+    let stopped = false;
+    const open = async (rows: GroupFile[] | null) => {
+      const found = rows?.find((row) => row.id === focus.file_id);
+      if (found) {
+        void openPreview(found);
+        return;
+      }
+      const again = await refresh();
+      if (stopped) return;
+      const refreshed = again?.find((row) => row.id === focus.file_id);
+      if (refreshed) void openPreview(refreshed);
+      else if (again) toast.error(`交付卡片指向的「${focus.name}」已不在群文件里。`);
+    };
+    void open(files);
+    return () => {
+      stopped = true;
+    };
+  }, [focus]);
 
   async function pickFile(file: File) {
     if (file.size > 400_000) {

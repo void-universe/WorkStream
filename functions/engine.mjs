@@ -1,11 +1,13 @@
 // 调度与虚拟员工执行引擎：邮箱 FIFO + 按权重的时间片、上下文压缩、MCP 工具回路。
-import { AGENT_COLUMNS, AGENT_SECRET_COLUMNS, completeForAgent } from "./agents.mjs";
+import { AGENT_COLUMNS, AGENT_SECRET_COLUMNS, completeForAgent, upstreamCode } from "./agents.mjs";
+import { backendFor } from "./backends.mjs";
 import { armInterrupt, disarmInterrupt, fireInterrupt } from "./bus.mjs";
 import { shapeMessage, streamWeight } from "./chat.mjs";
+import { fireDueSchedules } from "./cron.mjs";
 import { queueDelegateMail } from "./delegate.mjs";
 import { executeTool, INTERNAL_TOOL_NAMES, toolDefinitions } from "./mcp.mjs";
 import { connectorToolDefs } from "./plugins.mjs";
-import { composeAsk, composeSystemPrompt, isCloudBackend } from "./prompt.mjs";
+import { composeAsk, composeSystemPrompt } from "./prompt.mjs";
 import { open } from "./sec.mjs";
 import { insertMessage, nextSeq } from "./rooms.mjs";
 import { requireMembership } from "./perm.mjs";
@@ -34,6 +36,11 @@ export const actions = {
     const agentIds = myAgents.map((a) => a.id);
     if (!agentIds.length) return json({ ok: true, ran: [], queued: 0, since });
 
+    // 排程在这一轮醒来：先把这位主人名下到点的排程投成信，再按平时的方式取排队——
+    // 同一个 tick 就能把新投的信跑掉，不用多等一轮。扫的是 (owner_id, next_run_at) 索引，
+    // 到期行少时几乎不花钱；没到期只多一条空查询。
+    const cronFired = await fireDueSchedules(db, { ownerId: user.id });
+
     const queuedAll = await db.mail.list([
       ["agent_id", agentIds], ["stream_id", streamIds], ["status", "queued"],
     ], {
@@ -41,7 +48,7 @@ export const actions = {
       order: ["created_at", { ascending: true }], limit: 200,
     });
     await reapStale(db);
-    if (!queuedAll.length) return json({ ok: true, ran: [], queued: 0, since });
+    if (!queuedAll.length) return json({ ok: true, ran: [], queued: 0, since, cron: cronFired });
 
     // 同一个 (员工, 群) 一轮只放最早的一封：并发跑两封，后一封的上下文里就没有前一封的回复，落群顺序还会倒置。
     // 认领是 queued→running 的单行 CAS，两轮同时看上同一封时只有一轮赢；输的那轮直接跳过、不退而求其次，
@@ -55,8 +62,9 @@ export const actions = {
     for (const item of queuedAll) {
       const key = `${item.agent_id}:${item.stream_id}`;
       if (taken.has(key)) continue;
-      // 后台压缩信让位给真人触发的那封，否则压缩排在前面时每次回复都要多等一轮。
-      if (item.meta?.kind === "compress") {
+      // 后台信让位给真人触发的那封：压缩排在前面时每次回复都要多等一轮；排程是"没人叫我也该干活"，
+      // 但同事在线等回答时，先答人——排程不缺一轮，欠下的对点下一轮照样按时钟追上来。
+      if (item.meta?.kind === "compress" || item.meta?.kind === "cron") {
         background.push(item);
         continue;
       }
@@ -69,7 +77,7 @@ export const actions = {
       taken.add(key);
       queued.push(item);
     }
-    if (!queued.length) return json({ ok: true, ran: [], queued: queuedAll.length, since });
+    if (!queued.length) return json({ ok: true, ran: [], queued: queuedAll.length, since, cron: cronFired });
 
     const budget = sliceBudget(env);
     const byAgent = new Map();
@@ -115,7 +123,7 @@ export const actions = {
     const left = await db.mail.list([
       ["agent_id", agentIds], ["stream_id", streamIds], ["status", "queued"],
     ], { columns: "id", limit: 200 });
-    return json({ ok: true, ran, queued: left.length, budget, since: Date.now() });
+    return json({ ok: true, ran, queued: left.length, budget, since: Date.now(), cron: cronFired });
   },
 
   async "scheduler.board"({ db, user }) {
@@ -371,7 +379,9 @@ export async function runTask({ db, env, mailId }) {
 
   let prepared = await assemble({ db, agent, stream });
   const skills = await skillPrompt(db, agent.id);
-  let built = await buildContext({ db, agent, stream, prepared, trigger, skills, delegate });
+  // 排程醒来的那一轮：到点时刻、欠了几个对点、要办的事都在这封信的 meta 里，装配不再回查排程行。
+  const cronTask = mail.meta?.kind === "cron" ? mail.meta.cron ?? null : null;
+  let built = await buildContext({ db, agent, stream, prepared, trigger, skills, delegate, cron: cronTask });
   let used = size(built.messages);
 
   // 超预算不在关键路径里调模型：先按字符预算从窗口头部确定性裁剪（摘要滞后一轮），
@@ -387,7 +397,8 @@ export async function runTask({ db, env, mailId }) {
     }
     if (dropped > 0) {
       prepared = { ...prepared, window: prepared.window.slice(dropped) };
-      built = await buildContext({ db, agent, stream, prepared, trigger: currentTrigger, skills, delegate });
+      // 裁剪后重建也要带上排程块：漏掉它，超长窗口的排程轮次只剩转录，模型看不到要办的事。
+      built = await buildContext({ db, agent, stream, prepared, trigger: currentTrigger, skills, delegate, cron: cronTask });
       used = size(built.messages);
       needsCompress = true;
     }
@@ -423,11 +434,13 @@ export async function runTask({ db, env, mailId }) {
       break;
     } catch (error) {
       if (!(error instanceof Interrupted)) {
-        const code = error?.name === "TimeoutError" ? "upstream_timeout" : error?.code ?? error?.status ?? "upstream_unreachable";
+        const code = upstreamCode(error);
         await finish(db, mailId, "failed", String(code));
         await insertMessage(db, {
           streamId: stream.id, senderType: "system", senderId: agent.owner_id, senderName: "系统",
-          content: `虚拟员工「${agent.name}」这次没能完成：${code}。任务保留在邮箱里可重试。`,
+          // 邮箱里没有自动重投：claim 只从 queued 走 CAS，跑坏的这封直接结在 failed。
+          // 所以这句要说清下一步在谁手里——重新 @ 才会再生成一封，而不是等它自己缓过来。
+          content: `虚拟员工「${agent.name}」这次没能完成：${code}。要再试请重新 @ 他。`,
         });
         return { status: "failed", error: String(code) };
       }
@@ -445,7 +458,7 @@ export async function runTask({ db, env, mailId }) {
       absorbed.push({ id: next.id, seq: Number(next.seq ?? 0) });
       prepared = await assemble({ db, agent, stream });
       built = await buildContext({
-        db, agent, stream, prepared, trigger: next, skills, delegate,
+        db, agent, stream, prepared, trigger: next, skills, delegate, cron: cronTask,
         steerNote: `上一条回复说到一半被 @ 你的新消息打断了。已输出的半截是：${truncate(error.payload.partial ?? "", 400)}。请以这条插话为准，重新给出完整回应。`,
       });
       used = size(built.messages);
@@ -453,7 +466,29 @@ export async function runTask({ db, env, mailId }) {
   }
 
   const content = text(reply.content ?? "", { max: 8000, required: false });
+  const presented = reply.presented ?? [];
   if (!content) {
+    // 只交了文件、一个字没说：卡片照样要发出去。这一轮的活确实干完了，
+    // 让它落回 empty_reply 或静默，等于交付物进了群里却没人知道。
+    if (presented.length) {
+      const delivered = await insertMessage(db, {
+        streamId: stream.id,
+        senderType: "agent",
+        senderId: agent.id,
+        senderName: agent.name,
+        content: "",
+        presented,
+        onBehalfOf: represented?.id ?? null,
+      });
+      await finish(db, mailId, "done", null);
+      return { status: "done", mode: "delivery", message_id: delivered.id, presented, ms: reply.ms };
+    }
+    // 排程那一轮允许静默：到点看一眼、没有要说的事，就安静回去，而不是往群里塞一句"本次无内容"。
+    // 真人 @ 的轮次回空正文仍然是失败——同事在等着回答，空手回一句等于没干。
+    if (cronTask) {
+      await finish(db, mailId, "done", null);
+      return { status: "done", mode: "cron", silent: true, ms: reply.ms };
+    }
     await finish(db, mailId, "failed", "empty_reply");
     return { status: "failed", error: "empty_reply" };
   }
@@ -465,6 +500,7 @@ export async function runTask({ db, env, mailId }) {
     senderName: agent.name,
     content,
     mentions,
+    presented,
     onBehalfOf: represented?.id ?? null,
   });
   await db.memories.insert({
@@ -503,7 +539,8 @@ export async function runTask({ db, env, mailId }) {
     }, { columns: "id" });
   }
   if (needsCompress) await queueCompression(db, { agentId: agent.id, streamId: stream.id });
-  return { status: "done", seq: message.seq, mode: reply.mode, ms: reply.ms };
+  // mode 报的是"这一轮是什么活"（与压缩那一轮同一口径）：worker 日志和 tick 响应靠它分辨排程醒来的轮次。
+  return { status: "done", seq: message.seq, mode: cronTask ? "cron" : reply.mode, ms: reply.ms };
 }
 
 /** 投一封后台压缩信：同 (员工, 群) 已有排队或在跑的压缩信就不重复投。 */
@@ -598,11 +635,12 @@ async function imageParts(db, message, limit = 4) {
 }
 
 /** 一轮请求的上下文：正文由提示词槽位表装配（见 functions/prompt.mjs），这里只补图。
- *  连带的 promptSlots 是这一步真正落下的块与各自字符数，要进步骤轨迹——命中率掉了得能对出是哪一块动的。 */
-async function buildContext({ db, agent, stream, prepared, trigger, skills, steerNote, delegate }) {
+ *  连带的 promptSlots 是这一步真正落下的块与各自字符数，要进步骤轨迹——命中率掉了得能对出是哪一块动的。
+ *  后端条目在这里解析一次：措辞（吃不吃工具）与传输走的是同一份判定，不能各查各的。 */
+async function buildContext({ db, agent, stream, prepared, trigger, skills, steerNote, delegate, cron }) {
   const images = await imageParts(db, trigger);
   const { system, promptSlots } = composeSystemPrompt({
-    agent, stream, prepared, trigger, skills, steerNote, delegate, cloud: isCloudBackend(agent),
+    agent, stream, prepared, trigger, skills, steerNote, delegate, cron, backend: backendFor(agent),
   });
   return {
     promptSlots,
@@ -776,7 +814,7 @@ async function compress({ db, env, agent, stream, prepared, key, trace }) {
       firstTokenMs: result.first_token_ms,
     });
   } catch (error) {
-    failure = String(error?.name === "TimeoutError" ? "upstream_timeout" : error?.code ?? error?.status ?? "compress_failed");
+    failure = String(upstreamCode(error, "compress_failed"));
     await trace.close(step, { status: "failed", error: failure, detail: { note: foldNote, ...covers } });
   }
   if (failure) {
@@ -801,15 +839,22 @@ async function compress({ db, env, agent, stream, prepared, key, trace }) {
  *  每一轮模型调用和每一次工具调用都落一条 run_steps，员工详情页的时间线读的就是它。 */
 async function withTools({ db, env, agent, stream, key, messages, watch, trace, contextNote, promptSlots }) {
   const started = Date.now();
+  const backend = backendFor(agent);
   // 主人启用中的插件工具并进这一轮的清单；重名时内置优先，插件让位——让位不是丢弃，
   // 每一条都要在这轮模型步的备注里说清被谁挤掉，否则"接了连接器却用不上"没有任何一面能看出来。
-  const { defs: externalDefs, skipped: shadowedTools } = await connectorToolDefs(db, agent.owner_id, INTERNAL_TOOL_NAMES);
-  const externalNames = new Set(externalDefs.map((definition) => definition.function.name));
-  const tools = externalDefs.length ? [...TOOL_DEFINITIONS, ...externalDefs] : TOOL_DEFINITIONS;
-  const shadowNote = shadowedTools.length
-    ? `；${shadowedTools.length} 个连接器工具这轮没进清单：${shadowedTools.map((item) => `${item.name}（被${item.by}挤掉）`).join("、")}`
+  // 不吃工具的那条通道连清单都不查：连接器读了也发不出去，还会在备注里留下一句挤不掉的原因。
+  const connector = backend.caps.tools
+    ? await connectorToolDefs(db, agent.owner_id, INTERNAL_TOOL_NAMES)
+    : { defs: [], skipped: [] };
+  const externalNames = new Set(connector.defs.map((definition) => definition.function.name));
+  const tools = !backend.caps.tools ? null
+    : connector.defs.length ? [...TOOL_DEFINITIONS, ...connector.defs] : TOOL_DEFINITIONS;
+  const shadowNote = connector.skipped.length
+    ? `；${connector.skipped.length} 个连接器工具这轮没进清单：${connector.skipped.map((item) => `${item.name}（被${item.by}挤掉）`).join("、")}`
     : "";
   let working = [...messages];
+  // 这一轮交出的群文件：present 工具往这里登记，回复落群那一刻才变成卡片（见 runTask 的提交点）。
+  const presented = [];
   let last;
   for (let round = 0; round < 2; round += 1) {
     const modelStep = await trace.openModel({ model: agent.model });
@@ -828,7 +873,7 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
       const preempted = error instanceof Interrupted;
       await trace.close(modelStep, {
         status: preempted ? "cancelled" : "failed",
-        error: preempted ? "interrupted" : String(error?.name === "TimeoutError" ? "upstream_timeout" : error?.code ?? error?.status ?? "upstream_unreachable"),
+        error: preempted ? "interrupted" : upstreamCode(error),
         detail: {
           content: preempted ? (error.payload?.partial ?? "") : "",
           context,
@@ -874,6 +919,12 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
       const scope = { agentId: agent.id, streamId: stream.id, ownerId: agent.owner_id, trace };
       const output = await executeTool(db, scope, name, args, env, { callId: call.id })
         .catch((error) => ({ error: error?.error ?? "tool_failed" }));
+      if (name === "present" && output?.ok && output.entry) {
+        const earlier = presented.find((item) => item.file_id === output.entry.file_id);
+        // 同一件文件交两次只有一张卡片，后一次的说法盖掉前一次：重复调用是补充说明，不是新交付。
+        if (earlier) Object.assign(earlier, output.entry);
+        else presented.push(output.entry);
+      }
       results.push({ call_id: call.id, name, output });
     }
     working = [
@@ -886,7 +937,7 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
       })),
     ];
   }
-  return { ...last, ms: Date.now() - started };
+  return { ...last, ms: Date.now() - started, presented };
 }
 
 /** 文本里的 @名字 → 群内成员；用于让虚拟员工也能 @ 真人与其他虚拟员工。 */

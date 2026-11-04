@@ -1,8 +1,8 @@
 # WorkStream 调度器架构
 
-scheduler · executor · context assembly ｜ 实测日期 2026-11-02 ｜ 源码：`functions/engine.mjs`、`functions/worker.mjs`、`functions/bus.mjs`、`functions/chat.mjs`、`functions/agents.mjs`、`functions/delegate.mjs`
+scheduler · executor · context assembly ｜ 实测日期 2026-11-02 ｜ 源码：`functions/engine.mjs`、`functions/worker.mjs`、`functions/bus.mjs`、`functions/chat.mjs`、`functions/agents.mjs`、`functions/backends.mjs`、`functions/delegate.mjs`、`functions/cron.mjs`、`functions/qca.mjs`
 
-**一页结论。** 调度层是「邮箱 FIFO + 跨群加权时间片」：群里 @ 一位虚拟员工 = 往 ta 的邮箱投一封信，`scheduler.tick` 按创建顺序取信、按群权重分并发槽、CAS 抢任务执行；服务端常驻 `worker` 让队列在没有浏览器时也往前走。执行层是「单发流式调用 + 插话掐断」：每轮把群历史现场重渲染成一条 system 消息发给 OpenAI 兼容上游，边收 SSE 边查插话。上下文层是「稳定前缀 + 尾部追加窗口 + 后台压缩」：块序即缓存序，窗口按字符预算分页取，压缩在后台把水位线推上去；实测两轮之间的可复用前缀 **98.5%**，每轮只为本轮新增的记录付 prefill。
+**一页结论。** 调度层是「邮箱 FIFO + 跨群加权时间片」：群里 @ 一位虚拟员工 = 往 ta 的邮箱投一封信，`scheduler.tick` 按创建顺序取信、按群权重分并发槽、CAS 抢任务执行；服务端常驻 `worker` 让队列在没有浏览器时也往前走。执行层是「单发流式调用 + 插话掐断」：每轮把群历史现场重渲染成一条 system 消息发给 OpenAI 兼容上游，边收 SSE 边查插话。上下文层是「稳定前缀 + 尾部追加窗口 + 后台压缩」：块序即缓存序，窗口按字符预算分页取，压缩在后台把水位线推上去；实测两轮之间的可复用前缀 **98.5%**，每轮只为本轮新增的记录付 prefill。排程（cron）不另开一条执行路径：到点的排程只是在 tick 里多投一封普通信，时间片、CAS、插话、压缩全部复用。
 
 本文第 6 节把已经查实的 8 个问题逐条列出，每条都给改前/改后的实测数字与对应的回归断言。
 
@@ -22,6 +22,7 @@ tick 驱动者（两个，可并存）
       ▼
 scheduler.tick（engine.mjs）
   reapStale 回收跑了 5 分钟以上的僵尸任务
+  → 先扫这位主人名下到期的排程（cron.mjs：CAS 推时钟 → 投一封 queued 信），同一轮就能跑掉
   → 取 queued 信 → 过滤掉「同 (员工, 群) 已有 running」的那些，一轮只放最早的一封
   → 按员工分组、组内按群分组 → allocate() 分槽 → 并发执行。
       ▼
@@ -44,11 +45,12 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 
 | 表 | 键 / 约束 | 在调度里的角色 |
 | --- | --- | --- |
-| `mail` | `(agent_id, stream_id, status)` 索引 | 邮箱即任务队列。`status`: queued → running → done / failed / cancelled；`trigger_seq` 指向触发消息；`meta.interrupt` 存未消化的插话；`meta.kind="compress"` 是后台压缩信。 |
+| `mail` | `(agent_id, stream_id, status)` 索引 | 邮箱即任务队列。`status`: queued → running → done / failed / cancelled；`trigger_seq` 指向触发消息；`meta.interrupt` 存未消化的插话；`meta.kind="compress"` 是后台压缩信；`meta.kind="cron"` 是排程到点投的信，`trigger_seq=0`（不挂在任何一条群消息上），`meta.cron` 里带着到点时刻、欠的对点数与要办的事。 |
 | `slice_prefs` | `UNIQUE(agent_id, stream_id)` | 该员工在该群的时间片权重 1–20（默认 1）。群主/管理员才能改。 |
 | `memories` | `(agent_id, scope)`、`(agent_id, stream_id)` | `scope=common` 跨群长期记忆；`scope=stream` 本群记忆；`kind=summary` + `covers_through_seq` 是本群压缩摘要的水位线。 |
 | `messages` | `(stream_id, seq)` | 群转录的唯一权威。上下文窗口、插话判定、审计回执全部以它为准。`on_behalf_of` 非空表示这条正文是替身代某位真人说的。 |
 | `users` / `members` 的替身字段 | `users.delegate_agent_id` + `delegate_start_at` / `delegate_end_at`（账号级班表）；`members.delegate_mode`（`inherit` / `on` / `off`）+ `members.delegate_agent_id`（单群覆盖） | 真人被 @ 时先看群内覆盖、再看班表，命中才往替身邮箱投一封 `meta.on_behalf_of` 的信（见 3.4）。 |
+| `schedules` | `(owner_id, next_run_at)`、`(agent_id)` | 排程（见 3.5）。时钟状态只有 `next_run_at` 一列：为空就是暂停，到点判定读它现算，不存第二个真值源。`merged_runs` 是累计被并进同一轮的对点数，`last_run_at` 是最近一次真正交付的对点。 |
 | `cli_sessions`（规划） | `UNIQUE(agent_id, stream_id)` | per（员工, 群）的 CLI 会话键：runner / session_id / last_seq / workdir。见第 7 节。 |
 | `run_traces`（规划） | `(mail_id, seq)` | 每次运行的 thinking / 工具调用 / 装配上下文快照。群里只看结论，过程在员工详情里点开看。 |
 
@@ -71,7 +73,7 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 
 - 同一对并发跑两封时，后一封的上下文里没有前一封的回复，落群顺序还会倒置——这条规则把它挡住；
 - 认领是 `queued→running` 的单行 CAS，两个驱动者（多 Function 实例、前端轮询、worker）同时看上同一封时只有一个赢，输的那个直接跳过，所以规则跨进程同样成立；
-- 后台压缩信让位给真人触发的那封，否则压缩排在队头时每次回复都要多等一轮。
+- 后台信（压缩、排程）让位给真人触发的那封，否则它们排在队头时每次回复都要多等一轮（排程不缺一轮，见 3.5）。
 
 ### 3.3 为什么默认 FIFO 就够
 
@@ -88,6 +90,19 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 - **署名与回执**：任务信带 `meta.on_behalf_of`，落群的回复带 `messages.on_behalf_of`，界面据此标「替 @X 代答」——正文署名仍是替身自己，不冒充真人。
 - **两处挡住回环**：同一条消息既 @ 真人又 @ ta 的替身时，`skipAgents` 让替身只收那封直接任务；替身回复里再 @ 主人时，`human.id === senderId` 直接跳过，不给自己派活。smoke §25 借演示模型会把提示词尾巴念回正文这个行为，把「队列里始终只有一封」钉成了端到端断言。
 
+### 3.5 排程：员工按自己的时刻表醒来
+
+真人 @ 是外驱，排程是内驱：主人给某个（员工, 群）排一条「每 45 分钟」或「周一、三、五 09:30（UTC+8）」，到点员工自己往群里干活。实现刻意不新增第二条执行路径——到点只是在 tick 里多投一封普通 `mail`，时间片分配、CAS 认领、插话、压缩、轨迹全部复用，与 3.4 替身同一个手法。
+
+- **时钟只有 `next_run_at` 一列，到点判定现算**。和替身班表同一个理由：「到点翻牌」需要一个常驻进程保证那次写入真的发生，进程没跑到位就留下一个谁也停不掉的状态。扫到期时读出 `next_run_at` 跟当前时刻一比，欠几个对点由纯函数 `catchUp` 算出来，没有第二个真值源就没有能对不上的地方。暂停 = 把这一列写空，恢复 = 按规格重算「现在之后的第一个对点」——再加一个 `enabled` 位就会造出「enabled 为真而 `next_run_at` 为空」这种没人能兑现的组合。
+- **追补但不刷屏：欠几个对点只投一封**。掉线三天回来，群里要的是一次「这三天有什么要紧事」，不是三千封补投。多出来的对点折进 `merged_runs`（累计）和信里的 `cron.merged`（本轮），排程块会写明「其间合并了 N 个没跑成的对点（这一轮一次办完）」，调度台上「累计合并 N 个对点」那个小标签也就能自证口径。等长周期用算术一次算完；带周几过滤的 daily 只能一步步走，走到 `MAX_CATCHUP=500` 就把时钟重锚到「现在之后的第一个对点」、更早的不补——刚上线就连着几轮全在补历史，同事看到的是一串迟到的旧任务，比丢掉一段没人看的排程更糟。
+- **投递带 CAS：一个对点只有一封**。同一个到期行会被多个驱动同时看见（前端每 5 秒轮询、常驻 worker、多实例 Function）。推进时钟的条件写成「我读到的那个值还没被人动过」（`schedules.claim`），只有一个赢，输的直接跳过、不退而求其次投第二封，否则群里同一件事会被念好几遍。信没投出去（邮箱写失败）就把时钟回拨成自己刚读到的那个值，回拨的条件是「推进后的那个值还在」，所以不会盖掉别的驱动这一轮刚推上去的时钟。smoke **§26** 钉住这条：两个驱动并发扫同一个到期行只投出一封（配一条「并发那一轮也真的把活干了」的对照），邮箱写失败时如实报出这条排程的错并把时钟回拨，写入恢复后同一个对点照样投出去——一次失败不该永久丢掉这条排程。
+- **人 > 排程**。排程信和压缩信一样落进 `background` 桶：同事在线等回答时先答人，排程留在队列里下一轮再跑。排程不缺一轮——`catchUp` 按 `next_run_at` 往后数对点数，晚投不会把欠的算少。
+- **到点这一轮允许静默**。排程醒来的那一轮没有人 @，正文就是那条群消息；没事要说就回空正文，`runTask` 把信结为 `done` 并记 `mode=cron, silent=true`，不往群里塞一句「本次无内容」。真人 @ 的轮次回空正文仍是失败（`empty_reply`）——同事在等回答，空手回一句等于没干。两种德性在同一个空正文分支里分开。
+- **没活也要有人驱动**。worker 的 `once()` 原本只看「有没有排队信」，一个安静的群永远攒不出第一封，到点的排程就只会躺在表里等一个不会来的触发。现在空闲轮也用 `dueOwnerIds` 找出该醒的主人再 tick，这一步是纯读，真正的投递在 tick 里带 CAS；前端轮询本来就带主人身份打 `scheduler.tick`，天然覆盖同一件事。
+- **边界与自我退场**。每人最多 20 条（扫描走 `(owner_id, next_run_at)` 索引，上限让最坏一轮的开销有界）、最短间隔 1 分钟（排程是主动干活，不是往群里灌消息的定时器）、员工必须属于主人且就在这个群里（借别人的员工排班等于烧别人的 Key）。扫到员工已经退群的那条，CAS 把时钟写成暂停而不是继续推进：这条排程不可能再跑成，继续走只会每到一个对点白扫一次。删员工连带删掉他名下的排程、解散群连带删掉这个群里的排程（留着行只会按时投出必定失败的信，或为一个不存在的群投信）；删排程连带撤回队里还没跑的那一封，但只撤 `queued`——正在生成的那封让它跑完，掐断是 `scheduler.interrupt` 的活，删排程不该越权掐人。
+- **界面上的「下一次」由服务端算**。`cron.list` 每条带往后三个对点，`upcomingOccurrences` 从这一行自己的时钟一步步走，不拿「现在」重锚——按现在重锚会把「每半小时」那条说成 10:37、11:07，而它真实会醒在 10:30、11:00，差一分钟都不该差，差了就没人再信这个表。暂停返回空数组，界面写「下一次 —」，不装作它还在跑。
+
 ---
 
 ## 4. 执行层：流式 + 插话
@@ -96,6 +111,12 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 - 每收到一片就问一次 `interruptWatcher`：同进程由 `bus.mjs` 的 `fireInterrupt` 立即命中；跨进程由 400ms 的邮箱轮询兜底。命中就 `reader.cancel()` 并抛 `Interrupted{partial}`。
 - 半截内容不丢：重跑时作为「上一条说到一半被打断」的提示喂回去；叫停则任务置 `cancelled`，半截不落群。
 - 插话重跑上限 2 次，防止两个人轮流插话把任务变成死循环；超限按 cancelled 收尾并留回执。
+- **通道差异写在一张清单上**：[functions/backends.mjs](../../functions/backends.mjs) 给每条后端通道一个 `transport` 与 `caps.tools`，执行层只按 transport 从 [functions/agents.mjs](../../functions/agents.mjs) 的分流口取路由（`chat` / `demo` / `cloud`）；清单里声明了却没有实现的 transport 在模块加载时就抛，不留到运行时变成一句上游错误。
+- **工具注入看 `caps.tools`，不看通道名**：不吃工具的通道请求体里 `tools` 为 `null`，连接器工具那一步也直接跳过——给了它也不会调，白付一轮 token；提示词侧同一字段决定落「按需调用工具」还是「把结论直接写进正文」（`backend.tools` 槽位）。
+- **交付卡片只在提交点发布**：`present` 工具只把本群的群文件登记进这一轮的 `presented` 清单（`withTools`），卡片随回复那条 `insertMessage` 一起落；中途报错或被叫停就没有那条回复，也就没有卡片，即使轨迹里那一步是 `done`。只交了文件、正文一个字没写的一轮按 `mode: "delivery"` 算成功，排程到点那一轮也优先于静默——否则活干完了群里看不见。这一列只给客户端读，装配上下文取消息时不选它，交付说明因此不进任何一轮模型请求（`dev/smoke.mjs` 第 27 节拿哨标钉住）。
+- **流断在半路不算说完**：SSE 走到尽头既没 `[DONE]` 也没 `finish_reason`，这轮记 `upstream_stream_incomplete` 并结为失败，半截正文一个字都不落群。它和「被插话掐断」是两回事：后者有人接手，前者只是上游掉了。云端那条一直按这个口径报 `qca_stream_ended_unfinished`，自建通道原来把断流当成写完——群里留下一句缺尾巴的话，邮箱还标着 `done`。
+- **失败码在源头就有名字**：`chatCompletion` 拿到非 2xx 时当场用 `functions/agents.mjs` 的 `upstreamCode` 把状态码翻成 `upstream_*`，邮箱、轨迹、界面那句「这次没能完成」读同一个函数翻出来的码，不再各写一遍映射、也不再落一个裸的 `"500"`。
+- **没有自动重投**：领取只从 `queued` 走 CAS，`reapStale` 把跑飞的 `running` 收成 `failed`，没有任何一条路会把 `failed` 重新排队。所以失败提示写「要再试请重新 @ 他」，不写「稍后会自动重试」——前一句兑现得了，后一句兑现不了。smoke 第 28 节用故障开关（`dev/smoke.mjs` 里 `scripts.chat` 的 500 / eof / half 三档，按跑切换、不靠触发关键词）钉住这三条坏德性，并配一条拨回正常后重新 @ 能跑成的对照。
 - 接 CLI 执行器后，掐断语义从「cancel 读循环」变成「kill 进程组 + 从 stdout 增量捞半截」。
 
 ---
@@ -109,7 +130,7 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 | 槽位 id | order | volatile | 内容 |
 | --- | --- | --- | --- |
 | `identity` | 10 | 否 | 身份（名字 / 角色 / 群名） |
-| `backend.cloud` | 20 | 否 | 仅云端 Agent 通道才落的那句 |
+| `backend.tools` | 20 | 否 | 仅这条通道不吃工具时才落的须知（`caps.tools` 在 `functions/backends.mjs`） |
 | `signature` | 30 | 否 | 个性签名 |
 | `guide` | 40 | 否 | 工作守则 |
 | `announcement` | 50 | 否 | 群公告 |
@@ -120,6 +141,7 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 | `transcript` | 100 | 是 | 最近转录窗口（按字符预算，**尾部追加**） |
 | `memory.stream` | 110 | 是 | 本群记忆 notes（近 30 条，**升序渲染**） |
 | `delegate` | 115 | 是 | 替身须知（仅替身轮） |
+| `cron` | 118 | 是 | 排程须知（仅排程醒来的那一轮） |
 | `trigger` | 120 | 是 | 触发消息 |
 | `steer` | 130 | 是 | 插话提示（仅插话轮） |
 
@@ -130,6 +152,8 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 **`memory.stream` 的取舍**：每回完一条就往本群记忆插一条 `#NN 回应：<正文前 200 字>` 的回声。装配时按序号两头剔除——`NN ≤ 水位线`的已经折进摘要，`NN ≥ 窗口头`的转录里就带全文，只有落在「摘要没覆盖、窗口又装不下」那段缝隙里的回声才单列。这块排在转录之后，而**前缀缓存是一刀切**：断点之后哪怕逐字节相同也算 miss，所以让它常态为空比让它变小更要紧（实测它一度占每轮 miss 的 86%，见 P9）。非回声类 note（压缩失败留痕、用户显式记下的事）没有序号，一律保留。
 
 **`delegate` 只在替身轮落下**：非替身轮它的 build 返回空串，空串不落块，装配结果和加这块之前逐字节相同——替身特性不给普通轮的缓存添任何代价。断点位置不受它影响（`CACHE_BREAKPOINT_ID` 是表里第一颗 volatile 块，在 `memory.common`，smoke 8d2 钉着），它只是在断点之后、触发消息之前多一段正文。这块的内容是内部提示，进群正文的红线由 `DEMO_QUOTABLE_HEADERS` 守住：演示模型只准从转录和两段记忆里摘录，那三类本来就是群里可见的内容；守则、替身须知、触发消息是内部提示，被照抄进正文等于把提示词摊给全群看（本机假上游就是这么暴露的，smoke §25 有断言，白名单与装配共用同一份抬头常量，加新块不会悄悄漏进摘录）。
+
+**`cron` 只在排程醒来的那一轮落下**：位置在 `delegate` 之后、`trigger` 之前，build 在非排程轮返回空串，所以普通接活的那轮请求体逐字节不变；这块自己也标了 `volatile`，落在缓存断点之后，一个员工挂多条排程也不打断平时那段前缀。内容里有一句专门防重复播报：到点这一轮的正文就是那条群消息，不写清「别再补发一条」，模型会先调 `send_message` 再把同一句话抄进正文，群里同一件事念两遍（本机真实上游跑 1 分钟排程时第一次就发生了这件事）。同一轮的触发块也换了口径——「没有人 @ 你，这一轮是你自己的排程醒的」，不谎称自己是一条补发任务。
 
 **命中率掉了怎么定位**：每个模型轮收尾时把这轮真正落下的槽位清单（`[id, 字符数, volatile]` 三元组）写进 `run_steps.detail.prompt_slots`，员工详情页的轨迹检视器「上下文」标签按原序排出来，并在第一颗每轮重写的块上标「断点」。它只记口径不记正文——正文库里已经有，重复存只会把库撑大。
 
@@ -174,7 +198,7 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 
 老库里 `covers_through_seq` 为空的历史回声不参与过滤（无法判断序号），会随「最近 30 条」的滑动自然退场；非回声类 note（压缩失败留痕、用户显式记下的事）序号为空，一律保留。
 
-套件健康度：smoke **118 通过 / 6 失败 → 139 通过 / 0 失败**；突发压测 bench **73 通过 / 0 失败**（6.3）；`tsc --noEmit` 干净；`check:schema` 干净（18 张表，列一致）。
+套件健康度：smoke **118 通过 / 6 失败 → 139 通过 / 0 失败**；突发压测 bench **73 通过 / 0 失败**（6.3）；`tsc --noEmit` 干净；`check:schema` 干净（23 张表，列一致）。
 
 ### 6.1 对话变长会不会延迟高
 
@@ -249,4 +273,5 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 - **多驱动者**：前端轮询与 worker 并行时重复执行必须为 0，`slice_count` 全为 1（bench **B5**）。
 - **块序是被分配的**：槽位表的 id 唯一、order 齐、build 齐全，且第一个 volatile 块就是缓存断点（smoke **8d2** 已锁）；装配出来的块序与正文逐字对得上同一条检查。
 - **代答不另开一条路**：替身任务与普通任务同表同队列，普通轮提示词逐字节不变（smoke **25**：非替身轮不落 `delegate` 块）；一条 @ 最多派一封（回环两处 guard 各配一条放行断言），真人侧通知不因代答而少（**代答≠代收**）。
+- **排程不另开一条路**：到点的排程只多投一封普通 `mail`，同表同队列，非排程轮的提示词与请求体逐字节不变（smoke **26**：不是排程的那一轮不落 `cron` 块）。一个对点只能有一封信——CAS 推进时钟，多驱动同时扫只有一个赢；投信失败要回拨时钟，下一轮重新判到点（同节）。欠几个对点只投一封，多出来的记进 `merged_runs` 与信里的 `cron.merged`，界面上的「累计合并」和「下一次」都从服务端算出来的值来（暂停时「下一次」是空，不装作还在跑）。人 > 排程：这一轮有真人 @ 就先答人，排程留在下一轮按时钟追上来。
 - 每个模型轮在 `run_steps.detail.prompt_slots` 落下这轮的 `[槽位 id, 字符数, volatile]` 清单，轨迹检视器「上下文」标签按原序显示并标出断点；prompt 字符数与上一轮 LCP 的自动采集仍待 R3/trace 表落地。

@@ -5,7 +5,7 @@ WorkStream 是"真人 × 虚拟员工"协作台：Vite 静态前端 + 单个 Edg
 ## 环境与门禁
 
 - **Node 必须 22.12+，`engines` 是 `>=22.12.0 <23`。** 本机系统 Node 是 v24，会被 [scripts/check-node.mjs](scripts/check-node.mjs) 的 `preinstall`/`predev`/`prebuild` 拦下。所有 `npm`/`npx` 前面加 `export PATH="/d/tools/node22:$PATH"`（便携版 Node 22）。
-- **`npm run qa` 是唯一的全量门禁**（= check-node + check-schema + smoke）。改动合入前跑它，报数以千计：`dev/smoke.mjs` 用真实 handler + 本机假数据库跑端到端，**601 项检查、0 失败**是当前的地板，只许涨不许跌。
+- **`npm run qa` 是唯一的全量门禁**（= check-node + check-schema + smoke）。改动合入前跑它，报数以千计：`dev/smoke.mjs` 用真实 handler + 本机假数据库跑端到端，**717 项检查、0 失败**是当前的地板，只许涨不许跌。
 - **`npm run build` = `tsc --noEmit && node scripts/build.mjs`**，类型检查在构建里，不在 qa 里。
 - **本仓没有 ESLint 配置**：别跑 `npx eslint`，别建议加 linter 来代替静态检查。需要机器可验的不变量时，照 `dev/check-schema.mjs` 的样子写成 `scripts/` 下的静态对账 + 在 `dev/smoke.mjs` 里落一条 `check()`。
 - 起服务端要带 `--worker`（或 `WORKSTREAM_WORKER=1`）：[functions/worker.mjs](functions/worker.mjs) 是常驻调度循环，不带它就只能靠前端每 5 秒轮询推进一格，页面一隐藏邮箱就停（见 [dev/local-function.mjs:17](dev/local-function.mjs#L17)）。
@@ -23,9 +23,9 @@ WorkStream 是"真人 × 虚拟员工"协作台：Vite 静态前端 + 单个 Edg
 - **不透明的 id 必须带来源。** 外部传入的 id 一律走 [functions/util.mjs:66](functions/util.mjs#L66) 的 `uuid(value, name)`，错误信息里要说清是哪个字段；内部新 id 用 `newId()`。别加模块级的 `current` / `active` / `selection` 单例——共享状态要挂在一个有主人的服务对象上。
 - **类型能证明的边界不要再校验。** 校验放在真边界：请求体入口（`text` / `int` / `oneOf` / `avatarData`）、用户自填的外部地址（[functions/util.mjs:163](functions/util.mjs#L163) `safeApiBaseUrl`：线上只收 https，`WORKSTREAM_DEV=1` 才放行内网与元数据地址）、入库、出网、跨进程。进程内函数之间不补防御性 fallback，也不为静态类型已排除的输入写测试。
 - **随部署变化的旋钮不许硬编码。** 上下文预算、超时、上限这类做成 `Config`/入参/env（`CONTEXT_CHARS_DEFAULT` 在 [functions/util.mjs:85](functions/util.mjs#L85)，密钥主密钥走 `WORKSTREAM_DATA_KEY`）。一个 `DEFAULT_*` 常量或测试钩子不算可配置。协议常量、外部规范、安全不变量保持固定。
-- **新行为挂扩展点，不改主循环。** 工具进 `TOOL_HANDLERS`，动作进各模块的 `actions` 表（[functions/handler.mjs:75](functions/handler.mjs#L75) 对未知动作回 `unknown_action`），提示词块进 [functions/prompt.mjs:23](functions/prompt.mjs#L23) 的槽位表，群文件预览进 [src/lib/fileRenderers.mjs:25](src/lib/fileRenderers.mjs#L25) 的渲染器注册表并在 [src/lib/renderers/index.mjs](src/lib/renderers/index.mjs) 登记一行（漏登记由 `npm run check:schema` 静态拦）。要改 `functions/engine.mjs` 的派发主循环，同一份改动里更新 [docs/arch/scheduler.md](docs/arch/scheduler.md)。
+- **新行为挂扩展点，不改主循环。** 工具进 `TOOL_HANDLERS`，动作进各模块的 `actions` 表（[functions/handler.mjs:75](functions/handler.mjs#L75) 对未知动作回 `unknown_action`），提示词块进 [functions/prompt.mjs:23](functions/prompt.mjs#L23) 的槽位表，后端通道进 [functions/backends.mjs:20](functions/backends.mjs#L20) 的清单（"这条通道吃不吃工具"是 `caps.tools` 一个字段，提示词措辞与工具注入读同一份；表里声明的 transport 缺实现由 [functions/agents.mjs:380](functions/agents.mjs#L380) 冷启动抛出），群文件预览进 [src/lib/fileRenderers.mjs:25](src/lib/fileRenderers.mjs#L25) 的渲染器注册表并在 [src/lib/renderers/index.mjs](src/lib/renderers/index.mjs) 登记一行（漏登记由 `npm run check:schema` 静态拦，界面「模型来源」下拉与后端清单也在 `dev/check-schema.mjs` 里对账——冒烟看不见界面）。要改 `functions/engine.mjs` 的派发主循环，同一份改动里更新 [docs/arch/scheduler.md](docs/arch/scheduler.md)。
 - **注册是副作用，注销要精确。** 注册函数返回只摘自己那一条的 disposer：同 id 重复注册就地抛错而不是静默覆盖，缺字段的注册在登记时就抛（`npm run qa` §24 锁住这三条）。没有运行时的贡献者就不要搭注册表——声明式的槽位表够用。
-- **迁移只追加。** `sql/` 下按 0001→0009 递增编号建新的 `.sql`，已发布的迁移不改编；新列不回填旧行的既有语义。改完跑 `npm run check:schema`。
+- **迁移只追加。** `sql/` 下按 0001→0012 递增编号建新的 `.sql`，已发布的迁移不改编；新列不回填旧行的既有语义。改完跑 `npm run check:schema`。
 - **断言成对写。** 一条"越权被拒"的检查必须配一条"主人做同一件事能成"的检查，否则只读 id 列做 owner 比较会永远成立，假通过。
 - **测试描述行为，不描述正确性。** 行为改了就把测试一起改掉，并在交付说明里写清为什么改。
 - **重复的同类值优先对称。** 说不出理由的不对称通常是漏了一次抽取。

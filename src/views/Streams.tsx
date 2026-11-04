@@ -8,7 +8,7 @@ import { describeError, get, type Agent } from "../api";
 import type { AgentPresence, Message, Stream, StreamDetail, User, Vm } from "../types";
 import { clockOf, shortUuid, timeAgo } from "../lib/format";
 import { flashVars, readFlashColors, type FlashColors } from "../lib/flash";
-import { DeliveryChips, MentionText, MessageImages, PersonAvatar, RoleBadge } from "../lib/ui";
+import { DeliveryChips, MentionText, MessageImages, PersonAvatar, PresentedCards, RoleBadge } from "../lib/ui";
 import { navigate } from "../lib/route";
 import { Composer, mentionablesOf } from "./chat/Composer";
 import { CreateGroup, JoinByUuid } from "./streams/StreamForms";
@@ -880,16 +880,20 @@ function PaneMessage({
           {agent ? <span className="text-[10px] text-machine/70">虚拟</span> : null}
           <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{clockOf(message.created_at)}</span>
         </header>
-        <div
-          className={cn(
-            "whitespace-pre-wrap leading-relaxed",
-            dense ? "rounded-xl px-2 py-1 text-xs" : "rounded-xl px-2.5 py-1.5 text-[13px]",
-            mine ? "rounded-tr-sm bg-signal-soft" : "rounded-tl-sm border border-border/50 bg-card",
-          )}
-        >
-          <MessageImages attachments={message.attachments} dense />
-          <MentionText content={message.content} names={names} />
-        </div>
+        {message.content || message.attachments?.length ? (
+          <div
+            className={cn(
+              "whitespace-pre-wrap leading-relaxed",
+              dense ? "rounded-xl px-2 py-1 text-xs" : "rounded-xl px-2.5 py-1.5 text-[13px]",
+              mine ? "rounded-tr-sm bg-signal-soft" : "rounded-tl-sm border border-border/50 bg-card",
+            )}
+          >
+            <MessageImages attachments={message.attachments} dense />
+            <MentionText content={message.content} names={names} />
+          </div>
+        ) : null}
+        {/* 监控位没有群文件抽屉可开，卡片只用来认出交付物，整块不可点。 */}
+        <PresentedCards items={message.presented} dense />
         <DeliveryChips deliveries={message.deliveries} dense />
         {message.error ? <p className="px-0.5 text-[11px] text-destructive">回执出错：{message.error}</p> : null}
       </div>

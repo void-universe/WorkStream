@@ -7,10 +7,10 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { describeError, get, type Agent } from "../../api";
-import type { AgentPresence, Message, StreamDetail, User, Vm } from "../../types";
+import type { AgentPresence, Message, Presented, StreamDetail, User, Vm } from "../../types";
 import { cn } from "@/lib/utils";
 import { shortUuid, timeAgo } from "../../lib/format";
-import { CopyChip, DeliveryChips, MentionText, MessageImages, PersonAvatar } from "../../lib/ui";
+import { CopyChip, DeliveryChips, MentionText, MessageImages, PersonAvatar, PresentedCards } from "../../lib/ui";
 import { Composer, mentionablesOf, type SendResult } from "./Composer";
 import { FilesSection, MembersPanel, SettingsPanel } from "./Panels";
 
@@ -74,6 +74,8 @@ export function ChatView({
   const stickRef = useRef(true);
   const tickRef = useRef(false);
   const [drawer, setDrawer] = useState<DrawerTab | null>(null);
+  // 点交付卡片时想直接看的那份文件：抽屉打开到「群文件」页后由 FilesSection 接着预览它。
+  const [fileFocus, setFileFocus] = useState<Presented | null>(null);
 
   const loadDetail = useCallback(async () => {
     try {
@@ -240,6 +242,11 @@ export function ChatView({
   }
 
   const reload = loadDetail;
+  // 交付卡片整块可点：点开直接看到群文件里那份原件，不用同事自己按名字去列表里翻。
+  const openPresented = (item: Presented) => {
+    setFileFocus(item);
+    setDrawer("files");
+  };
   const agentColors = new Map<string, string>();
   for (const agent of myAgents) if (agent.color) agentColors.set(agent.id, agent.color);
   for (const member of detail.members) {
@@ -307,6 +314,7 @@ export function ChatView({
                       (message.sender_id === user.id ? user.avatar : null)
                     }
                     presence={message.sender_type === "agent" ? presenceMap.get(message.sender_id) : undefined}
+                    onOpenFile={openPresented}
                   />
                 </Fragment>
               );
@@ -324,11 +332,19 @@ export function ChatView({
               <h2 className="min-w-0 flex-1 truncate text-sm font-semibold">
                 {DRAWER_TABS.find((tab) => tab.value === drawer)?.title}
               </h2>
-              <Button size="icon-xs" variant="ghost" title="关闭" onClick={() => setDrawer(null)}>
+              <Button size="icon-xs" variant="ghost" title="关闭" onClick={() => { setDrawer(null); setFileFocus(null); }}>
                 <XIcon className="size-4" />
               </Button>
             </div>
-            <Tabs value={drawer} onValueChange={(value) => setDrawer(value as DrawerTab)} className="flex min-h-0 flex-1 flex-col">
+            <Tabs
+              value={drawer}
+              onValueChange={(value) => {
+                setDrawer(value as DrawerTab);
+                // 换了标签页就不再是"从卡片跳过来"，别下一次点开群文件时冒出上次那份的预览。
+                setFileFocus(null);
+              }}
+              className="flex min-h-0 flex-1 flex-col"
+            >
               <TabsList className="mx-3 mt-3 h-8 w-auto shrink-0 justify-start gap-0 self-start rounded-none bg-transparent p-0">
                 {DRAWER_TABS.map((tab) => (
                   <TabsTrigger
@@ -347,7 +363,7 @@ export function ChatView({
                   <MembersPanel detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} presence={presence} />
                 </TabsContent>
                 <TabsContent value="files" className="mt-0">
-                  <FilesSection detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} />
+                  <FilesSection detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} focus={fileFocus} />
                 </TabsContent>
                 <TabsContent value="settings" className="mt-0">
                   <SettingsPanel detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} />
@@ -369,6 +385,7 @@ function MessageRow({
   avatar,
   presence,
   humanNames,
+  onOpenFile,
 }: {
   message: Message;
   names: string[];
@@ -377,6 +394,7 @@ function MessageRow({
   avatar?: string | null;
   presence?: AgentPresence;
   humanNames: Map<string, string>;
+  onOpenFile: (item: Presented) => void;
 }) {
   if (message.sender_type === "system" || message.kind === "system") {
     return <p className="py-0.5 text-center text-[11px] leading-relaxed text-muted-foreground">{message.content}</p>;
@@ -412,15 +430,19 @@ function MessageRow({
             ) : null}
           </header>
         )}
-        <div
-          className={cn(
-            "rounded-[10px] px-3.5 py-2.5 text-sm leading-relaxed whitespace-pre-wrap",
-            mine ? "bg-signal-soft" : "border border-border/50 bg-card",
-          )}
-        >
-          <MessageImages attachments={message.attachments} />
-          <MentionText content={message.content} names={names} />
-        </div>
+        {message.content || message.attachments?.length ? (
+          <div
+            className={cn(
+              "rounded-[10px] px-3.5 py-2.5 text-sm leading-relaxed whitespace-pre-wrap",
+              mine ? "bg-signal-soft" : "border border-border/50 bg-card",
+            )}
+          >
+            <MessageImages attachments={message.attachments} />
+            <MentionText content={message.content} names={names} />
+          </div>
+        ) : null}
+        {/* 只交了文件、正文空着的回合：气泡不渲染，交付卡片就是这条消息的全部内容。 */}
+        <PresentedCards items={message.presented} onOpen={onOpenFile} />
         <div className="flex min-w-0 flex-wrap items-center gap-1.5 px-1">
           <DeliveryChips deliveries={message.deliveries} dense />
           <span className="font-mono text-[10px] text-muted-foreground opacity-0 transition-opacity group-hover:opacity-70">

@@ -1,15 +1,16 @@
 // 跨视图复用的小件：头像、@ 高亮、复制、字段容器、派发状态、消息贴图。
 import { useEffect, useRef, useState, type CSSProperties, type InputHTMLAttributes, type ReactNode } from "react";
 import { toast } from "sonner";
+import { FileTextIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import { describeError, get } from "../api";
-import type { Attachment, Delivery } from "../types";
+import type { Attachment, Delivery, Presented } from "../types";
 import { AVATAR_PRESETS, avatarPresetDataUrl, presetPreviewUrl } from "./avatars";
-import { initials } from "./format";
+import { byteSize, initials } from "./format";
 
 export type Kind = "human" | "agent" | "system";
 
@@ -258,6 +259,59 @@ export function DeliveryChips({ deliveries, dense = false }: { deliveries?: Deli
             <span className="max-w-24 truncate">{row.agent_name}</span>
             <span className="opacity-80">{tone.label}</span>
           </span>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * 交付卡片：这一轮交出的群文件挂在回复下面。同事不用从正文一句话里猜最终成果是哪个文件，
+ * 也不用去群文件列表里翻——卡片整块可点，点开就是那个文件的预览。
+ */
+export function PresentedCards({
+  items,
+  dense = false,
+  onOpen,
+}: {
+  items?: Presented[];
+  dense?: boolean;
+  onOpen?: (item: Presented) => void;
+}) {
+  const rows = items ?? [];
+  if (!rows.length) return null;
+  const shell = cn(
+    "flex w-full min-w-0 items-start gap-2 rounded-lg border border-border/60 bg-card px-2.5 text-left",
+    dense ? "py-1" : "py-1.5",
+    onOpen && "cursor-pointer transition-colors hover:bg-accent/60",
+  );
+  return (
+    <div className={cn("grid w-full min-w-0 gap-1", dense && "gap-0.5")}>
+      {rows.map((item) => {
+        const inner = (
+          <>
+            <FileTextIcon className={cn("mt-0.5 size-3.5 shrink-0 text-signal", dense && "size-3")} />
+            <span className="min-w-0 flex-1">
+              <span className={cn("block truncate font-medium", dense ? "text-[11px]" : "text-xs")}>{item.name}</span>
+              <span className="block truncate text-[10px] text-muted-foreground">
+                交付 · {byteSize(item.size_bytes)} · {item.content_type}
+              </span>
+              {item.note ? (
+                <span className="block whitespace-pre-wrap break-words text-[10px] leading-relaxed text-muted-foreground">
+                  {item.note}
+                </span>
+              ) : null}
+            </span>
+          </>
+        );
+        return onOpen ? (
+          <button key={item.file_id} type="button" className={shell} title="在群文件里预览这份交付物" onClick={() => onOpen(item)}>
+            {inner}
+          </button>
+        ) : (
+          <div key={item.file_id} className={shell}>
+            {inner}
+          </div>
         );
       })}
     </div>

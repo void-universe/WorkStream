@@ -5,11 +5,8 @@ import { fireInterrupt } from "./bus.mjs";
 import { requireMembership } from "./perm.mjs";
 import { streamPresence } from "./presence.mjs";
 import { queueDelegateMail } from "./delegate.mjs";
-import { insertMessage } from "./rooms.mjs";
+import { insertMessage, MESSAGE_COLUMNS } from "./rooms.mjs";
 import { Halt, isUuid, json, newId, now, text, truncate, uuid } from "./util.mjs";
-
-export const MESSAGE_COLUMNS =
-  "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,attachments,on_behalf_of,created_at";
 
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const MAX_IMAGES = 4;
@@ -259,6 +256,8 @@ export const shapeMessage = (row) => ({
   ...row,
   mentions: Array.isArray(row.mentions) ? row.mentions : [],
   attachments: Array.isArray(row.attachments) ? row.attachments : [],
+  // 0012 之前落的消息没有这一列，读出来统一给空数组，前端不必分两种形状。
+  presented: Array.isArray(row.presented) ? row.presented : [],
 });
 
 /** 该虚拟员工在这个群里的时间片权重；未设即为均分（权重 1）。 */

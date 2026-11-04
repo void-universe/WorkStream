@@ -87,23 +87,26 @@ export function createFixtureClient(file) {
       return this;
     }
 
+    // SQL 里 NULL 参与大小比较的结果是 unknown，那一行不会被选中；这里必须一样，
+    // 否则"时钟写空表示暂停"的行会混进 `<= 现在` 的到期扫描，把 limit 的窗口占满——
+    // 本地表现和线上相反，正是测试替身最坏的偏差。
     gt(column, value) {
-      this.filters.push(([row]) => compare(row[column], value) > 0);
+      this.filters.push(([row]) => hasValue(row[column]) && compare(row[column], value) > 0);
       return this;
     }
 
     gte(column, value) {
-      this.filters.push(([row]) => compare(row[column], value) >= 0);
+      this.filters.push(([row]) => hasValue(row[column]) && compare(row[column], value) >= 0);
       return this;
     }
 
     lt(column, value) {
-      this.filters.push(([row]) => compare(row[column], value) < 0);
+      this.filters.push(([row]) => hasValue(row[column]) && compare(row[column], value) < 0);
       return this;
     }
 
     lte(column, value) {
-      this.filters.push(([row]) => compare(row[column], value) <= 0);
+      this.filters.push(([row]) => hasValue(row[column]) && compare(row[column], value) <= 0);
       return this;
     }
 
@@ -238,6 +241,9 @@ export function createFixtureClient(file) {
 
 const SAFE = /^[a-z_][a-z0-9_]*$/;
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** SQL 的三值逻辑：NULL 与任何值比较都是 unknown，这一行不进结果集。 */
+const hasValue = (value) => value !== null && value !== undefined;
 
 function compare(a, b) {
   if (a === b) return 0;

@@ -4,6 +4,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { BACKEND_IDS } from "../functions/backends.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const columnName = /^[a-z_][a-z0-9_]*$/;
@@ -186,8 +187,22 @@ if (/fill\s*:/.test(drawioTextRule)) {
   problems.push("src/globals.css 的 .ws-drawio text 规则里设了 fill：会盖掉渲染器按底色算出的标签颜色");
 }
 
+/* ---------- 5. 后端清单与界面「模型来源」对账 ---------- */
+// 后端能填什么由 functions/backends.mjs 说了算（服务端 oneOf 用的就是那份 id 清单）。
+// 界面上的下拉选项与 TS 联合类型是它的两个副本：冒烟只打接口看不见界面，这一处只能静态对账。
+const agentsView = readFileSync(join(root, "src", "views", "Agents.tsx"), "utf8");
+const backendSelect = /<NativeSelect[\s\S]*?id="agent-backend"[\s\S]*?<\/NativeSelect>/.exec(agentsView)?.[0] ?? "";
+const optionIds = [...backendSelect.matchAll(/<NativeSelectOption value="([a-z_]+)">/g)].map((match) => match[1]);
+const unionSource = /type Backend = ([^;]+);/.exec(agentsView)?.[1] ?? "";
+const unionIds = [...unionSource.matchAll(/"([a-z_]+)"/g)].map((match) => match[1]);
+const sameSet = (left, right) => left.length === right.length && [...left].sort().join() === [...right].sort().join();
+if (!optionIds.length) problems.push('src/views/Agents.tsx 的「模型来源」下拉没解析出选项（改了结构要同步改这道对账）');
+else if (!sameSet(optionIds, BACKEND_IDS)) problems.push(`「模型来源」下拉 [${optionIds.join(",")}] 与后端清单 [${BACKEND_IDS.join(",")}] 对不上`);
+if (!sameSet(unionIds, BACKEND_IDS)) problems.push(`type Backend [${unionIds.join(",")}] 与后端清单 [${BACKEND_IDS.join(",")}] 对不上`);
+
 console.log(`迁移里的表（${tables.size}）：${[...tables.keys()].join(", ")}`);
 console.log(`群文件渲染器（${rendererFiles.length}）：${rendererFiles.join(", ") || "（无）"}`);
+console.log(`后端清单（${BACKEND_IDS.length}）：${BACKEND_IDS.join(", ")}`);
 if (dynamicWrites.size) console.log(`按变量传参、无法静态展开写入列的表：${[...dynamicWrites].join(", ")}`);
 if (problems.length) {
   console.log(`发现 ${problems.length} 处不一致：\n- ${problems.join("\n- ")}`);

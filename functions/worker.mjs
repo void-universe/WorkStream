@@ -1,5 +1,6 @@
 // 常驻调度进程：站点 Function 自己不能驻留，所以邮箱推进要么靠前端轮询，要么靠这个循环。
 // 与前端轮询共用同一个 scheduler.tick；认领是 queued→running 的单行 CAS，两边同时跑不会重复执行。
+import { dueOwnerIds } from "./cron.mjs";
 import { actions, reapStale } from "./engine.mjs";
 import { store } from "./store.mjs";
 
@@ -25,15 +26,20 @@ export function startWorker({ supabase, env, tickMs = 1_000, log = (line) => con
     },
   };
 
-  /** 一轮：回收僵尸任务 → 只找真有排队的员工 → 按其主人逐个跑 tick。
-   *  不按用户全表扫（store 也禁止空条件查询），空闲时整轮只有两条查询。 */
+  /** 一轮：回收僵尸任务 → 找有活儿的主人（排队的信 + 到期的排程）→ 按其主人逐个跑 tick。
+   *  不按用户全表扫（store 也禁止空条件查询），空闲且没到期时整轮只有三条查询。 */
   async function once() {
     await reapStale(db);
     const queued = await db.mail.list([["status", "queued"]], { columns: "agent_id", limit: 200 });
-    if (!queued.length) return { ran: [], queued: 0 };
     const agentIds = [...new Set(queued.map((mail) => mail.agent_id))];
-    const agents = await db.agents.list([["id", agentIds]], { columns: "owner_id", limit: 60 });
-    const owners = [...new Set(agents.map((agent) => agent.owner_id).filter(Boolean))];
+    // 空闲时也要有人替排程醒着：只看"有没有排队信"的话，一个安静的群永远攒不出第一封，
+    // 到点的排程就只会躺在表里等一个不会来的触发。这一步是纯读，真正的投递在 tick 里带 CAS。
+    const cronOwners = await dueOwnerIds(db, { nowMs: Date.now() });
+    if (!agentIds.length && !cronOwners.length) return { ran: [], queued: 0 };
+    const agents = agentIds.length
+      ? await db.agents.list([["id", agentIds]], { columns: "owner_id", limit: 60 })
+      : [];
+    const owners = [...new Set([...agents.map((agent) => agent.owner_id).filter(Boolean), ...cronOwners])];
     const results = await Promise.all(owners.map((ownerId) => tick({
       db, env, params: new URLSearchParams(), user: { id: ownerId },
     }).then((response) => response.json())));

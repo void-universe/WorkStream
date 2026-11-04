@@ -12,9 +12,6 @@
 // 这条不变量由 dev/smoke.mjs 的 8d 兜住：两轮请求的公共前缀必须覆盖整段上一轮窗口，且可复用 ≥95%。
 import { imageMark, renderTranscript } from "./transcript.mjs";
 
-/** 云端 Agent 通道：工具不在这一条通道里，两处措辞要跟着换。 */
-export const isCloudBackend = (agent) => (agent.backend ?? "openai") === "qca";
-
 // 内容块的抬头：装配用它，演示模型摘录它，两边必须读同一份，否则过滤会跟着正文悄悄失效。
 const MEMORY_COMMON_HEADER = "你的长期记忆（common）：";
 const MEMORY_STREAM_HEADER = "本群记忆：";
@@ -40,21 +37,19 @@ export const PROMPT_SECTIONS = [
       `你是虚拟员工「${agent.name}」（角色：${agent.role}），正在 WorkStream 群「${stream.name}」里工作。`,
   },
   {
-    id: "backend.cloud",
+    id: "backend.tools",
     order: 20,
     volatile: false,
-    // 云端 Agent 用自己的工具集，我们的群工具不在这条通道里；不说清楚它就会照着技能说明
-    // "调用 send_message"，把工具名写进正文，群里看到的是一次假执行。
-    build: ({ cloud }) => (cloud
-      ? "本次由云端 Agent 作答：下面提到的 WorkStream 工具（发消息、群文件、虚拟机、记忆写入等）在这一通道里都调不到，也不要把工具名写进回复。请把结论直接写进正文，需要落地的动作列成待办交给同事。"
-      : ""),
+    // 这一条通道吃不吃工具写在后端清单的 caps.tools 上（functions/backends.mjs），措辞跟着那条目的说辞走。
+    // 不吃工具却不说明，模型就会照着技能说明"调用 send_message"，把工具名写进正文，群里看到的是一次假执行。
+    build: ({ backend }) => (backend.caps.tools ? "" : backend.noToolsNotice),
   },
   {
     id: "signature",
     order: 30,
     volatile: false,
-    build: ({ agent, cloud }) => (agent.signature
-      ? `你的个性签名（群里头像旁可见${cloud ? "" : "，需要时用 set_signature 更新"}）：${agent.signature}`
+    build: ({ agent, backend }) => (agent.signature
+      ? `你的个性签名（群里头像旁可见${backend.caps.tools ? "，需要时用 set_signature 更新" : ""}）：${agent.signature}`
       : ""),
   },
   {
@@ -73,17 +68,17 @@ export const PROMPT_SECTIONS = [
     id: "skills",
     order: 60,
     volatile: false,
-    build: ({ skills, cloud }) => (skills
-      ? `你的技能（${cloud ? "在这里只是背景知识，细则的全文在本机技能库里" : "按需调用对应工具；细则可用 read_skill 查全文"}）：\n${skills}`
+    build: ({ skills, backend }) => (skills
+      ? `你的技能（${backend.caps.tools ? "按需调用对应工具；细则可用 read_skill 查全文" : "在这里只是背景知识，细则的全文在本机技能库里"}）：\n${skills}`
       : ""),
   },
   {
     id: "history.access",
     order: 70,
     volatile: false,
-    build: ({ cloud }) => (cloud
-      ? "如需更早的记录，请说明还需要哪一段，由 WorkStream 侧补给你；回答用群成员能直接用的表述。"
-      : "如需更早的记录，调用 search_history / read_window 工具；回答用群成员能直接用的表述。"),
+    build: ({ backend }) => (backend.caps.tools
+      ? "如需更早的记录，调用 search_history / read_window 工具；回答用群成员能直接用的表述。"
+      : "如需更早的记录，请说明还需要哪一段，由 WorkStream 侧补给你；回答用群成员能直接用的表述。"),
   },
   {
     id: "memory.common",
@@ -126,11 +121,31 @@ export const PROMPT_SECTIONS = [
       : ""),
   },
   {
+    id: "cron",
+    order: 118,
+    volatile: true,
+    // 排程醒来的那一轮没有人 @，得说清是谁排的、到点没有、要办什么，否则员工只会对着一段转录发愣。
+    // 允许留空正文：到点看一眼、没事要说，就不该往群里塞一句废话（静默退场在 engine 的空正文分支里）。
+    // 排在 delegate 之后、trigger 之前：员工平时接活的那段前缀不会被这块打断。
+    build: ({ cron }) => (cron
+      ? `这一轮是你自己的排程到点了，没有人 @ 你：排程「${cron.name}」，对点 ${cron.due_at}`
+        + (Number(cron.merged ?? 0) > 0 ? `，其间合并了 ${cron.merged} 个没跑成的对点（这一轮一次办完）` : "")
+        + `。要办的事：${cron.instruction}\n`
+        // 到点这一轮正文就是那条群消息：不写清"别再补发"，模型会先调 send_message 再把同一句话
+        // 抄进正文，群里同一件事念两遍。
+        + "如果这一轮没有需要让同事知道的结果，正文留空即可，WorkStream 不会替你发一条空消息；"
+        + "要说的话就写在正文里——正文会直接进群，别再补发一条。"
+      : ""),
+  },
+  {
     id: "trigger",
     order: 120,
     volatile: true,
-    build: ({ trigger }) =>
-      `上一条 @ 你的消息：${trigger ? `${trigger.sender_name}：${trigger.content}${imageMark(trigger)}` : "（队列里的补发任务，无原始消息）"}`,
+    build: ({ trigger, cron }) =>
+      `上一条 @ 你的消息：${trigger
+        ? `${trigger.sender_name}：${trigger.content}${imageMark(trigger)}`
+        // 排程那一轮同样没有原始消息，但不能写成"补发任务"：那会让模型以为在重跑别人的活。
+        : (cron ? "（没有人 @ 你，这一轮是你自己的排程醒的）" : "（队列里的补发任务，无原始消息）")}`,
   },
   {
     id: "steer",

@@ -189,6 +189,27 @@ export type Stream = {
   updated_at?: string;
 };
 
+/** 排程行：next_run_at 为空就是暂停，界面上的"下一次"只认服务端算出来的 upcoming。 */
+export type Schedule = {
+  id: string;
+  owner_id: string;
+  agent_id: string;
+  stream_id: string;
+  name: string;
+  instruction: string;
+  kind: "every" | "daily";
+  interval_minutes: number | null;
+  at_time: string | null;
+  weekdays: number[] | null;
+  tz_offset_minutes: number | null;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  merged_runs: number;
+  created_at: string;
+  updated_at: string;
+  upcoming: string[];
+};
+
 export type Member = {
   membership_id: string;
   type: "human" | "agent";
@@ -217,6 +238,15 @@ export type Attachment = {
   size_bytes: number;
 };
 
+/** 虚拟员工这一轮交出的群文件（交付卡片）：原件仍在群文件里，这里只是挂在回复下面的引用。 */
+export type Presented = {
+  file_id: string;
+  name: string;
+  content_type: string;
+  size_bytes: number;
+  note?: string;
+};
+
 export type Message = {
   id: string;
   stream_id: string;
@@ -228,6 +258,8 @@ export type Message = {
   mentions: { type: "human" | "agent"; id: string }[];
   attachments?: Attachment[];
   deliveries?: Delivery[];
+  /** 这一轮交出的群文件；卡片只给客户端看，不进模型上下文。 */
+  presented?: Presented[];
   kind: "chat" | "system";
   /** 替身代答时是被谁的名下任务触发的：署名仍是员工，界面要标出这是替谁说话。 */
   on_behalf_of?: string | null;

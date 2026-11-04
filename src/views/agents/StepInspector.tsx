@@ -2,6 +2,7 @@
 // 数据只来自 agents.trajectory（轻列没有 detail，原文在那儿才拿得到），所以这里纯粹是展示。
 import { useMemo, useState } from "react";
 import { cn } from "@/lib/utils";
+import { describeCode } from "../../api";
 import { clockOf } from "../../lib/format";
 import { Notice, StatRow } from "../../lib/ui";
 import type { RunStep, TrajectoryResponse } from "../../types";
@@ -26,6 +27,10 @@ const STEP_ERROR: Record<string, string> = {
   step_write_failed: "这一步没能写进库。",
   summary_empty: "上游回了空正文，这批记录没折进摘要；水位线没动，下次超预算会再折。",
 };
+
+// upstream_* 那句话的家在 api.ts 的错误码清单里（界面上别处也要用同一个码说同一件事），
+// 这里只是把它接到这一步下面，不在两处各写一遍。
+const stepErrorNote = (code: string) => STEP_ERROR[code] ?? (code.startsWith("upstream_") ? describeCode(code) : "");
 
 function ms(msValue: number | null | undefined): string {
   if (msValue === null || msValue === undefined) return "—";
@@ -122,6 +127,8 @@ export function StepInspector({ step, mail, schemas, loading, error, onRefresh }
     }
   }, [detail.prompt_slots]);
   const firstRewrite = slots?.findIndex(([, , volatile]) => volatile) ?? -1;
+  // 整封的码常常就是这一步的码：同一句话在一屏里说两遍是噪声，只在两者不同才补一句人话。
+  const mailErrorNote = mail?.error && mail.error !== step?.error ? stepErrorNote(mail.error) : "";
   const charsOf = (volatile: boolean) => (slots ?? [])
     .filter(([, , slotVolatile]) => slotVolatile === volatile)
     .reduce((sum, [, chars]) => sum + chars, 0);
@@ -198,10 +205,14 @@ export function StepInspector({ step, mail, schemas, loading, error, onRefresh }
           {step.error ? (
             <p className="mt-1 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-[10.5px] leading-relaxed text-destructive">
               <span className="font-mono">{step.error}</span>
-              <span className="mt-0.5 block text-foreground/80">{STEP_ERROR[step.error] ?? ""}</span>
+              <span className="mt-0.5 block text-foreground/80">{stepErrorNote(step.error)}</span>
             </p>
           ) : null}
+          {/* 整封的失败码原来只有裸码一行；同一句话在别处怎么说这里就怎么说，省得两处口径分叉。 */}
           {mail?.error ? <Row label="整封的状态" value={mail.error} /> : null}
+          {mailErrorNote ? (
+            <p className="mt-0.5 text-right text-[10.5px] leading-relaxed text-muted-foreground">{mailErrorNote}</p>
+          ) : null}
           <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
             群聊里看不到这些过程——它们只记在这封邮件的轨迹上，正文照常只发最终回复。
           </p>
