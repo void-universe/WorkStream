@@ -73,6 +73,9 @@ const step = (title) => console.log(`\n${title}`);
  */
 function startMockUpstream() {
   const seen = [];
+  // 压缩信的那次调用按剧本换德性：ok 正常出摘要，empty 只回空正文，boom 直接 500。
+  // 折不动时水位线该不该动是摘要覆盖对不对得上的关键，所以两种坏德性都要能重跑。
+  const scripts = { compress: "ok" };
   const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
   const server = createServer((req, res) => {
     let raw = "";
@@ -88,6 +91,13 @@ function startMockUpstream() {
       }
       seen.push(body);
       res.on("error", () => {});
+      const system = String(body.messages?.[0]?.content ?? "");
+      // 压缩剧本 boom 要在 SSE 头发出之前决定状态码，所以这一条单独前置。
+      if (system.includes("压成不超过 600 字") && scripts.compress === "boom") {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "mock_compress_boom" } }));
+        return;
+      }
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
       const send = (delta, finishReason = null) => res.write(
         `data: ${JSON.stringify({ id: "mock", choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`,
@@ -96,17 +106,25 @@ function startMockUpstream() {
       // 思考链增量 + 只在请求带了 stream_options.include_usage 时才补的用量块：
       // 两者一起验“我们有发、有收”，不然轨迹里的用量列会悄悄全是空。
       const think = (text) => { if (alive()) send({ reasoning_content: text }); };
+      // 用量块的四种真实口径：full 带两个子桶、bare 只有总数、sketchy 子桶比总数还大、none 压根不回了。
+      // 落库要分得清"没这项"和"这项是 0"，所以形状得能按剧本换，不能只验最整齐的那一种。
+      const USAGE = {
+        full: {
+          prompt_tokens: 812, completion_tokens: 24, total_tokens: 836,
+          prompt_tokens_details: { cached_tokens: 640 },
+          completion_tokens_details: { reasoning_tokens: 9 },
+        },
+        bare: { prompt_tokens: 812, completion_tokens: 24 },
+        sketchy: {
+          prompt_tokens: 812, completion_tokens: 24,
+          prompt_tokens_details: { cached_tokens: 1200 },
+          completion_tokens_details: { reasoning_tokens: 40 },
+        },
+      };
+      let usageMode = "full";
       const usageChunk = () => {
-        if (!alive() || body.stream_options?.include_usage !== true) return;
-        res.write(`data: ${JSON.stringify({
-          id: "mock",
-          choices: [],
-          usage: {
-            prompt_tokens: 812, completion_tokens: 24, total_tokens: 836,
-            prompt_tokens_details: { cached_tokens: 640 },
-            completion_tokens_details: { reasoning_tokens: 9 },
-          },
-        })}\n\n`);
+        if (!alive() || body.stream_options?.include_usage !== true || usageMode === "none") return;
+        res.write(`data: ${JSON.stringify({ id: "mock", choices: [], usage: USAGE[usageMode] })}\n\n`);
       };
       const finish = () => {
         if (!alive()) return;
@@ -130,14 +148,19 @@ function startMockUpstream() {
         send({}, "stop");
         finish();
       };
-      const system = String(body.messages?.[0]?.content ?? "");
       const last = body.messages?.[body.messages.length - 1];
+      // 压缩信按剧本回空正文：一条都没折进摘要，就不该把水位线抬上去（5xx 那条在前置分支里直接给状态码）。
+      if (system.includes("压成不超过 600 字") && scripts.compress === "empty") { send({}, "stop"); finish(); return; }
       if (system.includes("被 @ 你的新消息打断")) { sayFast("已按插话重排：一、准备；二、执行；三、复盘。"); return; }
       // 按触发消息本身认剧本：下一轮的转录里也带着上一轮的关键词，按全文匹配会把两封混成一份。
       const trig = String(system.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "");
       if (trig.includes("突发甲")) { sayFast("回甲已落群"); return; }
       if (trig.includes("突发乙")) { sayFast("回乙已落群"); return; }
       if (trig.includes("慢慢写")) { await say("正在慢慢写这段长正文", 140); return; }
+      // 按剧本换用量形状：同一个上游的三种回报德性，落库的空/有数要当场分出来。
+      if (trig.includes("用量只报总数")) { usageMode = "bare"; sayFast("这轮的用量只有两个总数。"); return; }
+      if (trig.includes("用量子桶越界")) { usageMode = "sketchy"; sayFast("这轮把缓存数报得比输入数还大。"); return; }
+      if (trig.includes("用量完全不回")) { usageMode = "none"; sayFast("这轮末尾没有用量块。"); return; }
       // 自建端点只吐两个字就卡住：验证静默期间照样问一次要不要掐断，跟云端那条通道对齐。
       if (String(last?.content ?? "").includes("静默卡住")) {
         think("先想一步再动笔。");
@@ -197,6 +220,7 @@ function startMockUpstream() {
       resolve({
         port: server.address().port,
         seen,
+        scripts,
         close: () => new Promise((done) => { server.close(() => done()); }),
       });
     });
@@ -569,6 +593,13 @@ async function main() {
   check("建档时带上的个性签名会回读", agent.payload.agent?.signature === "资料整理 · 先列清单再动手", agent.payload.agent);
   check("虚拟员工建档时能带头像", agent.payload.agent?.avatar === AVATAR, agent.payload.agent);
   check("响应不回显明文 Key", !JSON.stringify(agent.payload).includes("demo-key-1234"));
+  // 凭据只有一个可读口径：掩码尾号。曾经挂过一个写死的 api_key_set: true——UI 没用它，
+  // 但它长得像读数，谁都可能拿它当"密钥有效"的证据，所以把它连同恒等的外壳函数一起删了。
+  check("员工资料里凭据只有尾号，没有冒充读数的旗标",
+    agent.payload.agent?.api_key_tail === `••••${"demo-key-1234".slice(-4)}`
+      && !("api_key_set" in (agent.payload.agent ?? {}))
+      && !("api_key" in (agent.payload.agent ?? {}))
+      && !("api_key_cipher" in (agent.payload.agent ?? {})), agent.payload.agent);
   const ping = await call("agents.test", { token: ana, body: { id: agentId } });
   check("连接自检可用（演示模型）", ping.payload.result?.reachable === true, ping.payload);
   const badUrl = await call("agents.create", {
@@ -626,6 +657,10 @@ async function main() {
     injected.startsWith("### WorkStream 平台技能")
       && injected.includes("### DevStream 群文件与公告")
       && injected.includes("发布检查清单"), injected.slice(0, 160));
+  check("技能块自带出处：谁教的、哪一版，模型看得见也答得出",
+    injected.startsWith("### WorkStream 平台技能（内置，随平台一起发）")
+      && injected.includes("### 周报与进度同步（平台技能，未标版本）")
+      && injected.includes("### 发布检查清单（本地上传，未标版本）"), injected.slice(0, 400));
 
   step("3. 群：UUID、申请、审批、角色");
   const stream = await call("streams.create", { token: ana, body: { name: "上线前定稿", agent_ids: [agentId], announcement: "本周五定稿。" } });
@@ -850,6 +885,11 @@ async function main() {
   const skillList = await executeTool(db, scope, "list_skills", {});
   check("内置技能有两个（平台 + DevStream）",
     (skillList.skills ?? []).filter((item) => item.builtin).length === 2, skillList);
+  const uploadedSkill = await executeTool(db, scope, "read_skill", { name: "发布检查清单" });
+  check("工具回的技能带同一份出处，不跟上下文里的说法分叉",
+    skillTool.origin === "内置，随平台一起发" && uploadedSkill.origin === "本地上传，未标版本"
+      && (skillList.skills ?? []).every((item) => Boolean(item.origin)),
+    { 内置: skillTool.origin, 上传: uploadedSkill.origin, 清单: skillList.skills?.map((item) => item.origin) });
   const toolFile = await executeTool(db, scope, "upload_file", { name: "员工草稿.md", content: "# 员工写入\n第二条" });
   check("内部工具可以上传群文件", Boolean(toolFile.file?.id), toolFile);
   const toolRead = await executeTool(db, scope, "read_file", { name: "员工草稿.md" });
@@ -1033,6 +1073,113 @@ async function main() {
   check("摘要覆盖序号把水位线推到最新记录之前（积压真的排空了）", covers > 0, { covers });
   check("窗口从水位线连续往下，中间不留既看不见也没被摘要覆盖的缺口",
     finalSeq === covers + 1, { finalSeq, covers });
+
+  step("8c2. 压缩失败不许抬水位线：折不动的那批记录要还能再折");
+  // 把预算压到装不下，让每一轮回复都补投一封后台压缩信，好反复触发压缩这一步。
+  await call("agents.update", { token: ana, body: { id: mockAgentId, context_chars: 2000 } });
+  for (const word of ["积压甲", "积压乙", "积压丙", "积压丁", "积压戊"]) {
+    await call("messages.send", { token: ana, body: { stream_id: streamId, content: `凑一批旧记录 ${word}` } });
+  }
+  const runCompress = async (content, sid = streamId) => {
+    await call("messages.send", {
+      token: ana, body: { stream_id: sid, content, mentions: [{ type: "agent", id: mockAgentId }] },
+    });
+    for (let round = 0; round < 8; round += 1) {
+      const tick = await call("scheduler.tick", { token: ana, method: "GET" });
+      const hit = (tick.payload.ran ?? []).find((row) => row.mode === "compress" && row.stream_id === sid);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const failNotes = async () => {
+    const mem = await call("agents.memory.list", {
+      token: ana, method: "GET", body: { agent_id: mockAgentId, scope: "stream", stream_id: streamId },
+    });
+    return (mem.payload.items ?? []).filter((row) => String(row.content).startsWith("后台压缩失败"));
+  };
+  const stuckAt = await readCovers();
+  mock.scripts.compress = "boom";
+  const boomRun = await runCompress("@小M 上游报错时的压缩");
+  check("上游 5xx 折不动摘要：这封后台信如实结成失败", boomRun?.status === "failed", boomRun);
+  check("失败不抬水位线：那批记录还留在窗口里，下一轮真能再折", (await readCovers()) === stuckAt, { stuckAt, now: await readCovers() });
+  mock.scripts.compress = "empty";
+  const emptyRun = await runCompress("@小M 空正文时的压缩");
+  check("上游回空正文等于一条都没折：错误码如实报 summary_empty，水位线照旧不动",
+    emptyRun?.status === "failed" && emptyRun?.error === "summary_empty" && (await readCovers()) === stuckAt, emptyRun);
+  const notes = await failNotes();
+  check("可见 note 只留最近一条：连错两轮不把本群记忆刷成错误日志",
+    notes.length === 1 && String(notes[0].content).includes("还留在窗口里"), notes.map((row) => row.content));
+  mock.scripts.compress = "ok";
+  const okRun = await runCompress("@小M 恢复后的压缩");
+  const moved = await readCovers();
+  check("对照：上游正常后同一批记录真的折动了，水位线从原地推进",
+    okRun?.status === "done" && moved > stuckAt, { okRun, stuckAt, moved });
+  const okTraj = await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: okRun?.mail_id } });
+  const foldDetail = (okTraj.payload.steps ?? []).find((row) => row.kind === "model")?.detail ?? {};
+  check("折叠声称覆盖的序号区间进步骤：区间头一条正接上上次没折动的那条",
+    Number(foldDetail.covers_from) === stuckAt + 1 && Number(foldDetail.covers_to) === moved, foldDetail);
+  const seqs = new Set((await db.messages.list([["stream_id", streamId]], { columns: "seq", limit: 900 }))
+    .map((row) => Number(row.seq)));
+  const coveredSeqs = [];
+  for (let value = Number(foldDetail.covers_from); value <= Number(foldDetail.covers_to); value += 1) coveredSeqs.push(value);
+  check("对账：水位线声称吃掉的每一条都真的在群历史里，中间没有洞",
+    coveredSeqs.length > 0 && coveredSeqs.every((value) => seqs.has(value)), { coveredSeqs, stuckAt, moved });
+
+  step("8c3. 一条长贴不许饿死折叠：摘要读的是按行宽剪枝后的那一版");
+  // 单独开一个群：水位线从 0 起，长贴就是它后面的第一条，正是修之前折不动的那个形状。
+  // 入库上限是 8000 字节（中文按 3 字节计），所以夹具用 ASCII 的日志体才真能把一条顶到 7814 字；
+  // 最小档预算那一批只有 4000 字——一条长贴就能把整批占满。
+  const wide = await call("streams.create", { token: ana, body: { name: "长贴挡路组", agent_ids: [mockAgentId] } });
+  const wideStreamId = wide.payload.stream?.id;
+  const longBody = `现场日志开头 ${"x".repeat(7800)} 现场日志结尾`;
+  const longSend = await call("messages.send", { token: ana, body: { stream_id: wideStreamId, content: longBody } });
+  const longSeq = Number(longSend.payload.message?.seq ?? 0);
+  check("先钉住夹具本身：一条 7814 字的长贴落得进库，没顶破 8000 字节上限",
+    longSeq > 0 && longSend.payload.message?.content?.length === longBody.length,
+    { status: longSend.status, error: longSend.payload.error, longSeq });
+  for (const word of ["尾随甲", "尾随乙", "尾随丙", "尾随丁"]) {
+    await call("messages.send", { token: ana, body: { stream_id: wideStreamId, content: `紧跟长贴 ${word}` } });
+  }
+  const wideCovers = async () => {
+    const mem = await call("agents.memory.list", {
+      token: ana, method: "GET", body: { agent_id: mockAgentId, scope: "stream", stream_id: wideStreamId },
+    });
+    return Number((mem.payload.items ?? []).find((m) => m.kind === "summary")?.covers_through_seq ?? 0);
+  };
+  const foldTranscripts = () => mock.seen
+    .filter((body) => String(body.messages?.[0]?.content ?? "").includes("压成不超过 600 字"))
+    .map((body) => String(body.messages?.[1]?.content ?? ""));
+  const wideRun = await runCompress("@小M 长贴挡路时的压缩", wideStreamId);
+  const wideMoved = await wideCovers();
+  check("长贴挡在水位线第一条也不再饿死折叠：这一轮真的折动了",
+    wideRun?.status === "done" && wideMoved > 0, { wideRun, wideMoved });
+  // 按长贴正文认这一批：序号每群各自排，别的群里也有 #2，只有正文不会撞。
+  const foldText = foldTranscripts().find((t) => t.includes("现场日志开头")) ?? "";
+  check("摘要读的是剪枝后的那一版：长贴行尾带上写清原文字数与取回序号的标记",
+    foldText.includes(`全文按 #${longSeq} 取回`) && foldText.includes("截断"), foldText.slice(0, 160));
+  check("剪完按行宽收口：喂给摘要的每一行都不超 1000 字（这批 4000 字均分给最少 4 条）",
+    foldText.split("\n").length > 1 && foldText.split("\n").every((line) => line.length <= 1000),
+    foldText.split("\n").map((line) => line.length));
+  const longRow = await db.messages.byId(longSend.payload.message?.id);
+  check("群里的原文一条没少：剪的只是摘要输入，按序号还能取回全文",
+    String(longRow?.content ?? "").length === longBody.length, { stored: String(longRow?.content ?? "").length });
+  const wideTraj = await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: wideRun?.mail_id } });
+  const wideDetail = (wideTraj.payload.steps ?? []).find((row) => row.kind === "model")?.detail ?? {};
+  check("折叠那一步如实报剪了几条与行宽：摘要不是全文这件事在轨迹里看得见",
+    /条超过 1000 字行宽/.test(String(wideDetail.note ?? "")), wideDetail);
+  // 对照：正常长度的一批照常折，不带截断标记——剪枝不是无条件开刀。
+  const sinceFold = mock.seen.length;
+  for (const word of ["短贴甲", "短贴乙", "短贴丙", "短贴丁", "短贴戊"]) {
+    await call("messages.send", { token: ana, body: { stream_id: wideStreamId, content: `正常长度 ${word}` } });
+  }
+  const ctrlRun = await runCompress("@小M 短贴对照时的压缩", wideStreamId);
+  const ctrlTexts = mock.seen.slice(sinceFold)
+    .filter((body) => String(body.messages?.[0]?.content ?? "").includes("压成不超过 600 字"))
+    .map((body) => String(body.messages?.[1]?.content ?? ""));
+  check("对照：正常长度的批次一条都不截",
+    ctrlRun?.status === "done" && ctrlTexts.length > 0 && ctrlTexts.every((t) => t.includes("#") && !t.includes("截断")),
+    { ctrlRun, sample: ctrlTexts[0]?.slice(0, 160) });
+  await call("agents.update", { token: ana, body: { id: mockAgentId, context_chars: 8000 } });
 
   step("8d. 前缀缓存：稳定态下上一轮窗口整段可复用");
   for (const word of ["前缀甲", "前缀乙"]) {
@@ -1698,7 +1845,7 @@ async function main() {
   const x19ResNoOwner = await toolSafe({ agentId, streamId }, "list_my_resources", {});
   check("list_my_resources：没有主人身份给 owner_missing", x19ResNoOwner.error === "owner_missing", x19ResNoOwner);
   const x19Unknown = await toolSafe(x19Scope, "drop_table", {});
-  check("未注册的工具名一律 tool_not_allowed", x19Unknown.error === "tool_not_allowed", x19Unknown);
+  check("员工回路里没命中的工具名报 connector_tool_unmatched", x19Unknown.error === "connector_tool_unmatched", x19Unknown);
 
   const x19FreshAgent = await call("agents.create", {
     token: ana,
@@ -1846,6 +1993,27 @@ async function main() {
   check("请求带了 stream_options，用量四列才落得下来", Number(x20Steps[0]?.input_tokens) === 812
     && Number(x20Steps[0]?.output_tokens) === 24 && Number(x20Steps[0]?.cached_tokens) === 640
     && Number(x20Steps[0]?.reasoning_tokens) === 9, x20Steps[0]);
+  // 用量口径：拿不到可信的数就留空，不拿 0 冒充"没用 token"——命中率的分子分母只收两个数都算得清的轮。
+  const firstStepOf = async (content) => {
+    const mailId = await sendFor(content);
+    const traj = await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: mailId } });
+    return { step: traj.payload.steps?.[0], mailId };
+  };
+  const { step: bareStep } = await firstStepOf("@小M 用量只报总数（口径样本）");
+  check("上游只报总数：命中与思考两列留空而不是 0", Number(bareStep?.input_tokens) === 812
+    && Number(bareStep?.output_tokens) === 24 && bareStep?.cached_tokens === null
+    && bareStep?.reasoning_tokens === null, bareStep);
+  const { step: sketchyStep } = await firstStepOf("@小M 用量子桶越界（口径样本）");
+  check("子桶比总数还大就不进账：命中率不会算出 100% 以上", Number(sketchyStep?.input_tokens) === 812
+    && Number(sketchyStep?.output_tokens) === 24 && sketchyStep?.cached_tokens === null
+    && sketchyStep?.reasoning_tokens === null, sketchyStep);
+  const { step: noneStep, mailId: noneMail } = await firstStepOf("@小M 用量完全不回（口径样本）");
+  check("上游压根不回用量块：四列全空，这一轮不进命中率分母",
+    ["input_tokens", "output_tokens", "cached_tokens", "reasoning_tokens"]
+      .every((column) => noneStep?.[column] === null), noneStep);
+  check("对照：口径收成空不影响这一轮跑完，正文照样落群",
+    (await db.mail.byId(noneMail, { columns: "status" }))?.status === "done"
+      && String(noneStep?.detail?.content ?? "").includes("没有用量块"), noneMail);
   check("首字延迟被单独记成一个数", x20Steps[0]?.first_token_ms !== null
     && Number.isFinite(Number(x20Steps[0]?.first_token_ms)), x20Steps[0]?.first_token_ms);
   check("工具步把参数与结果原文都留在轨迹里", x20Steps[1]?.name === "search_history"
@@ -1866,7 +2034,7 @@ async function main() {
   const x20GhostSteps = (await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: x20GhostMail } })).payload.steps ?? [];
   const x20Rejected = x20GhostSteps.find((row) => row.name === "drop_table");
   check("模型编出来的工具名也留一条失败步骤，而不是悄悄消失",
-    x20Rejected?.status === "failed" && x20Rejected?.error === "tool_not_allowed"
+    x20Rejected?.status === "failed" && x20Rejected?.error === "tool_unknown"
     && String(x20Rejected?.detail?.args ?? "").includes("\"x\""), x20Rejected);
   check("越界工具不拖垮这轮：最终仍回一条", (await db.mail.byId(x20GhostMail, { columns: "status" }))?.status === "done", x20GhostMail);
 
@@ -1988,18 +2156,25 @@ async function main() {
   await db.plugins.removeAll([["owner_id", zedId]]);
   const x21Zed = await call("plugins.add", { token: zedToken, body: { name: "Zed 自己的", endpoint: `${pluginBase}/mcp`, token: "zed-7777" } });
   check("腾出额度后能再接，且各人的连接器互不进对方的清单", x21Zed.payload.plugin?.status === "ready"
-    && (await connectorToolDefs(db, anaId, INTERNAL_TOOL_NAMES)).every((row) => row.function.name !== "zed_only"), x21Zed.payload);
+    && (await connectorToolDefs(db, anaId, INTERNAL_TOOL_NAMES)).defs.every((row) => row.function.name !== "zed_only"), x21Zed.payload);
 
-  const x21Defs = await connectorToolDefs(db, anaId, INTERNAL_TOOL_NAMES);
+  const x21Pick = await connectorToolDefs(db, anaId, INTERNAL_TOOL_NAMES);
+  const x21Defs = x21Pick.defs;
   check("主人启用中连接器的工具并进员工清单",
     x21Defs.some((row) => row.function.name === "get_weather") && x21Defs.some((row) => row.function.name === "long_text"),
     x21Defs.map((row) => row.function.name));
   check("与内置重名的外部工具让位，不出现两份",
     !x21Defs.some((row) => row.function.name === "search_history"), x21Defs.map((row) => row.function.name));
+  // 让位不等于丢弃：被谁挤掉要查得到，否则"接了连接器却用不上"在任何一面都看不出来。
+  check("让位的工具如实报进 skipped，并说清被谁挤掉",
+    x21Pick.skipped.some((item) => item.name === "search_history" && item.by === "内置工具"), x21Pick.skipped);
+  check("对照：没让位的连接器工具不混进 skipped",
+    !x21Pick.skipped.some((item) => item.name === "get_weather"), x21Pick.skipped);
 
   await call("plugins.update", { token: ana, body: { id: x21Id, enabled: false } });
-  check("停用后外部声明立刻从清单消失", (await connectorToolDefs(db, anaId, INTERNAL_TOOL_NAMES)).length === 0);
-  check("停用中的连接器工具调用被拒", (await toolSafe(x21Scope, "get_weather", { city: "杭州" })).error === "tool_not_allowed");
+  check("停用后外部声明立刻从清单消失", (await connectorToolDefs(db, anaId, INTERNAL_TOOL_NAMES)).defs.length === 0);
+  check("停用中的连接器工具调用被拒：名字不在启用中的清单里",
+    (await toolSafe(x21Scope, "get_weather", { city: "杭州" })).error === "connector_tool_unmatched");
   const x21Re = await call("plugins.update", { token: ana, body: { id: x21Id, enabled: true } });
   check("重新启用后名字与开关都如实回显", x21Re.payload.plugin?.name === "天气插件" && x21Re.payload.plugin?.enabled === true, x21Re.payload);
   const x21Call = await toolSafe(x21Scope, "get_weather", { city: "杭州" });
@@ -2012,8 +2187,8 @@ async function main() {
   check("外部结果超过 6000 字截到 6000，不撑爆上下文", x21Capped.ok === true && x21Capped.text?.length === 6000, { len: x21Capped.text?.length });
   const x21Boom = await toolSafe(x21Scope, "boom", {});
   check("外部工具自己报错如实传成错误，不装成成功", x21Boom.error === "plugin_tool_failed" && String(x21Boom.text).includes("炸了"), x21Boom);
-  check("对外 MCP 那条路（作用域里没有 agentId）碰不到插件工具",
-    (await toolSafe({ streamId, ownerId: anaId }, "get_weather", { city: "杭州" })).error === "tool_not_allowed");
+  check("对外 MCP 那条路（作用域里没有 agentId）碰不到插件工具：报的是不在员工回路里",
+    (await toolSafe({ streamId, ownerId: anaId }, "get_weather", { city: "杭州" })).error === "connector_needs_agent_run");
 
   const x21Moved = await call("plugins.update", { token: ana, body: { id: x21Id, name: "改名插件", endpoint: `${pluginBase}/other` } });
   check("换端点先清掉旧工具缓存，再如实重测", x21Moved.payload.plugin?.name === "改名插件"
@@ -2035,6 +2210,9 @@ async function main() {
   const x21Traj = await call("agents.trajectory", { token: ana, method: "GET", body: { mail_id: x21Mail } });
   const x21Steps = x21Traj.payload.steps ?? [];
   check("插件调用走同一条管道：模型→工具→模型", x21Steps.map((row) => row.kind).join(",") === "model,tool,model", x21Steps.map((row) => row.kind));
+  // 这一轮模型确实没拿到那个重名的外部工具，而"为什么没拿到"必须在这一步的轨迹里能读出来。
+  check("被内置挤掉的外部工具在这轮模型步的备注里如实说出",
+    String(x21Steps[0]?.detail?.note ?? "").includes("search_history（被内置工具挤掉）"), x21Steps[0]?.detail?.note);
   check("外部工具的参数与结果都落进轨迹", x21Steps[1]?.name === "get_weather"
     && String(x21Steps[1]?.detail?.args ?? "").includes("杭州") && String(x21Steps[1]?.detail?.result ?? "").includes("晴 26 度"), x21Steps[1]);
   check("检视器的 Schema 页也拿得到外部工具的入参声明",
@@ -2095,6 +2273,10 @@ async function main() {
   check("快照进本地市场，带着版本与来源", (await call("skills.market", { token: ana, method: "GET" })).payload.items
     ?.some((row) => row.id === snapId && row.version === "1.2.0" && row.source_registry_id === regId));
   check("快照正文注入员工上下文", (await skillPrompt(store(supabase), mockAgentId)).includes("### release-check 技能"));
+  check("远端技能块的出处报源的名字与 slug，不报一个谁都查不到的 uuid",
+    (await skillPrompt(store(supabase), mockAgentId))
+      .includes("### release-check 技能（远端源「社区技能源」的 release-check，快照 1.2.0）"),
+    (await skillPrompt(store(supabase), mockAgentId)).slice(0, 400));
   check("快照不进别人的市场", !(await call("skills.market", { token: bToken, method: "GET" })).payload.items?.some((row) => row.id === snapId));
   const x22Again = await call("skills.remoteInstall", { token: ana, body: { registry_id: regId, slug: "release-check", agent_id: mockAgentId } });
   check("重复装同一员工不建第二条快照", x22Again.payload.skill?.id === snapId
@@ -2226,6 +2408,14 @@ async function main() {
   await call("registries.remove", { token: ana, body: { id: regId } });
   check("源没了，版本自查如实报 registry_not_found", (await call("skills.checkUpdates", { token: ana, method: "GET", body: { agent_id: mockAgentId } })).payload.unavailable
     ?.some((row) => row.skill_id === snapId && row.reason === "registry_not_found"));
+  const deadSource = await skillPrompt(store(supabase), mockAgentId);
+  const blockHeads = (body) => body.split("\n").filter((line) => line.startsWith("### ")).join(" ｜ ");
+  // 版本从快照行取而不是写死：这一段前面还排着更新与撤下的剧本，装进来时那一版早已不是当前版。
+  const snapVersion = (await call("skills.get", { token: ana, method: "GET", body: { id: snapId } })).payload.skill?.version;
+  check("源删掉了技能块照旧在上下文里，出处如实写「已删除的源」而不是冒充内置",
+    Boolean(snapVersion)
+      && deadSource.includes(`### release-check 技能（远端源「已删除的源」的 release-check，快照 ${snapVersion}）`),
+    blockHeads(deadSource));
   check("清空后源清单是空的", (await call("registries.list", { token: ana, method: "GET" })).payload.items?.length === 0);
   check("版本比对按数字段比大小：1.10 新于 1.2", isUpdateAvailable("1.2.0", "1.10.0") === true
     && isUpdateAvailable("1.10.0", "1.9.9") === false);

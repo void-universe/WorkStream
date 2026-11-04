@@ -16,12 +16,15 @@ const STATUS_LABEL: Record<RunStep["status"], string> = {
 
 /** 轨迹里才会出现的错误码；库外的码交给 describeError 兜底。 */
 const STEP_ERROR: Record<string, string> = {
-  tool_not_allowed: "这个工具名不在清单里，是模型临时编出来的，没有执行。",
+  tool_unknown: "这个工具名不在本轮清单里，是模型临时编出来的，没有执行。",
+  connector_tool_unmatched: "这个外部工具已经不在主人启用的连接器清单里（停用或删掉了），没有执行。",
+  connector_needs_agent_run: "外部连接器的工具只在员工接活的那一轮里可调，别的路径不认。",
   invalid_arguments: "参数不是合法 JSON，没有送进工具。",
   interrupted: "群里有人插话，这一轮被掐断。",
   slice_interrupted: "时间片结束时这一步还没合上，已回收。",
   step_unfinished: "整封邮件收尾时这一步仍未结束。",
   step_write_failed: "这一步没能写进库。",
+  summary_empty: "上游回了空正文，这批记录没折进摘要；水位线没动，下次超预算会再折。",
 };
 
 function ms(msValue: number | null | undefined): string {

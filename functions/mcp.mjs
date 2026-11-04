@@ -10,7 +10,7 @@ import { createPipeline } from "./pipeline.mjs";
 import { callConnectorTool, resolveConnectorTool } from "./plugins.mjs";
 import { runStepsTrace } from "./steps.mjs";
 import { seal } from "./sec.mjs";
-import { BUILTIN_SKILLS, installedSkillRows } from "./skills.mjs";
+import { BUILTIN_ORIGIN, BUILTIN_SKILLS, installedSkillRows, skillOrigins } from "./skills.mjs";
 import { CONTEXT_CHARS_DEFAULT, email as emailOf, json, newId, now, oneOf, sha256Hex, text, truncate, uuid } from "./util.mjs";
 
 const shape = (properties = {}, required = []) => ({
@@ -519,11 +519,15 @@ const TOOL_HANDLERS = {
   },
   list_skills: async ({ db, scope, args, env, streamId }) => {
     const installed = scope.agentId ? await installedSkillRows(db, scope.agentId) : [];
+    const origins = await skillOrigins(db, installed);
     return {
       skills: [
-        ...BUILTIN_SKILLS.map((skill) => ({ name: skill.name, summary: skill.summary, builtin: true })),
+        ...BUILTIN_SKILLS.map((skill) => ({
+          name: skill.name, summary: skill.summary, builtin: true, origin: BUILTIN_ORIGIN,
+        })),
         ...installed.map((row) => ({
           name: row.name, summary: row.summary, category: row.category, builtin: false,
+          origin: origins.get(String(row.id)),
         })),
       ],
     };
@@ -531,12 +535,17 @@ const TOOL_HANDLERS = {
   read_skill: async ({ db, scope, args, env, streamId }) => {
     const wanted = text(args.name ?? "", { max: 120, name: "name" });
     const builtin = BUILTIN_SKILLS.find((skill) => skill.name === wanted);
-    if (builtin) return { name: builtin.name, body: builtin.body };
+    if (builtin) return { name: builtin.name, origin: BUILTIN_ORIGIN, body: builtin.body };
     const installed = scope.agentId ? await installedSkillRows(db, scope.agentId) : [];
     const match = installed.find((row) => row.name === wanted);
     if (!match) return { error: "skill_not_found" };
     const full = await db.skills.byId(match.id, { columns: "body" });
-    return { name: match.name, body: truncate(full?.body ?? "", 20000) };
+    const origins = await skillOrigins(db, [match]);
+    return {
+      name: match.name,
+      origin: origins.get(String(match.id)),
+      body: truncate(full?.body ?? "", 20000),
+    };
   },
   list_my_resources: async ({ db, scope, args, env, streamId }) => {
     if (!scope.ownerId) return { error: "owner_missing" };
@@ -749,9 +758,10 @@ export async function executeTool(db, scope, name, args = {}, env = null, meta =
     }
     // 外部连接器的工具：只有这轮真拿到主人启用中连接器的声明才放行，
     // 且必须发生在员工回路里——对外 MCP 那条路按 EXTERNAL_TOOL_NAMES 白名单走，碰不到这里。
-    if (!scope.agentId) return { error: "tool_not_allowed" };
+    // 两种"没成"是三件不同的事，不许并成一个码：不在员工回路里 ≠ 这个名字不在启用中的清单里。
+    if (!scope.agentId) return { error: "connector_needs_agent_run" };
     const target = await resolveConnectorTool(db, env, scope.ownerId, name);
-    if (!target) return { error: "tool_not_allowed" };
+    if (!target) return { error: "connector_tool_unmatched" };
     return callConnectorTool(target, ctx.args);
   });
 }

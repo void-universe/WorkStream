@@ -26,7 +26,7 @@ export const actions = {
     const rows = await db.agents.list([["owner_id", user.id]], {
       columns: AGENT_COLUMNS, order: ["created_at", { ascending: true }],
     });
-    return json({ ok: true, items: rows.map(publicAgent) });
+    return json({ ok: true, items: rows });
   },
 
   async "agents.get"({ db, user, params }) {
@@ -41,7 +41,7 @@ export const actions = {
     const presence = await agentPresence(db, agent.id);
     return json({
       ok: true,
-      agent: publicAgent(agent),
+      agent,
       common_memory: memories,
       skills: await skillsForAgent(db, agent.id),
       streams,
@@ -132,7 +132,7 @@ export const actions = {
       updated_at: now(),
     }, { columns: "id" });
     await installDefaultSkillsFor(db, id, user.id);
-    return json({ ok: true, agent: publicAgent(created) });
+    return json({ ok: true, agent: created });
   },
 
   async "agents.update"({ db, user, body, env }) {
@@ -189,7 +189,7 @@ export const actions = {
       await db.qca_sessions.removeAll([["agent_id", agent.id]]);
     }
     const row = await db.agents.byId(agent.id, { columns: AGENT_COLUMNS });
-    return json({ ok: true, agent: publicAgent(row) });
+    return json({ ok: true, agent: row });
   },
 
   async "agents.delete"({ db, user, body }) {
@@ -260,7 +260,7 @@ export const actions = {
       columns: "id,scope,stream_id,kind,content,covers_through_seq,created_at,updated_at,source",
       order: ["created_at", { ascending: false }], limit: 200,
     });
-    return json({ ok: true, agent: publicAgent(agent), items: rows });
+    return json({ ok: true, agent, items: rows });
   },
 
   async "agents.memory.put"({ db, user, body }) {
@@ -300,8 +300,6 @@ export const actions = {
     return json({ ok: true, id: removed });
   },
 };
-
-export const publicAgent = (row) => ({ ...row, api_key_set: true });
 
 const privateAllowed = (env) => env?.("WORKSTREAM_DEV") === "1";
 
@@ -383,16 +381,23 @@ export async function completeForAgent({
 
 const IDLE_MS = 800;
 
-/** OpenAI 用量对象 → 我们要落库的四个数；缺字段就留 null，不拿 0 冒充"没用 token"。 */
+/**
+ * OpenAI 用量对象 → 我们要落库的四个数；缺字段就留 null，不拿 0 冒充"没用 token"。
+ * total 不落：它等于 input + output，没有哪一列需要它。
+ */
 function normalizeUsage(raw) {
   if (!raw || typeof raw !== "object") return null;
   const pick = (...values) => values.find((value) => Number.isFinite(Number(value))) ?? null;
+  const input = pick(raw.prompt_tokens);
+  const output = pick(raw.completion_tokens);
+  // cached/reasoning 是总数的子桶：自建端点各家口径不一，子桶比总数还大就是这份数不可信。
+  // 按"不回报"收成 null——界面上的命中率与思考占比才不会算出超过 100%，也不会把它投进分母。
+  const subset = (part, whole) => (part === null || whole === null || part > whole ? null : part);
   return {
-    input: pick(raw.prompt_tokens),
-    output: pick(raw.completion_tokens),
-    total: pick(raw.total_tokens),
-    cached: pick(raw.prompt_tokens_details?.cached_tokens),
-    reasoning: pick(raw.completion_tokens_details?.reasoning_tokens),
+    input,
+    output,
+    cached: subset(pick(raw.prompt_tokens_details?.cached_tokens), input),
+    reasoning: subset(pick(raw.completion_tokens_details?.reasoning_tokens), output),
   };
 }
 

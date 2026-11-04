@@ -209,6 +209,37 @@ export async function skillsForAgent(db, agentId) {
   return [...BUILTIN_SKILLS.map(builtinMeta), ...(await installedSkillRows(db, agentId))];
 }
 
+/**
+ * 技能块上的出处：模型回答「这条规矩是谁教的」时要有凭据，后台也要能对回市场里那一条。
+ * 删源不抽走已抄到本地的快照，所以源查不到时如实写「已删除的源」，不退成「内置」冒充平台自带。
+ */
+const originLabel = (row, registryNames) => {
+  if (row.source === "remote") {
+    const name = registryNames.get(String(row.source_registry_id ?? ""));
+    return `远端源「${name ?? "已删除的源"}」的 ${row.source_slug || "（源上没给 slug）"}，快照 ${row.version || "源上未标版本"}`;
+  }
+  const who = row.source === "upload" ? "本地上传" : row.source === "public" ? "平台技能" : "内置";
+  return `${who}，${row.version ? `版本 ${row.version}` : "未标版本"}`;
+};
+
+/** 内置技能不进技能表，出处跟着平台版本走，界面上没有可点开的来源。 */
+export const BUILTIN_ORIGIN = "内置，随平台一起发";
+
+/** 一批技能行各自的出处文案。 */
+export async function skillOrigins(db, rows) {
+  // 远端快照的出处要报源的名字，不报一个谁都查不到的 uuid；只有真装了远端技能才多这一次查。
+  const remoteIds = [...new Set(rows.filter((row) => row.source === "remote")
+    .map((row) => String(row.source_registry_id ?? "")).filter(Boolean))];
+  const registryNames = new Map();
+  if (remoteIds.length) {
+    const found = await db.skill_registries.list([["id", remoteIds]], { columns: "id,name", limit: 20 });
+    for (const row of found) registryNames.set(String(row.id), row.name);
+  }
+  const out = new Map();
+  for (const row of rows) out.set(String(row.id), originLabel(row, registryNames));
+  return out;
+}
+
 /** 注入上下文：内置技能排第一，按预算截断，保证平台能力永远在。 */
 export async function skillPrompt(db, agentId, maxChars = 6000) {
   const installed = await installedSkillRows(db, agentId);
@@ -218,9 +249,10 @@ export async function skillPrompt(db, agentId, maxChars = 6000) {
     const rows = await db.skills.list([["id", ids]], { columns: "id,body", limit: 100 });
     for (const row of rows) bodies.set(row.id, row.body);
   }
+  const origins = await skillOrigins(db, installed);
   const blocks = [
-    ...BUILTIN_SKILLS.map((skill) => `### ${skill.name}\n${skill.body}`),
-    ...installed.map((row) => `### ${row.name}\n${truncate(bodies.get(row.id) ?? "", MAX_BODY)}`),
+    ...BUILTIN_SKILLS.map((skill) => `### ${skill.name}（${BUILTIN_ORIGIN}）\n${skill.body}`),
+    ...installed.map((row) => `### ${row.name}（${origins.get(String(row.id))}）\n${truncate(bodies.get(row.id) ?? "", MAX_BODY)}`),
   ];
   const parts = [];
   let used = 0;

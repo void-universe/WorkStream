@@ -1,5 +1,5 @@
 // 调度与虚拟员工执行引擎：邮箱 FIFO + 按权重的时间片、上下文压缩、MCP 工具回路。
-import { AGENT_COLUMNS, AGENT_SECRET_COLUMNS, completeForAgent, publicAgent } from "./agents.mjs";
+import { AGENT_COLUMNS, AGENT_SECRET_COLUMNS, completeForAgent } from "./agents.mjs";
 import { armInterrupt, disarmInterrupt, fireInterrupt } from "./bus.mjs";
 import { shapeMessage, streamWeight } from "./chat.mjs";
 import { queueDelegateMail } from "./delegate.mjs";
@@ -138,7 +138,7 @@ export const actions = {
       const weightOf = new Map(weights.map((w) => [w.stream_id, w.weight]));
       const total = ids.reduce((sum, id) => sum + (weightOf.get(id) ?? 1), 0);
       rows.push({
-        agent: publicAgent(agent),
+        agent,
         streams: streams.map((s) => {
           const weight = weightOf.get(s.id) ?? 1;
           const mine = mail.filter((m) => m.stream_id === s.id);
@@ -337,20 +337,28 @@ export async function runTask({ db, env, mailId }) {
     // 也避免把十几万字符塞进一次 400 token 的摘要里。
     const prepared = await assemble({
       db, agent, stream, anchor: "head",
-      maxChars: Math.max(4000, Math.floor(streamBudget(stream, agent) * 0.12)),
+      maxChars: compressBatchChars(stream, agent),
+      // 保底取满一批：长贴占满预算时也让这一批有得折，超出部分在折叠前逐条剪掉。
+      minRows: SUMMARY_MIN_ROWS,
     });
     let folded;
     try {
       folded = await compress({ db, env, agent, stream, prepared, key, trace });
     } catch (error) {
       const code = error?.code ?? error?.status ?? "compress_failed";
+      // 同一批记录每轮都会再失败一次：note 只留最近一条，否则本群记忆块会被同一句话刷屏。
+      // 用 removeAll 而不是 remove——条件可能一次命中多行，remove 走 maybeSingle 在线上会直接报错。
+      await db.memories.removeAll([
+        ["agent_id", agent.id], ["scope", "stream"], ["stream_id", stream.id],
+        ["kind", "note"], ["source", "compression"],
+      ]);
       await db.memories.insert({
         id: newId(), agent_id: agent.id, scope: "stream", stream_id: stream.id, kind: "note",
-        content: `后台压缩失败：${code}（下一轮会重试）`, covers_through_seq: null,
+        content: `后台压缩失败：${code}（这批记录还留在窗口里，下次超预算再折）`, covers_through_seq: null,
         source: "compression", created_at: now(), updated_at: now(),
       }, { columns: "id" });
       await finish(db, mailId, "failed", String(code));
-      return { status: "failed", error: String(code) };
+      return { status: "failed", mode: "compress", error: String(code) };
     }
     await finish(db, mailId, "done", null);
     // 一次只折叠一批；水位线之后还压着记录就续投下一封，积压在后台自己排空，不用等真人再发一条。
@@ -519,6 +527,21 @@ function streamBudget(stream, agent) {
   );
 }
 
+/**
+ * 一次折叠的字符上限：摘要请求只给 400 token 输出，输入太长只会让折出来的要点更糊，
+ * 所以积压再多也是一批批排空，不是一把全塞。
+ */
+const compressBatchChars = (stream, agent) => Math.max(4000, Math.floor(streamBudget(stream, agent) * 0.12));
+
+/**
+ * 摘要最少要几条才值得折一次，同时给每条分摊到的行宽当分母。
+ * 三处必须用同一个数：取记录时的保底条数、"太少就不折"的门槛、单条剪枝的行宽。
+ * 少一个都用不了——历史 bug 是窗口里第一条恰好是一条近 4000 字的长贴，
+ * 它一条就顶满了这批的预算，后面的记录全被字符上限挡在门外，条数门槛永远不过，
+ * 水位线一步不动，回复窗口也被同一张贴压成一条。
+ */
+const SUMMARY_MIN_ROWS = 4;
+
 /** 图片按固定 1500 字折算进上下文预算：真实 token 由上游决定，这里只要别让它悄悄超窗。 */
 const IMAGE_BUDGET_CHARS = 1500;
 
@@ -601,7 +624,9 @@ async function finish(db, mailId, status, error) {
 /** 上下文组成：common memory + 本群记忆 + 摘要 + 摘要之后的窗口。
  *  anchor=tail（回复用）：取水位线之后最新的一段，被挤出去的旧记录靠 search_history / read_window 查。
  *  anchor=head（压缩用）：从水位线往后连续取一段，摘要声称覆盖到哪个序号就真的覆盖到那儿。 */
-async function assemble({ db, agent, stream, anchor = "tail", maxChars = null }) {
+async function assemble({
+  db, agent, stream, anchor = "tail", maxChars = null, minRows = 1,
+}) {
   const common = await db.memories.list([["agent_id", agent.id], ["scope", "common"]], {
     // 升序拼进上下文：新记忆追加到块尾，旧前缀不被打断（降序会让每条新记忆改写块头）。
     columns: "id,kind,content,created_at", order: ["created_at", { ascending: true }], limit: 20,
@@ -616,6 +641,7 @@ async function assemble({ db, agent, stream, anchor = "tail", maxChars = null })
     // 窗口按字符封顶，不按条数：条数上限会让长群聊在预算还没用满时先被截断。
     maxChars: maxChars ?? Math.floor(streamBudget(stream, agent) * 0.8),
     anchor,
+    minRows,
   });
   const windowHead = Number(rows[0]?.seq ?? 0);
   // 回复回声（「#NN 回应：…」）只在「摘要还没覆盖、窗口又装不下」那一段里才有价值：
@@ -636,8 +662,9 @@ const HISTORY_MAX_PAGES = 50;
 /** 从水位线那一侧按页取，累计到字符上限为止；truncated=true 说明还有记录没进窗口。
  *  整群历史可能几万条，一页页取而不是一把捞，既不会把 Function 的内存打满，也不会白读用不上的行。
  *  不按触发消息的序号设上界：突发时队列里第 2、3 封的触发消息比群里最新一条老，按它截断就会把
- *  自己刚发出的回复挡在窗口外（那些回复序号更大），员工于是一条条重复作答；触发消息另有专块给全。 */
-async function history(db, streamId, { from, maxChars, anchor }) {
+ *  自己刚发出的回复挡在窗口外（那些回复序号更大），员工于是一条条重复作答；触发消息另有专块给全。
+ *  minRows 让字符上限在取满这个条数之前不生效，只有压缩那一路用到（回复窗口不保底，因为它不剪枝）。 */
+async function history(db, streamId, { from, maxChars, anchor, minRows = 1 }) {
   const head = anchor === "head";
   const rows = [];
   let chars = 0;
@@ -660,7 +687,9 @@ async function history(db, streamId, { from, maxChars, anchor }) {
     for (const row of batch) {
       const cost = rowChars(row) + 1;
       // 单条就超上限时也要留一条，否则窗口空了，模型连触发消息之外什么都看不到。
-      if (rows.length && chars + cost > maxChars) { truncated = true; break; }
+      // minRows 是压缩那一路的保底：不足这个条数就不许被字符上限挡住，否则一条长贴就能把整批
+      // 预算占满，后面的记录永远进不来（折叠因此一步也推不动）。超出的部分由折叠前的剪枝收口。
+      if (rows.length >= minRows && chars + cost > maxChars) { truncated = true; break; }
       rows.push(row);
       chars += cost;
     }
@@ -672,69 +701,114 @@ async function history(db, streamId, { from, maxChars, anchor }) {
   return { rows: head ? rows : rows.reverse(), truncated };
 }
 
+/** 剪枝后留在行尾的话：说清这条被剪了、原本多长、按哪个序号能取回全文。
+ *  群里的记录一条没动，剪的只是喂给摘要的那一份，search_history 与 read_window 都拿得回原文。 */
+const foldCutMark = (row, total) => `…（截断，本条 ${total} 字，全文按 #${row.seq} 取回）`;
+
+/**
+ * 折叠前把单条剪到行宽以内。剪完的长度由行宽反推：行宽是这批预算均分给最少条数的份额，
+ * 所以 4 条长贴一起进来也不会把摘要请求撑爆——输出只有 400 token，输入越长折得越糊。
+ * 确定性：同一条记录同一次剪枝结果一致，不留"这次截到哪儿全看上游"的浮动。
+ */
+function pruneForFold(row, lineCap) {
+  const content = String(row.content ?? "");
+  const rendered = rowChars(row);
+  if (rendered <= lineCap) return row;
+  const mark = foldCutMark(row, content.length);
+  // rendered - content.length 是行号、发言者、附图标记这些固定包装；剪正文但要保住包装，
+  // 否则摘要里分不清这句话是谁说的。
+  const keep = Math.max(0, lineCap - (rendered - content.length) - mark.length);
+  // 按码位切而不是按 UTF-16 单元切：行宽是单元数，切在代理对中间会留下半个表情符号，
+  // 上游多半整条请求体拒收，摘要就折不动了。码位数 ≤ 单元数，只会剪得更保守，不会超行宽。
+  const cut = Array.from(content).slice(0, keep).join("");
+  return { ...row, content: `${cut}${mark}` };
+}
+
 /** 压缩：把窗口里较老的一半折叠进摘要，写入该 stream 的记忆并记录覆盖到的序号。
  *  前提：prepared.window 是从水位线往后连续取的那一段（anchor=head），
  *  这样 older 就是水位线之后的一个真前缀，covered 不会把没被读过的记录算成已覆盖。 */
 async function compress({ db, env, agent, stream, prepared, key, trace }) {
   const budget = streamBudget(stream, agent);
   const rows = prepared.window;
-  if (rows.length < 4) return { summary: prepared.summary, windowStart: prepared.windowStart };
+  if (rows.length < SUMMARY_MIN_ROWS) return { summary: prepared.summary, windowStart: prepared.windowStart };
   const keepFrom = Math.max(0, Math.floor(rows.length / 2));
   const older = rows.slice(0, keepFrom);
   const kept = rows.slice(keepFrom);
+  // 剪枝只作用于这一轮的摘要输入；kept 原样返回给回复窗口，模型看到的仍是全文。
+  const lineCap = Math.floor(compressBatchChars(stream, agent) / SUMMARY_MIN_ROWS);
+  const foldable = older.map((row) => pruneForFold(row, lineCap));
+  const prunedCount = foldable.filter((row, index) => row !== older[index]).length;
   let summary = prepared.summary;
+  // 这批记录声称被摘要吃掉的序号区间：区间连续（窗口是从水位线往后连续取的），
+  // 所以记下两头就能重建当时的输入——这是压缩那一轮唯一能复原"喂进去的是哪些条"的东西。
+  const covers = { covers_from: Number(older[0]?.seq ?? 0), covers_to: Number(older.at(-1)?.seq ?? prepared.windowStart) };
+  const foldNote = `折叠 ${older.length} 条较早记录（#${covers.covers_from}–#${covers.covers_to}）`
+    + (prunedCount ? `，其中 ${prunedCount} 条超过 ${lineCap} 字行宽，摘要读的是剪枝后的版本` : "");
   // 压缩也是一轮模型调用：记进步骤，后台信为什么没折动摘要才看得见，而不是只在记忆里留一句话。
   const step = await trace.openCompression({ model: agent.model });
+  let failure = null;
   try {
     // 摘要是一次性提问：云端后端不为它复用群里的 session，免得"帮我摘要"混进群对话史。
     const result = await completeForAgent({
       db, agent, streamId: stream.id, key,
       messages: [
         { role: "system", content: "把下面这段群聊压成不超过 600 字的中文要点摘要，保留结论、待办、数字与人名。" },
-        { role: "user", content: renderTranscript(older) },
+        { role: "user", content: renderTranscript(foldable) },
       ],
       maxTokens: 400,
       timeoutMs: 30000,
-      summary: { lines: older.map((r) => `${r.sender_name}：${r.content}`) },
+      summary: { lines: foldable.map((r) => `${r.sender_name}：${r.content}`) },
       persistSession: false,
     });
-    if (result.content) summary = `${prepared.summary ? `${prepared.summary}\n` : ""}${result.content}`.slice(-Math.max(600, budget * 0.1));
+    // 空正文等于这批一条都没折进摘要：不能让它顺水推舟把水位线抬上去。
+    if (!result.content) failure = "summary_empty";
+    else summary = `${prepared.summary ? `${prepared.summary}\n` : ""}${result.content}`.slice(-Math.max(600, budget * 0.1));
     await trace.close(step, {
-      status: "done",
+      status: failure ? "failed" : "done",
+      error: failure,
       detail: {
         reasoning: result.reasoning ?? "",
         content: result.content ?? "",
-        note: `折叠 ${older.length} 条较早记录`,
+        note: foldNote,
+        ...covers,
       },
       usage: result.usage,
       firstTokenMs: result.first_token_ms,
     });
   } catch (error) {
-    const code = error?.name === "TimeoutError" ? "upstream_timeout" : error?.code ?? error?.status ?? "compress_failed";
-    await trace.close(step, { status: "failed", error: String(code), detail: { note: `折叠 ${older.length} 条较早记录` } });
-    summary = `${prepared.summary}\n（${older.length} 条较早记录压缩失败：${code}，已折叠出上下文窗口）`.trim();
+    failure = String(error?.name === "TimeoutError" ? "upstream_timeout" : error?.code ?? error?.status ?? "compress_failed");
+    await trace.close(step, { status: "failed", error: failure, detail: { note: foldNote, ...covers } });
   }
-  const covered = Number(older.at(-1)?.seq ?? prepared.windowStart);
+  if (failure) {
+    // 折不动就地抛出，水位线原地不动：这批记录下一轮还在窗口里，才真谈得上"重试"。
+    // 旧写法是失败也把水位线抬到 #covers_to，并在摘要尾巴上写一句"已折叠出上下文窗口"——
+    // 记录既没进摘要也没进窗口，那句 note 从此没人能兑现。
+    throw Object.assign(new Error(failure), { code: failure });
+  }
   const existing = await db.memories.list([
     ["agent_id", agent.id], ["scope", "stream"], ["stream_id", stream.id], ["kind", "summary"],
   ], { columns: "id", limit: 10 });
   for (const row of existing) await db.memories.remove([["id", row.id]]);
   await db.memories.insert({
     id: newId(), agent_id: agent.id, scope: "stream", stream_id: stream.id, kind: "summary",
-    content: summary, covers_through_seq: covered, source: "compression",
+    content: summary, covers_through_seq: covers.covers_to, source: "compression",
     created_at: now(), updated_at: now(),
   }, { columns: "id" });
-  return { summary, windowStart: covered, window: kept };
+  return { summary, windowStart: covers.covers_to, window: kept };
 }
 
 /** 工具回路：最多两轮，工具执行都走内部 MCP 实现，作用域锁死在 (agent, stream, owner)。
  *  每一轮模型调用和每一次工具调用都落一条 run_steps，员工详情页的时间线读的就是它。 */
 async function withTools({ db, env, agent, stream, key, messages, watch, trace, contextNote, promptSlots }) {
   const started = Date.now();
-  // 主人启用中的插件工具并进这一轮的清单；重名时内置优先，插件被挤掉。
-  const externalDefs = await connectorToolDefs(db, agent.owner_id, INTERNAL_TOOL_NAMES);
+  // 主人启用中的插件工具并进这一轮的清单；重名时内置优先，插件让位——让位不是丢弃，
+  // 每一条都要在这轮模型步的备注里说清被谁挤掉，否则"接了连接器却用不上"没有任何一面能看出来。
+  const { defs: externalDefs, skipped: shadowedTools } = await connectorToolDefs(db, agent.owner_id, INTERNAL_TOOL_NAMES);
   const externalNames = new Set(externalDefs.map((definition) => definition.function.name));
   const tools = externalDefs.length ? [...TOOL_DEFINITIONS, ...externalDefs] : TOOL_DEFINITIONS;
+  const shadowNote = shadowedTools.length
+    ? `；${shadowedTools.length} 个连接器工具这轮没进清单：${shadowedTools.map((item) => `${item.name}（被${item.by}挤掉）`).join("、")}`
+    : "";
   let working = [...messages];
   let last;
   for (let round = 0; round < 2; round += 1) {
@@ -759,7 +833,7 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
           content: preempted ? (error.payload?.partial ?? "") : "",
           context,
           prompt_slots: promptSlots,
-          note: preempted ? "生成到一半被群里的插话掐断" : "",
+          note: (preempted ? "生成到一半被群里的插话掐断" : "") + shadowNote,
         },
       });
       throw error;
@@ -772,7 +846,7 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
         context,
         prompt_slots: promptSlots,
         tool_names: (answer.tool_calls ?? []).map((call) => call?.function?.name).join(", "),
-        note: answer.mode === "demo" ? "演示模型：不回报思考链与用量" : `finish_reason：${answer.finish_reason ?? "—"}`,
+        note: (answer.mode === "demo" ? "演示模型：不回报思考链与用量" : `finish_reason：${answer.finish_reason ?? "—"}`) + shadowNote,
       },
       usage: answer.usage,
       firstTokenMs: answer.first_token_ms,
@@ -785,8 +859,8 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
     for (const call of last.tool_calls.slice(0, 4)) {
       const name = String(call?.function?.name ?? "");
       if (!INTERNAL_TOOL_NAMES.includes(name) && !externalNames.has(name)) {
-        await trace.recordRejected({ name, callId: call.id, reason: "tool_not_allowed", raw: call?.function?.arguments });
-        results.push({ call_id: call.id, name, output: "tool_not_allowed" });
+        await trace.recordRejected({ name, callId: call.id, reason: "tool_unknown", raw: call?.function?.arguments });
+        results.push({ call_id: call.id, name, output: "tool_unknown" });
         continue;
       }
       let args = {};

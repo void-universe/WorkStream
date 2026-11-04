@@ -1,6 +1,6 @@
 // 群（stream）：UUID 申请进群、邀请、成员角色、公告、群文件、消息与 @ 派发。
 import { deliver } from "./accounts.mjs";
-import { AGENT_COLUMNS, publicAgent } from "./agents.mjs";
+import { AGENT_COLUMNS } from "./agents.mjs";
 import { delegateStatus } from "./delegate.mjs";
 import { STREAM_COLUMNS, humanMembership, requireMembership, requireRole } from "./perm.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, email as emailOf, int, json, newId, now, oneOf, text, uuid } from "./util.mjs";
@@ -83,7 +83,7 @@ async function memberDirectory(db, streamId) {
       type: "agent",
       role: m.role,
       joined_at: m.joined_at,
-      agent: publicAgent(byAgent.get(m.principal_id) ?? { id: m.principal_id, name: "已删除的虚拟员工", owner_id: "" }),
+      agent: byAgent.get(m.principal_id) ?? { id: m.principal_id, name: "已删除的虚拟员工", owner_id: "" },
     })),
   };
 }
@@ -471,7 +471,7 @@ export const actions = {
       streamId, senderType: "system", senderId: user.id, senderName: "系统",
       content: `${user.display_name} 把虚拟员工「${agent.name}」拉进了群。`,
     });
-    return json({ ok: true, agent: publicAgent(agent) });
+    return json({ ok: true, agent });
   },
 
   async "streams.members.promote"({ db, user, body }) {

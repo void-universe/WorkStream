@@ -135,12 +135,12 @@ export function createStepWriter(db, { mailId, agentId, streamId }) {
      * 没进 handler 的调用（模型编出工具名、参数不是合法 JSON）：也要留痕。
      * 不然时间线上这一段是空的，看的人只会以为员工"什么都没干"。
      */
-    recordRejected: async ({ name, callId, reason, raw }) => {
+    recordRejected: async ({ name, callId, reason, raw, note }) => {
       const step = await open({
         kind: "tool",
         name: name || "(空工具名)",
         callId: callId ?? null,
-        detail: { args: raw ?? "", note: reason },
+        detail: { args: raw ?? "", note: note || reason },
       });
       return close(step, { status: "failed", error: reason });
     },

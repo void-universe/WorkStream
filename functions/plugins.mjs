@@ -168,26 +168,40 @@ const publicPlugin = (row) => ({
   tool_count: Array.isArray(row.tools) ? row.tools.length : 0,
 });
 
-/** 主人启用中连接器的工具声明（OpenAI function 形式）。taken 里的名字一律跳过：内置工具优先。 */
-export async function connectorToolDefs(db, ownerId, taken = []) {
-  if (!ownerId) return [];
-  const rows = await db.plugins.list(
-    [["owner_id", ownerId], ["enabled", true]],
-    { columns: "id,name,tools", order: "created_at", limit: MAX_PER_OWNER },
-  );
-  const seen = new Set(taken);
+/**
+ * 装配一轮的外部工具声明（OpenAI function 形式）。taken 里的名字一律让位，但**不静默丢**：
+ * 每一条被挤掉的都进 skipped 并说清被谁挤掉——"启用了却用不上"从任何输出面都看不出来，
+ * 是连接器这条路上最难查的一类故障。
+ */
+export function selectConnectorTools(rows, taken = []) {
+  const seen = new Map(taken.map((name) => [name, "内置工具"]));
   const defs = [];
+  const skipped = [];
   for (const row of rows) {
     for (const tool of Array.isArray(row.tools) ? row.tools : []) {
-      if (seen.has(tool.name)) continue;
-      seen.add(tool.name);
+      const by = seen.get(tool.name);
+      if (by) {
+        if (skipped.length < 20) skipped.push({ name: tool.name, plugin: row.name, by });
+        continue;
+      }
+      seen.set(tool.name, `连接器「${row.name}」`);
       defs.push({
         type: "function",
         function: { name: tool.name, description: tool.description ?? "", parameters: tool.parameters ?? {} },
       });
     }
   }
-  return defs;
+  return { defs, skipped };
+}
+
+/** 主人启用中连接器的工具声明；重名让位并如实报进 skipped。 */
+export async function connectorToolDefs(db, ownerId, taken = []) {
+  if (!ownerId) return { defs: [], skipped: [] };
+  const rows = await db.plugins.list(
+    [["owner_id", ownerId], ["enabled", true]],
+    { columns: "id,name,tools", order: "created_at", limit: MAX_PER_OWNER },
+  );
+  return selectConnectorTools(rows, taken);
 }
 
 /** 按工具名找到它属于哪个连接器，并把令牌解出来；没有命中返回 null。 */
