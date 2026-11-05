@@ -79,6 +79,8 @@ sql/            0001_init.sql … 0013_dreaming.sql：app.* 23 张表的建表�
 
 仓库规则写在 [AGENTS.md](AGENTS.md)：环境门、门禁地板、注册表与顺序不变量、密钥边界、视觉验收口径。每条规则都指向本仓的一处实现或一道门禁，指不出来的不放进去。
 
+发布口径与待办写在 [CHANGELOG.md](CHANGELOG.md)：它只记「哪一次合入带来了什么」和「还差什么」，每个能力怎么用仍以本文件为准，那边不抄第二份说明。
+
 浏览器只调用同源的 `/functions/v1/app?action=<名称>`，不带任何平台凭据。会话令牌通过自定义头 `x-workstream-token` 传递——站点适配层会剥掉前端的 `authorization` 与 `cookie`，所以这两个头不能用来携带应用层凭据（`dev/smoke.mjs` 第 11 节直接跑真实 `serveSite` 验证了这条边界）。
 
 鉴权在应用层完成：PBKDF2-SHA256 口令散列（15 万轮）、sha256 后的会话令牌（30 天）、AES-GCM 密封 API Key 与虚拟机口令（主密钥优先取 `WORKSTREAM_DATA_KEY`，没有就落在 `app.runtime_state` 一行里）。密文列只在服务端读取，接口只回 Key 尾号。用户自填的 API 地址过 SSRF 白名单：线上只接受 https，拒绝内网与元数据地址。
