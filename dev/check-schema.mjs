@@ -1,7 +1,7 @@
 // 迁移自检：把 sql/*.sql 的列定义和 functions/*.mjs 里真实读写的列对账。
 // 本机假数据库是 JSON 存储，不会拒绝多余列，所以列名写错在本地跑不出来——这里静态拦一道。
 // 用法：node dev/check-schema.mjs
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BACKEND_IDS } from "../functions/backends.mjs";
@@ -231,21 +231,47 @@ for (const name of dictNames) {
   if (!clientIds.includes(id)) problems.push(`src/locales/${name} 对应的语言 id 不在前端清单里：多出来的一份没人读的字典`);
 }
 
+// 取词点与裸奔文案两处对账扫的是同一批文件，所以只走一次：glob 一旦退化（目录改名、后缀写错、
+// 根路径传歪），两份对账会同时变成空跑——取词点少一半看着像「没人硬编码」，裸奔棘轮的差值反而「更好看」，
+// 两种假通过都不报错。发现数下限钉在这里，一处就够。
+const srcFiles = [];
+(function walk(dir) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) { walk(path); continue; }
+    if (/\.(ts|tsx)$/.test(entry.name)) srcFiles.push(path);
+  }
+})(join(root, "src"));
+const SRC_FILE_FLOOR = 28;
+if (srcFiles.length < SRC_FILE_FLOOR) {
+  problems.push(`src 下只扫出 ${srcFiles.length} 个 .ts/.tsx 文件，地板是 ${SRC_FILE_FLOOR}：先确认不是扫描本身退化了（取词点和裸奔文案这两道闸都靠这份清单）`);
+}
+
 /** 取词点只认字面量键：写变量取词这道闸看不见，所以别那么写。 */
 const usedKeys = new Set();
 const tpKeys = new Set();
-(function walk(dir) {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isDirectory()) { walk(join(dir, entry.name)); continue; }
-    if (!/\.(ts|tsx)$/.test(entry.name)) continue;
-    const text = readFileSync(join(dir, entry.name), "utf8");
-    for (const match of text.matchAll(/\.(?:t|tf|tp)\(\s*"([\w.-]+)"/g)) usedKeys.add(match[1]);
-    for (const match of text.matchAll(/\.tp\(\s*"([\w.-]+)"/g)) tpKeys.add(match[1]);
-  }
-})(join(root, "src"));
+for (const path of srcFiles) {
+  const text = readFileSync(path, "utf8");
+  for (const match of text.matchAll(/\.(?:t|tf|tp)\(\s*"([\w.-]+)"/g)) usedKeys.add(match[1]);
+  for (const match of text.matchAll(/\.tp\(\s*"([\w.-]+)"/g)) tpKeys.add(match[1]);
+}
+// 取词点只会随界面变大而变多：文案从硬编码迁进字典是 t("...") 换个键名，不是少一个调用点。
+// 跌到地板以下说明调用形状变了（改成变量取词、或整批取词点被绕过），那要修的是扫描器，不是这张地板。
+const USED_KEY_FLOOR = 800;
+if (usedKeys.size < USED_KEY_FLOOR) {
+  problems.push(`界面取词点只认出 ${usedKeys.size} 个键，地板是 ${USED_KEY_FLOOR}：是取词写法变了（这道闸只认字面量键）还是文件没扫全？`);
+}
 
 const holders = (text) => [...String(text).matchAll(/\{(\w+)\}/g)].map((match) => match[1]).sort().join("+");
 const readDict = (name) => JSON.parse(readFileSync(join(localeDir, name), "utf8"));
+// 零宽字符、BOM 与双向隔离符能贴着文案混进字典，界面上看不出任何差别，却会咬到复制粘贴、
+// 字符串比对和从右到左排版；而切词后的句子在译文里根本没人会去数空格。非断空格不在其列：
+// 法语、希腊语的标点前有正式写法要求那种空格，那是排版不是脏字符。
+const INVISIBLE_RE = /[\u200b\u200c\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069]/;
+const invisibleOf = (text) => {
+  const hit = INVISIBLE_RE.exec(String(text));
+  return hit ? `U+${hit[0].codePointAt(0).toString(16).toUpperCase().padStart(4, "0")}` : null;
+};
 const source = readDict("zh-Hans.json");
 for (const key of usedKeys) {
   if (!(key in source)) problems.push(`界面取了字典里没有的键：${key}（渲染成 ⟦${key}⟧）`);
@@ -260,10 +286,14 @@ for (const name of dictNames) {
   const extra = Object.keys(dict).filter((key) => !(key in source));
   if (missing.length) problems.push(`src/locales/${name} 缺 ${missing.length} 个键：${missing.join(", ")}`);
   if (extra.length) problems.push(`src/locales/${name} 有中文源里没有的键：${extra.join(", ")}`);
-  for (const key of Object.keys(dict)) {
+  for (const [key, value] of Object.entries(dict)) {
+    const badKey = invisibleOf(key);
+    if (badKey) problems.push(`src/locales/${name} 的键名里有不可见字符 ${badKey}：${key}`);
+    const badValue = invisibleOf(value);
+    if (badValue) problems.push(`src/locales/${name} 的 ${key} 里有不可见字符 ${badValue}：界面上看不出来，但复制出来的文案和这份字典不再是同一个字符串`);
     if (!(key in source)) continue;
-    if (holders(dict[key]) !== holders(source[key])) {
-      problems.push(`src/locales/${name} 的 ${key} 占位符和中文源对不上：[${holders(source[key])}] vs [${holders(dict[key])}]`);
+    if (holders(value) !== holders(source[key])) {
+      problems.push(`src/locales/${name} 的 ${key} 占位符和中文源对不上：[${holders(source[key])}] vs [${holders(value)}]`);
     }
   }
 }
@@ -282,26 +312,15 @@ const BARE_COPY_CEILING = {
   "src/views/Agents.tsx": 2,
   "src/views/Skills.tsx": 3,
 };
-const bareFiles = [];
-(function walk(dir) {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const path = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      walk(path);
-      continue;
-    }
-    if (/\.(ts|tsx)$/.test(entry.name)) bareFiles.push(path);
-  }
-})(join(root, "src"));
 const stripComments = (text) =>
   text
     .replace(/\{\/\*[\s\S]*?\*\/\}/g, "")
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/^[\t ]*\/\/.*$/gm, "");
 const bareCounts = new Map();
-for (const path of bareFiles) {
+for (const path of srcFiles) {
   const relative = path.slice(root.length + 1).replace(/\\/g, "/");
-  if (relative.startsWith("locales/") || relative === "lib/route.ts") continue;
+  if (relative.startsWith("src/locales/") || relative === "src/lib/route.ts") continue;
   const lines = stripComments(readFileSync(path, "utf8")).split(/\r?\n/);
   const hit = lines.filter((line) => /[\u4e00-\u9fff]/.test(line)).length;
   if (hit) bareCounts.set(relative, hit);
@@ -322,7 +341,7 @@ for (const file of Object.keys(BARE_COPY_CEILING)) {
 // 冒烟和中文截图都看不见，所以在源码形状这一层钉住：相邻的两个子节点都取词，就必须有一个 {" "} 分隔。
 const copyChild = /^\{[^{}]*\}(?:\{" "\})?$/;
 const takesCopy = (text) => /i18n\.(t|tf|tp)\(|\(i18n[,)]/.test(text);
-for (const path of bareFiles) {
+for (const path of srcFiles) {
   const lines = stripComments(readFileSync(path, "utf8")).split(/\r?\n/);
   const relative = path.slice(root.length + 1).replace(/\\/g, "/");
   for (let i = 0; i + 1 < lines.length; i++) {
@@ -482,6 +501,135 @@ for (const [code, where] of composed) {
   if (!codeToKey.has(code)) problems.push(`服务端会回 ${code}（${where}），前端没配这句文案：界面只会显示「出错了：${code}」`);
 }
 
+/* ---------- 9. 文档双语配对 ---------- */
+// 可浏览的文档中英各一份，顶部一行互相跳。两份之间没有第三处事实来源，所以漏改一处翻译，
+// 界面切换帮不上忙、冒烟也永远看不见——只能按形状对账：标题层级序列、表格行列、正文规模、
+// 内联码与链接集合。内联码和链接是「事实」不是「文案」，两种语言里必须逐字一样；
+// 段落数与表格行数是结构，翻译既不该增也不该删。
+const DOC_PAIRS = [
+  ["README.md", "README.en.md"],
+  ["CHANGELOG.md", "CHANGELOG.en.md"],
+  ["docs/arch/scheduler.md", "docs/arch/scheduler.en.md"],
+];
+// 单语文档必须在这里登记，并说得出为什么只有一份。
+const SINGLE_LANGUAGE_DOCS = {
+  "AGENTS.md": "写给改这个仓的人与 agent 的规矩文件：同一份规矩摆成两种语言，就会变成两份会各自漂移的规矩",
+  "PROVENANCE.md": "vendor/ 里 upstream 的来源与许可证记录，条目名与条款本来就是英文",
+};
+const walkDocs = (dir, relative) => {
+  const found = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) found.push(...walkDocs(path, `${relative}/${entry.name}`));
+    else if (entry.name.endsWith(".md")) found.push(relative ? `${relative}/${entry.name}` : entry.name);
+  }
+  return found;
+};
+const repoDocs = [...readdirSync(root).filter((name) => name.endsWith(".md")), ...walkDocs(join(root, "docs"), "docs")].sort();
+const pairedDocs = new Set(DOC_PAIRS.flat());
+for (const doc of repoDocs) {
+  if (pairedDocs.has(doc) || doc in SINGLE_LANGUAGE_DOCS) continue;
+  problems.push(`${doc} 既不在中英配对表里，也没登记成单语文档：补一份对照，或在 dev/check-schema.mjs 的 SINGLE_LANGUAGE_DOCS 里写清为什么只有一份`);
+}
+// 内联码集合的对账只允许一种有登记的差异：文档自己造的速记（`invalid_<字段>` 这类占位写法，
+// 不是代码里真存在的字符串）。英文那份换成英文速记，这张表负责认这两个是同一个东西。
+// 表里没有的中文速记会让两边集合对不上，逼着要么登记要么写回逐字相同的事实。
+const SPAN_ALIASES = {
+  "invalid_<字段>": "invalid_<field>",
+  "registry_<原因>": "registry_<reason>",
+  "skill_skipped_<原因>": "skill_skipped_<reason>",
+  "<表>_request_failed": "<table>_request_failed",
+  "<字段>_clipped": "<field>_clipped",
+  "/functions/v1/app?action=<名称>": "/functions/v1/app?action=<name>",
+  "budget × min(员工数, 6)": "budget × min(#employees, 6)",
+  "@名字": "@name",
+  "#NN 回应：<正文前 200 字>": "#NN reply: <first 200 chars of the body>",
+  "NN ≤ 水位线": "NN ≤ watermark",
+  "NN ≥ 窗口头": "NN ≥ window head",
+  "[id, 字符数, volatile]": "[id, charCount, volatile]",
+  "[槽位 id, 字符数, volatile]": "[slotId, charCount, volatile]",
+  '{"员工 id:群 id": 已归并到的序号}': '{"agentId:streamId": mergedThroughSeq}',
+  "群内严格 FIFO": "strict FIFO within a stream",
+};
+const zhSpan = (value) => SPAN_ALIASES[value] ?? value;
+const CJK_RUN_RE = /[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]+/g;
+// 英文文档里允许出现的中文，只有「文档正在谈论的那个东西本身」：切换链接上中文那份的语言名、
+// 断句规则要举的中文句号、四种已译语言里非拉丁字体的自名。整段汉字必须逐字对上这张表，
+// 多一个汉字都不放行——一句没翻的中文在中文界面上一切正常，切到英文才露出来，冒烟打接口永远看不见。
+const MENTIONED_IN_ENGLISH = new Set(["简体中文", "。", "日本語"]);
+const ENGLISH_DOCS = [...DOC_PAIRS.map(([, english]) => english), ...Object.keys(SINGLE_LANGUAGE_DOCS)];
+const stripEn = (value) => value.replace(/\.en\.md(?=$|[/)#])/, ".md");
+const docText = (p) => readFileSync(join(root, p), "utf8");
+const docLines = (text) => text.split(/\r?\n/);
+const headingLevels = (lines) => lines.filter((line) => /^#{1,6} /.test(line)).map((line) => line.indexOf(" "));
+const tableShape = (lines) => lines.filter((line) => /^\s*\|/.test(line)).map((line) => line.split("|").length - 2);
+const codeSpans = (text) => new Set([...text.matchAll(/`([^`\n]+)`/g)].map((match) => stripEn(match[1])));
+const docLinks = (text) => [...text.matchAll(/\]\((?!https?:|#)([^)\s]+)\)/g)].map((match) => stripEn(match[1].split("#")[0]));
+const diffSet = (left, right) => [...left].filter((value) => !right.has(value));
+const zhAliasSeen = new Set();
+const enAliasSeen = new Set();
+for (const [chinese, english] of DOC_PAIRS) {
+  if (!existsSync(join(root, chinese)) || !existsSync(join(root, english))) {
+    problems.push(`文档配对 ${chinese} ↔ ${english}：少了一份，切换链接会把读者带进 404`);
+    continue;
+  }
+  const zh = docText(chinese);
+  const en = docText(english);
+  const zhLines = docLines(zh);
+  const enLines = docLines(en);
+  const where = `${chinese} ↔ ${english}`;
+  // 切换行：中文那份要能跳到英文那份，英文那份要能跳回来。缺一个方向就等于只有一半功能。
+  const baseOf = (p) => p.slice(p.lastIndexOf("/") + 1);
+  const headOf = (lines) => lines.slice(0, 6).join("\n");
+  if (!headOf(zhLines).includes(`](${baseOf(english)})`)) problems.push(`${where}：中文那份顶部没有指向 ${english} 的切换链接`);
+  if (!headOf(enLines).includes(`](${baseOf(chinese)})`)) problems.push(`${where}：英文那份顶部没有切回 ${chinese} 的链接`);
+  const zhLevels = headingLevels(zhLines);
+  const enLevels = headingLevels(enLines);
+  if (zhLevels.join() !== enLevels.join()) {
+    problems.push(`${where}：标题结构对不上（中文 ${zhLevels.join(",") || "无"} / 英文 ${enLevels.join(",") || "无"}）：增删或改层级要在两种语言里同一次做完`);
+  }
+  const zhTable = tableShape(zhLines);
+  const enTable = tableShape(enLines);
+  if (zhTable.length !== enTable.length) problems.push(`${where}：表格行数不同（中文 ${zhTable.length} / 英文 ${enTable.length}）：翻译不该增删行`);
+  else {
+    const row = zhTable.findIndex((cells, index) => cells !== enTable[index]);
+    if (row >= 0) problems.push(`${where}：第 ${row + 1} 行表格单元格数不同（中文 ${zhTable[row]} / 英文 ${enTable[row]}）`);
+  }
+  if (Math.abs(enLines.length - zhLines.length) > Math.max(3, Math.round(zhLines.length * 0.15))) {
+    problems.push(`${where}：正文行数差得太多（中文 ${zhLines.length} / 英文 ${enLines.length}）：翻译既不该合并段落也不该自己加段落`);
+  }
+  const rawZhSpans = codeSpans(zh);
+  const enSpans = codeSpans(en);
+  for (const value of rawZhSpans) zhAliasSeen.add(value);
+  for (const value of enSpans) enAliasSeen.add(value);
+  const zhSpans = new Set([...rawZhSpans].map(zhSpan));
+  const spansMissing = diffSet(zhSpans, enSpans);
+  const spansExtra = diffSet(enSpans, zhSpans);
+  // 中文那侧先过别名表：两种写法是同一件事的速记算合法差异，其余任何一处不同都是「一种语言里改了事实」。
+  if (spansMissing.length) problems.push(`${where}：中文有、英文没有的内联码 ${spansMissing.length} 个：${spansMissing.slice(0, 8).join(", ")}${spansMissing.length > 8 ? " …" : ""}——路径、action 名、数字不是文案，两种语言要逐字一样`);
+  if (spansExtra.length) problems.push(`${where}：英文里多出中文没有的内联码 ${spansExtra.length} 个：${spansExtra.slice(0, 8).join(", ")}`);
+  for (const doc of [chinese, english]) {
+    for (const target of new Set(docLinks(docText(doc)))) {
+      const base = doc.slice(0, doc.lastIndexOf("/") + 1);
+      if (!existsSync(join(root, base + target))) problems.push(`${doc} 里的链接 ${target} 在这个仓里不存在`);
+    }
+  }
+}
+// 英文那半边单独扫一遍：这条不看配对，只看「这一份是写给英文读者的」，所以单语文档（AGENTS.md）也在内。
+for (const doc of ENGLISH_DOCS) {
+  if (!existsSync(join(root, doc))) continue;
+  docLines(docText(doc)).forEach((line, index) => {
+    const runs = [...new Set(line.match(CJK_RUN_RE) || [])].filter((run) => !MENTIONED_IN_ENGLISH.has(run));
+    if (runs.length) problems.push(`${doc} 第 ${index + 1} 行留着没翻译的中文「${runs.slice(0, 3).join("、")}」：翻成英文；是文档自造的速记就在 SPAN_ALIASES 里登记英文写法，是文档正在谈论的那个中文词就登记进 MENTIONED_IN_ENGLISH`);
+  });
+}
+// 别名表也是会被改坏的：中文那侧不再这么写、或英文那侧换了说法，条目就成了一条没人走的桥，
+// 而下一条真速记被漏登记时报的是「集合对不上」，看不出是这张表过期了。
+for (const [from, to] of Object.entries(SPAN_ALIASES)) {
+  if (!zhAliasSeen.has(from)) problems.push(`SPAN_ALIASES 里的 ${from} → ${to}：中文文档里已经没有人这么写了，删掉这条`);
+  if (!enAliasSeen.has(to)) problems.push(`SPAN_ALIASES 里的 ${from} → ${to}：英文文档里没有 ${to} 这个写法，两份要么同一句要么改这条别名`);
+}
+
 console.log(`迁移里的表（${tables.size}）：${[...tables.keys()].join(", ")}`);
 console.log(`群文件渲染器（${rendererFiles.length}）：${rendererFiles.join(", ") || "（无）"}`);
 console.log(`后端清单（${BACKEND_IDS.length}）：${BACKEND_IDS.join(", ")}`);
@@ -489,10 +637,11 @@ console.log(`界面语言（${clientIds.length}，已译完 ${completeIds.length
 console.log(`取词点（${usedKeys.size} 个键，扫 src/ 全量 .ts/.tsx）`);
 console.log(`界面文案裸奔（${[...bareCounts.values()].reduce((n, c) => n + c, 0)} 行，分布在 ${bareCounts.size} 个文件；表里记了 ${Object.keys(BARE_COPY_CEILING).length} 处欠债）`);
 console.log(`服务端错误码（字面可扫 ${serverCodes.size} 个 + 拼出来 ${composed.size} 个）与前端文案（ERROR_KEYS ${codeToKey.size} 条）`);
+console.log(`文档双语配对（${DOC_PAIRS.length} 对：${DOC_PAIRS.map(([zh]) => zh.replace(/\.md$/, "")).join(", ")}；速记别名 ${Object.keys(SPAN_ALIASES).length} 条；单语 ${Object.keys(SINGLE_LANGUAGE_DOCS).length} 份：${Object.keys(SINGLE_LANGUAGE_DOCS).join(", ")}）`);
 if (dynamicWrites.size) console.log(`按变量传参、无法静态展开写入列的表：${[...dynamicWrites].join(", ")}`);
 if (problems.length) {
   console.log(`发现 ${problems.length} 处不一致：\n- ${problems.join("\n- ")}`);
   process.exitCode = 1;
 } else {
-  console.log("结果：读写列、渲染器登记、后端清单、语言字典、错误码文案与界面文案裸奔棘轮全部对账通过。");
+  console.log("结果：读写列、渲染器登记、后端清单、语言字典、错误码文案、界面文案裸奔棘轮与文档双语配对全部对账通过。");
 }

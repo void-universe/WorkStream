@@ -1,5 +1,7 @@
 # WorkStream 调度器架构
 
+**简体中文 · [English](scheduler.en.md)**
+
 scheduler · executor · context assembly ｜ 实测日期 2026-11-02 ｜ 源码：`functions/engine.mjs`、`functions/worker.mjs`、`functions/bus.mjs`、`functions/chat.mjs`、`functions/agents.mjs`、`functions/backends.mjs`、`functions/delegate.mjs`、`functions/cron.mjs`、`functions/qca.mjs`
 
 **一页结论。** 调度层是「邮箱 FIFO + 跨群加权时间片」：群里 @ 一位虚拟员工 = 往 ta 的邮箱投一封信，`scheduler.tick` 按创建顺序取信、按群权重分并发槽、CAS 抢任务执行；服务端常驻 `worker` 让队列在没有浏览器时也往前走。执行层是「单发流式调用 + 插话掐断」：每轮把群历史现场重渲染成一条 system 消息发给 OpenAI 兼容上游，边收 SSE 边查插话。上下文层是「稳定前缀 + 尾部追加窗口 + 后台压缩」：块序即缓存序，窗口按字符预算分页取，压缩在后台把水位线推上去；实测两轮之间的可复用前缀 **98.5%**，每轮只为本轮新增的记录付 prefill。排程（cron）不另开一条执行路径：到点的排程只是在 tick 里多投一封普通信，时间片、CAS、插话、压缩全部复用。
