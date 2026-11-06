@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { describeError, post } from "../../api";
 import { shrinkImages, type PickedImage } from "../../lib/image";
+import { useI18n } from "../../lib/i18n";
 import { PersonAvatar } from "../../lib/ui";
 import type { AgentPresence, Member, Message } from "../../types";
 
@@ -53,6 +54,7 @@ export function Composer({
   compact?: boolean;
   onSent: (result: SendResult) => void;
 }) {
+  const i18n = useI18n();
   const [draft, setDraft] = useState("");
   const [images, setImages] = useState<PickedImage[]>([]);
   const [sending, setSending] = useState(false);
@@ -113,21 +115,21 @@ export function Composer({
     const files = Array.from(fileList);
     if (!files.length) return;
     if (images.length >= 4) {
-      toast.info("一条消息最多带 4 张图，先撤掉一张再加。");
+      toast.info(i18n.t("composer.imageLimitReached"));
       return;
     }
     setReading(true);
     try {
-      const { images: picked } = await shrinkImages(files);
+      const { images: picked } = await shrinkImages(i18n, files);
       if (!picked.length) {
-        toast.info("只支持图片或 GIF（PNG / JPEG / WebP / GIF），其它文件请传到群文件。");
+        toast.info(i18n.t("composer.imageTypesOnly"));
         return;
       }
       const room = 4 - images.length;
-      if (picked.length > room) toast.info(`一条消息最多 4 张图，这次只带上前 ${room} 张。`);
+      if (picked.length > room) toast.info(i18n.tf("composer.imageLimitTrimmed", { n: room }));
       setImages((current) => [...current, ...picked.slice(0, room)]);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setReading(false);
     }
@@ -149,13 +151,13 @@ export function Composer({
       setImages([]);
       const steered = result.interrupted ?? [];
       if (steered.length) {
-        const names = steered.map((row) => nameOf.get(row.agent_id) ?? "虚拟员工").join("、");
-        toast.success(`已插话给 ${names}：会停下正在写的半截，按这条重答`);
-      } else if (result.queued.length) toast.success(`已投进 ${result.queued.length} 位虚拟员工的邮箱，按时间片推进`);
-      else if (result.notified.length) toast.success(`已通知 ${result.notified.length} 位真人`);
+        const names = i18n.list(steered.map((row) => nameOf.get(row.agent_id) ?? i18n.t("ui.kindAgent")));
+        toast.success(i18n.tf("composer.interrupted", { names }));
+      } else if (result.queued.length) toast.success(i18n.tf("composer.queued", { n: result.queued.length }));
+      else if (result.notified.length) toast.success(i18n.tf("composer.notified", { n: result.notified.length }));
       onSent(result);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setSending(false);
     }
@@ -186,8 +188,8 @@ export function Composer({
         variant="ghost"
         size="sm"
         className={compact ? "size-8 shrink-0 p-0" : "size-9 shrink-0 p-0"}
-        title="贴图片或选图片，一条消息最多 4 张"
-        aria-label="贴图片或选图片"
+        title={i18n.t("composer.attachTitle")}
+        aria-label={i18n.t("composer.attachLabel")}
         disabled={reading || images.length >= 4}
         onClick={() => fileRef.current?.click()}
       >
@@ -207,8 +209,8 @@ export function Composer({
           />
           <button
             type="button"
-            aria-label={`撤下 ${image.name}`}
-            title="撤下这张图"
+            aria-label={i18n.tf("composer.removeImageLabel", { name: image.name })}
+            title={i18n.t("composer.removeImageTitle")}
             className="absolute -right-1.5 -top-1.5 grid size-4 place-items-center rounded-full bg-foreground text-[10px] leading-none text-background"
             onClick={() => setImages((current) => current.filter((_, i) => i !== index))}
           >
@@ -216,7 +218,7 @@ export function Composer({
           </button>
         </span>
       ))}
-      {reading ? <span className="text-[11px] text-muted-foreground">压图中…</span> : null}
+      {reading ? <span className="text-[11px] text-muted-foreground">{i18n.t("composer.compressing")}</span> : null}
     </div>
   ) : null;
 
@@ -250,7 +252,7 @@ export function Composer({
                   busy={entry.type === "agent" ? presenceOf.get(entry.id)?.working : false}
                 />
                 {entry.name}
-                <span className="text-muted-foreground">{entry.type === "agent" ? "虚拟" : "真人"}</span>
+                <span className="text-muted-foreground">{entry.type === "agent" ? i18n.t("ui.kindAgentShort") : i18n.t("ui.kindHumanShort")}</span>
               </Button>
             </li>
           ))}
@@ -273,7 +275,7 @@ export function Composer({
               onPaste={pasteImages}
               onClick={rememberCaret}
               onKeyUp={rememberCaret}
-              placeholder="说点什么，@ 派活"
+              placeholder={i18n.t("composer.placeholderCompact")}
               style={{ minHeight: 34 }}
               className="resize-none text-xs"
               onKeyDown={(event) => {
@@ -281,7 +283,7 @@ export function Composer({
               }}
             />
             <Button size="sm" className="h-8 shrink-0 px-2 text-xs" onClick={() => void send()} disabled={canSend}>
-              {sending ? "发送中…" : "发送"}
+              {sending ? i18n.t("composer.sending") : i18n.t("composer.send")}
             </Button>
           </div>
         </div>
@@ -299,7 +301,7 @@ export function Composer({
             onPaste={pasteImages}
             onClick={rememberCaret}
             onKeyUp={rememberCaret}
-            placeholder="说点什么；输入 @ 挑一个群里的真人或虚拟员工——@ 虚拟员工就是往 ta 的邮箱派活，也可以直接 Ctrl+V 贴图"
+            placeholder={i18n.t("composer.placeholder")}
             className="resize-none text-sm"
             onKeyDown={(event) => {
               if ((event.metaKey || event.ctrlKey) && event.key === "Enter") void send();
@@ -308,9 +310,9 @@ export function Composer({
           <div className="flex flex-wrap items-center gap-2">
             {attach}
             <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">{chips}</div>
-            <span className="hidden font-mono text-[11px] text-muted-foreground sm:inline">Ctrl/⌘ + Enter 发送</span>
+            <span className="hidden font-mono text-[11px] text-muted-foreground sm:inline">{i18n.t("composer.hotkeyHint")}</span>
             <Button size="sm" onClick={() => void send()} disabled={canSend}>
-              {sending ? "发送中…" : "发送"}
+              {sending ? i18n.t("composer.sending") : i18n.t("composer.send")}
             </Button>
           </div>
         </>
@@ -332,15 +334,18 @@ function PendingBadge({ entry, onRemove }: { entry: Mentionable; onRemove: () =>
 
 /** 我的员工正在这个群里吐字时给一条短横幅：@ ta 就是插话，或者直接把这条活叫停。 */
 function InterruptBar({ streamId, entries }: { streamId: string; entries: AgentPresence[] }) {
+  const i18n = useI18n();
   const [stopping, setStopping] = useState<string | null>(null);
+  // 员工名字要夹在句子里做成前景色元素，所以按 {0} 拆成前后两段。
+  const writingParts = i18n.tp("composer.writingHint");
 
   async function stop(entry: AgentPresence) {
     setStopping(entry.agent_id);
     try {
       await post("scheduler.interrupt", { stream_id: streamId, agent_id: entry.agent_id });
-      toast.success(`已叫停 ${entry.name}：这条任务作废，半截回复不会发出来。`);
+      toast.success(i18n.tf("composer.interruptToast", { name: entry.name }));
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setStopping(null);
     }
@@ -359,7 +364,9 @@ function InterruptBar({ streamId, entries }: { streamId: string; entries: AgentP
             busy
           />
           <span className="min-w-0 flex-1 truncate text-muted-foreground">
-            <span className="text-foreground">{entry.name}</span> 正在写回复 · 再 @ ta 一次就是插话
+            {writingParts[0]}
+            <span className="text-foreground">{entry.name}</span>
+            {writingParts[1]}
           </span>
           <Button
             size="sm"
@@ -368,7 +375,7 @@ function InterruptBar({ streamId, entries }: { streamId: string; entries: AgentP
             disabled={stopping === entry.agent_id}
             onClick={() => void stop(entry)}
           >
-            {stopping === entry.agent_id ? "叫停中…" : "叫停"}
+            {stopping === entry.agent_id ? i18n.t("composer.stopping") : i18n.t("composer.stop")}
           </Button>
         </li>
       ))}

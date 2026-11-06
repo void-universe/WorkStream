@@ -222,7 +222,7 @@ export const actions = {
     const granted = await db.stream_vms.list([["stream_id", streamId]], { columns: "vm_id,level,id", limit: 50 });
     const vmIds = granted.map((g) => g.vm_id);
     const vmRows = vmIds.length
-      ? await db.vms.list([["id", vmIds]], { columns: "id,label,host,port,username,auth_kind,workdir,last_probe,owner_id", limit: 50 })
+      ? await db.vms.list([["id", vmIds]], { columns: "id,label,host,port,username,auth_kind,workdir,gateway_url,last_probe,owner_id", limit: 50 })
       : [];
     const open = await db.requests.list(
       [["stream_id", streamId], ["status", "pending"]],

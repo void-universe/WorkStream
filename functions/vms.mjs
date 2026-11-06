@@ -1,12 +1,14 @@
 // 办公虚拟机：每人可登记多台，凭据静态加密；创建群时可绑定，之后可授权/撤销到某个群。
 // 说明：站点 Function 是 Edge 运行时，没有可用的 TCP/SSH 客户端，因此这里做的是
 // 登记 + 授权 + 一次 HTTP 端口探活，真实的 SSH 命令执行留给群内 Agent 侧的 MCP 工具。
+// 真人的交互终端不在这一条链上：浏览器直连 VM 上的 WebSocket 网关（src/lib/terminal.mjs），
+// 服务端只存网关地址、不代理会话，所以 VM 口令依旧只以密文躺在 secret_cipher 里。
 import { seal } from "./sec.mjs";
 import { requireMembership, requireRole } from "./perm.mjs";
 import { nextSeq } from "./rooms.mjs";
 import { Halt, json, newId, now, oneOf, randomHex, safeApiBaseUrl, sha256Hex, text, uuid } from "./util.mjs";
 
-const VM_COLUMNS = "id,label,host,port,username,auth_kind,workdir,last_probe,owner_id,created_at,updated_at";
+const VM_COLUMNS = "id,label,host,port,username,auth_kind,workdir,gateway_url,last_probe,owner_id,created_at,updated_at";
 
 export const actions = {
   async "vms.list"({ db, user }) {
@@ -24,11 +26,12 @@ export const actions = {
     const authKind = oneOf(body.auth_kind, ["password", "key"], "auth_kind");
     const secret = text(body.secret, { max: 8000, name: "secret" });
     const workdir = text(body.workdir ?? "", { max: 200, required: false });
+    const gateway = gatewayOf(body.gateway_url);
     const sealed = await seal(secret, { supabase: db.client, env });
     const created = await db.vms.insert({
       id: newId(), owner_id: user.id, label, host, port, username,
       auth_kind: authKind, secret_cipher: sealed.cipher, key_source: sealed.key_source,
-      workdir, last_probe: null, created_at: now(), updated_at: now(),
+      workdir, gateway_url: gateway, last_probe: null, created_at: now(), updated_at: now(),
     }, { columns: VM_COLUMNS });
     if (!created) throw new Halt("vm_create_failed", 503);
     return json({ ok: true, vm: created });
@@ -48,7 +51,8 @@ export const actions = {
       values.port = port;
     }
     if (body.username !== undefined) values.username = text(body.username, { max: 60, name: "username" });
-    if (body.workdir !== undefined) values.workdir = text(body.workdir, { max: 200, required: false });
+    if (body.workdir !== undefined) values.workdir = text(body.workdir ?? "", { max: 200, required: false });
+    if (body.gateway_url !== undefined) values.gateway_url = gatewayOf(body.gateway_url);
     if (body.auth_kind !== undefined) values.auth_kind = oneOf(body.auth_kind, ["password", "key"], "auth_kind");
     if (body.secret) {
       const sealed = await seal(text(body.secret, { max: 8000, name: "secret" }), { supabase: db.client, env });
@@ -98,6 +102,8 @@ export const actions = {
       };
     }
     const probe = { ...result, checked_at: now(), ms: Date.now() - started };
+    // 真人点终端连的是网关，不是 SSH 端口，所以探活要各说各的：SSH 端口通不代表网关在跑。
+    if (vm.gateway_url) probe.gateway = await probeGateway(vm.gateway_url, { allowPrivate });
     await db.vms.patch([["id", id], ["owner_id", user.id]], { last_probe: probe, updated_at: now() });
     return json({ ok: true, probe });
   },
@@ -180,4 +186,56 @@ function hostOf(value) {
   const host = text(value, { max: 200, name: "host" });
   if (!/^[A-Za-z0-9._-]+$/.test(host)) throw new Halt("invalid_host", 400);
   return host.toLowerCase();
+}
+
+/**
+ * 终端网关地址。这里故意不复用 safeApiBaseUrl 的私网拒绝：那条闸门管的是服务端出网，
+ * 而网关是真人自己的浏览器去连的，内网 VM 恰恰是这套终端的主要用法，拒内网等于功能为零。
+ * 形状仍要收死——只认 ws/wss/http/https，并且不接受 URL 里的凭据与查询串：
+ * 那一栏会明文入库，让用户把 token 塞进 URL 就等于把网关口令抄进了数据库。
+ */
+function gatewayOf(value) {
+  const raw = text(value ?? "", { max: 300, required: false, name: "gateway_url" });
+  if (!raw) return "";
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Halt("invalid_gateway_url", 400);
+  }
+  if (!["ws:", "wss:", "http:", "https:"].includes(parsed.protocol)) throw new Halt("invalid_gateway_url", 400);
+  if (!parsed.hostname) throw new Halt("invalid_gateway_url", 400);
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) throw new Halt("gateway_url_no_credentials", 400);
+  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+}
+
+/** 探活要按 http 打，所以网关地址得先换回同源的 http/https 形状。 */
+function gatewayProbeUrl(gatewayUrl) {
+  const parsed = new URL(gatewayUrl);
+  parsed.protocol = parsed.protocol === "wss:" || parsed.protocol === "https:" ? "https:" : "http:";
+  return parsed.toString();
+}
+
+/**
+ * 服务端探网关只做「有没有进程在听」这一件事：边缘运行时不能把 WebSocket 升级成终端会话，
+ * 真正连上要靠浏览器。因此探不通时得说清是没探成还是那边真没起，别让人以为终端坏了。
+ */
+async function probeGateway(gatewayUrl, { allowPrivate }) {
+  let target;
+  try {
+    target = safeApiBaseUrl(gatewayProbeUrl(gatewayUrl), { allowPrivate });
+  } catch {
+    return { reachable: null, note: "网关是内网或明文地址，服务端不出网探测它；直接在浏览器里点开终端即可。" };
+  }
+  try {
+    const response = await fetch(target.url, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(4000) });
+    return { reachable: true, http_status: response.status, note: "网关端口有响应；是否能开会话要在浏览器里连一次才知道。" };
+  } catch (error) {
+    return {
+      reachable: false,
+      note: error?.name === "TimeoutError"
+        ? "网关 4 秒内无响应：确认 ttyd 一类进程在跑、端口已放行。"
+        : "无法连到网关端口：检查地址与防火墙。",
+    };
+  }
 }

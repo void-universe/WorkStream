@@ -1,5 +1,6 @@
 // 内置默认头像：不配图、不联网，SVG 画在代码里，点一下在浏览器烤成 128×128 WebP 再存库，
 // 和上传那条路用同一个字段、同一份 avatarData 校验。
+import type { MsgKey } from "./i18n";
 type Palette = { bg: string; shirt: string; skin: string; hair: string; line: string };
 
 /** 一张胸像：底 → 后发 → 颈 → 衣 → 头 → 耳 → 前发 → 五官 →（可选）眼镜/耳饰。 */
@@ -49,23 +50,24 @@ const female: Palette = { bg: "#0d7a6b", shirt: "#f3e9dc", skin: "#eec19c", hair
 const femaleOchre: Palette = { bg: "#a2593c", shirt: "#eae3d5", skin: "#e6b58c", hair: "#5a3a2a", line: "#241f1b" };
 const femaleMoss: Palette = { bg: "#42604c", shirt: "#cfd8cd", skin: "#d8a276", hair: "#241d19", line: "#211b17" };
 
-export const AVATAR_PRESETS: { key: string; label: string; svg: string }[] = [
-  { key: "m1", label: "男生 · 短发", svg: figure(male, { front: crop(male) }) },
-  { key: "m2", label: "男生 · 侧分", svg: figure(maleCool, { front: sidePart(maleCool) }) },
-  { key: "m3", label: "男生 · 眼镜", svg: figure(maleWarm, { front: crop(maleWarm), glasses: true }) },
+// labelKey 而不是 label：这六个名字是界面文案，会在语言切换时变，所以这里只存键、由取词方去翻。
+export const AVATAR_PRESETS: { key: string; labelKey: MsgKey; svg: string }[] = [
+  { key: "m1", labelKey: "avatar.maleShort", svg: figure(male, { front: crop(male) }) },
+  { key: "m2", labelKey: "avatar.maleSidePart", svg: figure(maleCool, { front: sidePart(maleCool) }) },
+  { key: "m3", labelKey: "avatar.maleGlasses", svg: figure(maleWarm, { front: crop(maleWarm), glasses: true }) },
   {
     key: "f1",
-    label: "女生 · 长发",
+    labelKey: "avatar.femaleLong",
     svg: figure(female, { back: mass(female, 104), front: fringe(female) + curtains(female) }),
   },
   {
     key: "f2",
-    label: "女生 · 齐肩",
+    labelKey: "avatar.femaleShoulder",
     svg: figure(femaleOchre, { back: mass(femaleOchre, 88), front: fringe(femaleOchre) }),
   },
   {
     key: "f3",
-    label: "女生 · 马尾",
+    labelKey: "avatar.femalePonytail",
     svg: figure(femaleMoss, {
       back: `<path d="M90,32c16,10 20,32 10,50-3-18-7-30-16,-38Z" fill="${femaleMoss.hair}"/><circle cx="91" cy="36" r="10" fill="${femaleMoss.hair}"/>`,
       front: sidePart(femaleMoss),

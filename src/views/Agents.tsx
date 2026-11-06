@@ -23,6 +23,7 @@ import { shortUuid, timeAgo } from "../lib/format";
 import { navigate } from "../lib/route";
 import { AvatarPicker, Field, Notice, PersonAvatar, SectionTitle, TextInput } from "../lib/ui";
 import { StreamFlow } from "./agents/StreamFlow";
+import { useI18n, type MsgKey } from "../lib/i18n";
 
 type AgentDetail = {
   ok: true;
@@ -105,6 +106,7 @@ type SkillHit = {
 };
 
 export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => Promise<void>; focusAgentId?: string }) {
+  const i18n = useI18n();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [listLoaded, setListLoaded] = useState(false);
   const [selected, setSelected] = useState("");
@@ -133,7 +135,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
       setSelected((current) => current || result.items[0]?.id || "");
       await onChanged();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setListLoaded(true);
     }
@@ -171,7 +173,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         setPresence(next);
         setPresenceError("");
       } catch (error) {
-        if (alive) setPresenceError(describeError(error));
+        if (alive) setPresenceError(describeError(i18n, error));
       }
     };
     void load();
@@ -211,7 +213,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         setDetail(await get<AgentDetail>("agents.get", { id: selected }));
         setMemories(await loadMemories(selected));
       } catch (error) {
-        toast.error(describeError(error));
+        toast.error(describeError(i18n, error));
       }
     })();
   }, [selected, agents]);
@@ -227,6 +229,9 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
   );
   const updateById = useMemo(() => new Map(updates.map((row) => [row.skill_id, row])), [updates]);
 
+  // 「自动写一条 summary」在句子里夹着 <code>，拆不成整句，所以按 {0} 切两段、中间自己塞。
+  const memoryParts = i18n.tp("agent.memoryNotice");
+
   // 技能区搜索：本地市场在内存里过滤，远端源要现拉，所以起词后才发请求。
   useEffect(() => {
     const needle = skillSearch.trim();
@@ -241,7 +246,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
           if (alive) setRemoteHits(result.items);
         })
         .catch((error) => {
-          if (alive) toast.error(describeError(error));
+          if (alive) toast.error(describeError(i18n, error));
         });
     }, 400);
     return () => {
@@ -262,7 +267,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
       setUpdateIssues(result.unavailable);
       setUpdateCheckedAt(result.checked_at);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setSkillBusy("");
     }
@@ -303,12 +308,14 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         summary: skill.summary,
         category: skill.category,
         version: skill.version ?? "",
-        origin: skill.source === "remote" ? "本地快照" : skill.is_public ? "本地市场" : "仅自己",
+        origin: skill.source === "remote" ? i18n.t("agent.originSnapshot") : skill.is_public ? i18n.t("agent.originMarket") : i18n.t("agent.originPrivate"),
         installedHere: installedIds.has(skill.id),
         install: async () => {
           const result = await post<{ ok: true; added?: number; already?: number; duplicate?: boolean }>(
             "skills.install", { skill_id: skill.id, agent_id: selected });
-          toast.success(result.duplicate || result.added === 0 ? `${skill.name} 已经在这位员工身上` : `已装上 ${skill.name}`);
+          toast.success(result.duplicate || result.added === 0
+            ? i18n.tf("agent.skillAlreadyHere", { name: skill.name })
+            : i18n.tf("agent.skillInstalled", { name: skill.name }));
         },
       }));
     const remote = remoteHits.map((item): SkillHit => ({
@@ -323,11 +330,11 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         const result = await post<{ ok: true; skill: Skill }>("skills.remoteInstall", {
           registry_id: item.registry_id, slug: item.slug, agent_id: selected,
         });
-        toast.success(`已抄成快照装上 ${result.skill.name} v${result.skill.version ?? "—"}`);
+        toast.success(i18n.tf("agent.skillSnapshotInstalled", { name: result.skill.name, version: result.skill.version ?? "—" }));
       },
     }));
     return [...local, ...remote];
-  }, [skillSearch, marketSkills, remoteHits, installedIds, selected]);
+  }, [skillSearch, marketSkills, remoteHits, installedIds, selected, i18n]);
 
   async function runInstall(hit: SkillHit) {
     if (!selected || hit.installedHere) return;
@@ -338,7 +345,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
       setSkillSearch("");
       setRemoteHits([]);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setSkillBusy("");
     }
@@ -346,7 +353,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
 
   async function save() {
     if (!draft.name.trim() || !draft.role.trim()) {
-      toast.error("名字和岗位描述都要填。");
+      toast.error(i18n.t("agent.needNameRole"));
       return;
     }
     setBusy(true);
@@ -368,21 +375,21 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         body.id = draft.id;
         if (draft.api_key.trim()) body.api_key = draft.api_key.trim();
         await post("agents.update", body);
-        toast.success("已保存");
+        toast.success(i18n.t("agent.saved"));
       } else {
         if (!draft.api_key.trim()) {
-          toast.error(draft.backend === "qca" ? "云端 Agent 要配个人访问令牌（PAT）才能建档。" : "新建虚拟员工要有 Key；想先试流程就用演示端点。");
+          toast.error(draft.backend === "qca" ? i18n.t("agent.needKeyQca") : i18n.t("agent.needKeyOpenai"));
           return;
         }
         body.api_key = draft.api_key.trim();
         const created = await post<{ ok: true; agent: Agent }>("agents.create", body);
-        toast.success("虚拟员工已建档");
+        toast.success(i18n.t("agent.created"));
         setSelected(created.agent.id);
         navigate(`/agents/${created.agent.id}`);
       }
       await refreshList();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy(false);
     }
@@ -390,7 +397,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
 
   async function testConnection() {
     if (!draft.id) {
-      toast.error("先保存，再测连通——Key 只在服务端解得开。");
+      toast.error(i18n.t("agent.testNeedSave"));
       return;
     }
     setBusy(true);
@@ -399,10 +406,10 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         "agents.test",
         { id: draft.id },
       );
-      if (result.result.reachable) toast.success(`通了，${result.result.ms}ms · ${result.result.mode ?? ""} ${result.result.reply ?? ""}`);
-      else toast.error(`没通（${result.result.error}）：${result.result.ms}ms`);
+      if (result.result.reachable) toast.success(i18n.tf("agent.testOk", { ms: result.result.ms, mode: result.result.mode ?? "", reply: result.result.reply ?? "" }));
+      else toast.error(i18n.tf("agent.testFail", { error: result.result.error ?? i18n.t("panel.unknown"), ms: result.result.ms }));
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy(false);
     }
@@ -412,13 +419,13 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
     if (!draft.id) return;
     try {
       await post("agents.delete", { id: draft.id });
-      toast.success("已删除");
+      toast.success(i18n.t("common.deleted"));
       setSelected("");
       setPresence(null);
       navigate("/agents");
       await refreshList();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     }
   }
 
@@ -434,9 +441,9 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
       });
       setMemoryDraft("");
       setMemories(await loadMemories(selected));
-      toast.success("记忆已写入");
+      toast.success(i18n.t("agent.memoryWritten"));
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     }
   }
 
@@ -445,7 +452,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
     try {
       setDetail(await get<AgentDetail>("agents.get", { id: selected }));
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     }
   }
 
@@ -453,10 +460,10 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
     if (!selected) return;
     try {
       await post<{ ok: true }>("skills.uninstall", { skill_id: skill.id, agent_id: selected });
-      toast.success("技能已卸载");
+      toast.success(i18n.t("agent.skillUninstalled"));
       await refreshDetail();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     }
   }
 
@@ -465,10 +472,10 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
     try {
       const result = await post<{ ok: true; skill: Skill; from_version: string; to_version: string }>(
         "skills.remoteUpdate", { skill_id: skill.id });
-      toast.success(`${skill.name}：v${result.from_version || "—"} → v${result.to_version || "—"}`);
+      toast.success(i18n.tf("agent.skillUpdated", { name: skill.name, from: result.from_version || "—", to: result.to_version || "—" }));
       await refreshDetail();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setSkillBusy("");
     }
@@ -491,14 +498,14 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                 navigate("/agents");
               }}
             >
-              新建
+              {i18n.t("agent.new")}
             </Button>
           }
         >
-          我的虚拟员工 · {agents.length}
+          {i18n.tf("agent.rosterTitle", { n: agents.length })}
         </SectionTitle>
         <div className="grid gap-1.5">
-          {agents.length === 0 ? <p className="text-xs text-muted-foreground">还没有虚拟员工。右边填一份档案就能开工。</p> : null}
+          {agents.length === 0 ? <p className="text-xs text-muted-foreground">{i18n.t("agent.rosterEmpty")}</p> : null}
           {agents.map((agent) => (
             <button
               key={agent.id}
@@ -521,7 +528,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-sm">{agent.name}</span>
                 <span className="block truncate font-mono text-[11px] text-muted-foreground">
-                  {agent.backend === "qca" ? "云端 Agent" : agent.model} · {agent.status === "paused" ? "已暂停" : "在岗"}
+                  {agent.backend === "qca" ? i18n.t("agent.qcaModel") : agent.model} · {agent.status === "paused" ? i18n.t("agent.pausedShort") : i18n.t("agent.onDuty")}
                 </span>
                 {agent.signature ? (
                   <span className="block truncate text-[11px] text-muted-foreground">「{agent.signature}」</span>
@@ -540,27 +547,27 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
             <Card className="mb-4">
           <CardContent className="grid gap-4 pt-6">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <h2 className="text-sm font-semibold">{draft.id ? `编辑 · ${draft.name}` : "新建虚拟员工"}</h2>
+              <h2 className="text-sm font-semibold">{draft.id ? i18n.tf("agent.editTitle", { name: draft.name }) : i18n.t("agent.createTitle")}</h2>
               <div className="flex gap-2">
                 {draft.id ? (
                   <>
                     <Button size="sm" variant="outline" className="text-xs" onClick={() => void testConnection()} disabled={busy}>
-                      连通测试
+                      {i18n.t("agent.testButton")}
                     </Button>
                     <Button size="sm" variant="outline" className="text-xs text-destructive hover:text-destructive" onClick={() => void remove()}>
-                      删除
+                      {i18n.t("common.delete")}
                     </Button>
                   </>
                 ) : null}
                 <Button size="sm" className="text-xs" onClick={() => void save()} disabled={busy}>
-                  {busy ? "保存中…" : "保存档案"}
+                  {busy ? i18n.t("agent.saving") : i18n.t("agent.saveProfile")}
                 </Button>
               </div>
             </div>
 
-            <Field label="头像" hint="群聊、成员列表与员工页都会用这张图；不设就用名字首字。">
+            <Field label={i18n.t("agent.avatarLabel")} hint={i18n.t("agent.avatarHint")}>
               <AvatarPicker
-                name={draft.name || "新员工"}
+                name={draft.name || i18n.t("agent.newAgentName")}
                 kind="agent"
                 color={agents.find((item) => item.id === draft.id)?.color}
                 avatar={draft.avatar}
@@ -569,91 +576,82 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
             </Field>
 
             <div className="grid gap-4 md:grid-cols-2">
-              <Field label="名字" htmlFor="agent-name">
-                <TextInput id="agent-name" value={draft.name} maxLength={48} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="如：小审" className="h-8 text-xs" />
+              <Field label={i18n.t("agent.nameLabel")} htmlFor="agent-name">
+                <TextInput id="agent-name" value={draft.name} maxLength={48} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder={i18n.t("agent.namePlaceholder")} className="h-8 text-xs" />
               </Field>
-              <Field label="岗位描述" htmlFor="agent-role" hint="写清 ta 负责什么、交付什么，群里 @ ta 时这就是任务背景。">
-                <TextInput id="agent-role" value={draft.role} maxLength={400} onChange={(event) => setDraft({ ...draft, role: event.target.value })} placeholder="如：负责验收清单整理与回归项跟踪" className="h-8 text-xs" />
+              <Field label={i18n.t("agent.roleLabel")} htmlFor="agent-role" hint={i18n.t("agent.roleHint")}>
+                <TextInput id="agent-role" value={draft.role} maxLength={400} onChange={(event) => setDraft({ ...draft, role: event.target.value })} placeholder={i18n.t("agent.rolePlaceholder")} className="h-8 text-xs" />
               </Field>
-              <Field label="模型来源" htmlFor="agent-backend" hint="自建端点走 OpenAI 兼容接口；云端 Agent 挂 Qoder Cloud Agents 上已有的那个 agent。">
+              <Field label={i18n.t("agent.backendLabel")} htmlFor="agent-backend" hint={i18n.t("agent.backendHint")}>
                 <NativeSelect
                   id="agent-backend"
                   className="h-8 text-xs"
                   value={draft.backend}
                   onChange={(event) => setDraft((current) => switchBackend(current, event.target.value as Backend))}
                 >
-                  <NativeSelectOption value="openai">自建 OpenAI 兼容端点</NativeSelectOption>
-                  <NativeSelectOption value="qca">Qoder 云端 Agent</NativeSelectOption>
+                  <NativeSelectOption value="openai">{i18n.t("agent.backendOpenai")}</NativeSelectOption>
+                  <NativeSelectOption value="qca">{i18n.t("agent.backendQca")}</NativeSelectOption>
                 </NativeSelect>
               </Field>
               {draft.backend === "qca" ? (
-                <Field label="云端 Agent ID" htmlFor="agent-qca" hint="控制台 /cloud/agents/agent_xxx 里的那个 id；直接粘整条链接也会取出 id。">
+                <Field label={i18n.t("agent.qcaIdLabel")} htmlFor="agent-qca" hint={i18n.t("agent.qcaIdHint")}>
                   <TextInput id="agent-qca" value={draft.qca_agent_id} onChange={(event) => setDraft({ ...draft, qca_agent_id: event.target.value })} placeholder="agent_…" className="h-8 font-mono text-xs" />
                 </Field>
               ) : null}
               <Field
-                label={draft.backend === "qca" ? "云端 API 地址" : "OpenAI 兼容 base URL"}
+                label={draft.backend === "qca" ? i18n.t("agent.qcaUrlLabel") : i18n.t("agent.openaiUrlLabel")}
                 htmlFor="agent-base"
-                hint={draft.backend === "qca"
-                  ? "要和 PAT 同一区域的 Cloud Agents 地址；线上只收 https，本机调试才放行内网。"
-                  : "线上必须是 https，且不能指向内网/元数据地址。"}
+                hint={draft.backend === "qca" ? i18n.t("agent.qcaUrlHint") : i18n.t("agent.openaiUrlHint")}
               >
                 <TextInput id="agent-base" value={draft.api_base_url} onChange={(event) => setDraft({ ...draft, api_base_url: event.target.value })} className="h-8 font-mono text-xs" />
               </Field>
               <Field
-                label={draft.backend === "qca" ? "展示用模型名" : "模型名"}
+                label={draft.backend === "qca" ? i18n.t("agent.qcaModelLabel") : i18n.t("agent.modelLabel")}
                 htmlFor="agent-model"
-                hint={draft.backend === "qca"
-                  ? "云端 agent 用它自己定义的模型，这里只影响档案与轨迹里怎么标这一轮。"
-                  : "演示端点（demo://local）固定填 demo，可在没 Key 时把整条流程跑通。"}
+                hint={draft.backend === "qca" ? i18n.t("agent.qcaModelHint") : i18n.t("agent.modelHint")}
               >
                 <TextInput id="agent-model" value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} className="h-8 font-mono text-xs" />
               </Field>
               <Field
-                label={draft.backend === "qca" ? "个人访问令牌（PAT）" : "API Key"}
+                label={draft.backend === "qca" ? i18n.t("agent.patLabel") : "API Key"}
                 htmlFor="agent-key"
-                hint={draft.backend === "qca"
-                  ? "Qoder 设置 → 个人访问令牌 里新建；AES-GCM 加密入库，接口与浏览器都拿不到原文，留空表示不更换。"
-                  : "AES-GCM 加密后入库，接口与浏览器都拿不到原文；留空表示不更换。"}
+                hint={draft.backend === "qca" ? i18n.t("agent.patHint") : i18n.t("agent.keyHint")}
               >
-                <Input id="agent-key" type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder={draft.backend === "qca" ? "pt-…" : draft.id ? "留空保持原 Key" : "sk-…"} className="h-8 text-xs" />
+                <Input id="agent-key" type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder={draft.backend === "qca" ? "pt-…" : draft.id ? i18n.t("agent.keyKeepPlaceholder") : "sk-…"} className="h-8 text-xs" />
               </Field>
-              <Field label="上下文预算（字符）" htmlFor="agent-context" hint="单轮能带进模型的字符上限，和群预算取较小值。中文约 1 字≈1 token、英文约 4 字符≈1 token：256K 窗口的模型填 20 万，百万窗口的可以拉到 200 万。">
+              <Field label={i18n.t("agent.contextLabel")} htmlFor="agent-context" hint={i18n.t("agent.contextHint")}>
                 <Input id="agent-context" type="number" min={2000} max={2000000} step={20000} value={draft.context_chars} onChange={(event) => setDraft({ ...draft, context_chars: Number(event.target.value) })} className="h-8 text-xs" />
               </Field>
             </div>
 
             {draft.backend === "qca" ? (
-              <Notice tone="info">
-                云端 Agent 用它自己的提示词与工具集：WorkStream 的记忆、群聊转录和技能说明会压成一条正文送过去，
-                但我们的群工具（发消息、群文件、虚拟机）对它不可见，回群里的那一段只有正文——思考链照旧不进群。
-              </Notice>
+              <Notice tone="info">{i18n.t("agent.qcaNotice")}</Notice>
             ) : null}
 
-            <Field label="个性签名" htmlFor="agent-signature" hint={draft.backend === "qca"
-              ? "群里头像旁的一行小字；云端 Agent 调不到我们的工具，改签名要回这里改。留空则不显示。"
-              : "群里头像旁的一行小字；员工自己也能用 set_signature 工具改。留空则不显示。"}>
+            <Field label={i18n.t("agent.signatureLabel")} htmlFor="agent-signature" hint={draft.backend === "qca"
+              ? i18n.t("agent.signatureQcaHint")
+              : i18n.t("agent.signatureHint")}>
               <TextInput
                 id="agent-signature"
                 value={draft.signature}
                 maxLength={120}
                 onChange={(event) => setDraft({ ...draft, signature: event.target.value })}
-                placeholder="如：验收清单控，交付前必跑回归"
+                placeholder={i18n.t("agent.signaturePlaceholder")}
                 className="h-8 text-xs"
               />
             </Field>
 
-            <Field label="系统提示词" htmlFor="agent-system" hint={draft.backend === "qca"
-              ? "决定 ta 的语气与边界；云端 Agent 用它自己的提示词，这段会跟着正文一起递过去。"
-              : "决定 ta 的语气、边界和什么时候该用 MCP 回查历史。"}>
+            <Field label={i18n.t("agent.systemLabel")} htmlFor="agent-system" hint={draft.backend === "qca"
+              ? i18n.t("agent.systemQcaHint")
+              : i18n.t("agent.systemHint")}>
               <Textarea id="agent-system" rows={3} value={draft.system_prompt} onChange={(event) => setDraft({ ...draft, system_prompt: event.target.value })} className="text-xs" />
             </Field>
 
             <div className="flex flex-wrap items-center gap-3">
-              <Field label="状态">
+              <Field label={i18n.t("agent.statusLabel")}>
                 <NativeSelect className="h-8 text-xs" value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value as "active" | "paused" })}>
-                  <NativeSelectOption value="active">在岗</NativeSelectOption>
-                  <NativeSelectOption value="paused">暂停接活</NativeSelectOption>
+                  <NativeSelectOption value="active">{i18n.t("agent.onDuty")}</NativeSelectOption>
+                  <NativeSelectOption value="paused">{i18n.t("agent.pauseWork")}</NativeSelectOption>
                 </NativeSelect>
               </Field>
               <div className="flex items-end gap-2 pb-0.5">
@@ -664,10 +662,10 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                     className="h-8 text-xs"
                     onClick={() => setDraft({ ...draft, api_base_url: "demo://local", model: "demo", api_key: draft.api_key || "demo" })}
                   >
-                    用演示端点填空
+                    {i18n.t("agent.useDemo")}
                   </Button>
                 )}
-                {draft.id ? <p className="text-xs text-muted-foreground">{draft.api_key ? "换了后端：要重新粘贴这份凭据" : `凭据尾号 ${draft.api_key_tail ?? "—"}`}</p> : null}
+                {draft.id ? <p className="text-xs text-muted-foreground">{draft.api_key ? i18n.t("agent.backendSwitchNote") : i18n.tf("agent.keyTail", { tail: draft.api_key_tail ?? "—" })}</p> : null}
               </div>
             </div>
           </CardContent>
@@ -679,28 +677,29 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         {detail ? (
           <Tabs defaultValue="memory" className="min-h-0">
             <TabsList className="grid w-full grid-cols-4">
-              <TabsTrigger value="memory" className="text-xs">记忆</TabsTrigger>
-              <TabsTrigger value="skills" className="text-xs">技能</TabsTrigger>
-              <TabsTrigger value="groups" className="text-xs">所在群</TabsTrigger>
-              <TabsTrigger value="queue" className="text-xs">邮箱队列</TabsTrigger>
+              <TabsTrigger value="memory" className="text-xs">{i18n.t("agent.tabMemory")}</TabsTrigger>
+              <TabsTrigger value="skills" className="text-xs">{i18n.t("market.skills")}</TabsTrigger>
+              <TabsTrigger value="groups" className="text-xs">{i18n.t("agent.tabGroups")}</TabsTrigger>
+              <TabsTrigger value="queue" className="text-xs">{i18n.t("agent.tabQueue")}</TabsTrigger>
             </TabsList>
 
             <TabsContent value="memory" className="grid gap-3 pt-3">
               <Notice>
-                两段记忆：common 跟着员工走，per-stream 只在这个群里生效。窗口超预算时系统会自动写一条
-                <code className="mx-1 font-mono">summary</code>并把覆盖点记在 covers_through_seq 上。
+                {memoryParts[0]}
+                <code className="mx-1 font-mono">summary</code>
+                {memoryParts[1]}
               </Notice>
               <div className="flex flex-wrap items-end gap-2">
-                <Field label="写入范围">
+                <Field label={i18n.t("agent.memoryScopeLabel")}>
                   <NativeSelect className="h-8 text-xs" value={memoryScope} onChange={(event) => setMemoryScope(event.target.value as "common" | "stream")}>
                     <NativeSelectOption value="common">common</NativeSelectOption>
                     <NativeSelectOption value="stream">per-stream</NativeSelectOption>
                   </NativeSelect>
                 </Field>
                 {memoryScope === "stream" ? (
-                  <Field label="群">
+                  <Field label={i18n.t("agent.memoryStreamLabel")}>
                     <NativeSelect className="h-8 w-40 text-xs" value={memoryStream} onChange={(event) => setMemoryStream(event.target.value)}>
-                      <NativeSelectOption value="">选择群…</NativeSelectOption>
+                      <NativeSelectOption value="">{i18n.t("agent.memoryStreamPlaceholder")}</NativeSelectOption>
                       {detail.streams.map((row) => (
                         <NativeSelectOption key={row.stream_id} value={row.stream_id}>
                           {streamNames.get(row.stream_id) ?? shortUuid(row.stream_id)}
@@ -710,12 +709,12 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                   </Field>
                 ) : null}
                 <div className="min-w-56 flex-1">
-                  <Field label="内容">
-                    <TextInput value={memoryDraft} onChange={(event) => setMemoryDraft(event.target.value)} placeholder="如：交付前先跑一遍验收清单" className="h-8 text-xs" />
+                  <Field label={i18n.t("agent.memoryContentLabel")}>
+                    <TextInput value={memoryDraft} onChange={(event) => setMemoryDraft(event.target.value)} placeholder={i18n.t("agent.memoryContentPlaceholder")} className="h-8 text-xs" />
                   </Field>
                 </div>
                 <Button size="sm" className="h-8 text-xs" disabled={!memoryDraft.trim() || (memoryScope === "stream" && !memoryStream)} onClick={() => void addMemory()}>
-                  写入
+                  {i18n.t("agent.memoryWrite")}
                 </Button>
               </div>
               <div className="grid gap-1.5">
@@ -726,8 +725,8 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                       <p className="mt-0.5 font-mono text-[11px] text-muted-foreground">
                         {memory.scope} · {memory.kind}
                         {memory.stream_id ? ` · ${streamNames.get(memory.stream_id) ?? shortUuid(memory.stream_id)}` : ""}
-                        {memory.covers_through_seq ? ` · 覆盖到 #${memory.covers_through_seq}` : ""}
-                        {memory.source === "engine" ? " · 自动压缩" : ""} · {timeAgo(memory.created_at)}
+                        {memory.covers_through_seq ? ` · ${i18n.tf("agent.coversThrough", { n: memory.covers_through_seq })}` : ""}
+                        {memory.source === "engine" ? ` · ${i18n.t("agent.autoCompressed")}` : ""} · {timeAgo(i18n, memory.created_at)}
                       </p>
                     </div>
                     <Button
@@ -740,32 +739,28 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                             await post("agents.memory.delete", { id: memory.id, agent_id: selected });
                             setMemories(await loadMemories(selected));
                           } catch (error) {
-                            toast.error(describeError(error));
+                            toast.error(describeError(i18n, error));
                           }
                         })();
                       }}
                     >
-                      删除
+                      {i18n.t("common.delete")}
                     </Button>
                   </div>
                 ))}
               </div>
               <Button size="sm" variant="ghost" className="justify-self-start text-xs" onClick={() => void loadMemories(selected).then(setMemories)}>
-                只看 common
+                {i18n.t("agent.commonOnly")}
               </Button>
             </TabsContent>
 
             <TabsContent value="skills" className="grid gap-3 pt-3">
-              <Notice>
-                技能会作为操作说明写进这个员工的上下文；内置的「WorkStream 平台技能」与
-                「DevStream 群文件与公告」始终启用，
-                带「默认」标记的公共技能在建档时已自动安装。这里搜到的技能只装给当前这一位。
-              </Notice>
+              <Notice>{i18n.t("agent.skillsNotice")}</Notice>
               <div className="flex flex-wrap items-center gap-2">
                 <Input
                   value={skillSearch}
                   onChange={(event) => setSkillSearch(event.target.value)}
-                  placeholder="搜本地市场和远端技能源…"
+                  placeholder={i18n.t("agent.skillSearchPlaceholder")}
                   className="h-8 w-60 text-xs"
                 />
                 {hasRemoteSkills ? (
@@ -776,29 +771,28 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                     disabled={skillBusy === "check"}
                     onClick={() => void checkUpdates(selected)}
                   >
-                    {skillBusy === "check" ? "比对中…" : "复查版本"}
+                    {skillBusy === "check" ? i18n.t("agent.checkingVersions") : i18n.t("agent.recheckVersions")}
                   </Button>
                 ) : null}
                 {updateCheckedAt ? (
                   <span className="font-mono text-[11px] text-muted-foreground">
-                    版本自查于 {timeAgo(updateCheckedAt)}
+                    {i18n.tf("agent.checkedAt", { time: timeAgo(i18n, updateCheckedAt) })}
                   </span>
                 ) : null}
                 <a href="#/market/skills" className="ml-auto text-xs text-signal hover:underline">
-                  要装给多个员工 → Market
+                  {i18n.t("agent.toMarket")}
                 </a>
               </div>
 
               {skillSearch.trim().length >= 2 && skillHits.length === 0 ? (
                 <p className="text-xs text-muted-foreground">
-                  本地市场和远端技能源里都没有「{skillSearch.trim()}」。换个关键词，或到 Market
-                  的远端技能源里先加一个源。
+                  {i18n.tf("agent.skillNoResults", { query: skillSearch.trim() })}
                 </p>
               ) : null}
               {skillHits.length > 0 ? (
                 <div className="ws-surface grid gap-1.5 rounded-xl bg-card p-3">
                   <p className="text-[11px] font-medium text-muted-foreground">
-                    搜索结果 · 只装给 {detail.agent.name}
+                    {i18n.tf("agent.skillResultsFor", { name: detail.agent.name })}
                   </p>
                   {skillHits.map((hit) => (
                     <div key={hit.key} className="flex flex-wrap items-center gap-2 rounded-md border px-2.5 py-2">
@@ -822,7 +816,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                         disabled={hit.installedHere || (skillBusy !== "" && skillBusy !== "check")}
                         onClick={() => void runInstall(hit)}
                       >
-                        {hit.installedHere ? "已装" : skillBusy === hit.key ? "安装中…" : "安装"}
+                        {hit.installedHere ? i18n.t("agent.installed") : skillBusy === hit.key ? i18n.t("agent.installing") : i18n.t("agent.install")}
                       </Button>
                     </div>
                   ))}
@@ -831,8 +825,9 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
 
               {updateIssues.length > 0 ? (
                 <Notice tone="warn">
-                  {updateIssues.map((issue) => `${issue.name}（${describeCode(issue.reason)}）`).join("；")}
-                  —— 这些远端技能暂时比不了版本，源恢复后再复查。
+                  {i18n.tf("agent.updateIssuesNote", {
+                    list: i18n.list(updateIssues.map((issue) => i18n.tf("agent.updateIssueItem", { name: issue.name, reason: describeCode(i18n, issue.reason) }))),
+                  })}
                 </Notice>
               ) : null}
 
@@ -846,21 +841,21 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                           <span className="truncate">{skill.name}</span>
                           {skill.always_on ? (
                             <Badge variant="secondary" className="rounded-full bg-signal/12 px-1.5 py-0 text-[10px] leading-4 font-normal text-signal">
-                              内置
+                              {i18n.t("agent.badgeBuiltIn")}
                             </Badge>
                           ) : skill.is_default ? (
                             <Badge variant="secondary" className="rounded-full px-1.5 py-0 text-[10px] leading-4 font-normal">
-                              默认
+                              {i18n.t("agent.badgeDefault")}
                             </Badge>
                           ) : null}
                           {skill.source === "remote" ? (
                             <Badge variant="secondary" className="rounded-full px-1.5 py-0 text-[10px] leading-4 font-normal">
-                              远端快照
+                              {i18n.t("agent.badgeRemoteSnapshot")}
                             </Badge>
                           ) : null}
                           {row?.update_available ? (
                             <Badge variant="secondary" className="rounded-full bg-machine-soft px-1.5 py-0 text-[10px] leading-4 font-normal text-machine">
-                              可更新 v{row.latest_version}
+                              {i18n.tf("agent.badgeUpdatable", { version: row.latest_version })}
                             </Badge>
                           ) : null}
                         </span>
@@ -871,7 +866,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                         <span className="font-mono text-[11px] text-muted-foreground">v{skill.version}</span>
                       ) : null}
                       {skill.always_on ? (
-                        <span className="text-[11px] text-muted-foreground">始终启用</span>
+                        <span className="text-[11px] text-muted-foreground">{i18n.t("agent.alwaysOn")}</span>
                       ) : (
                         <span className="flex items-center gap-1">
                           {row?.update_available && skill.source_registry_id ? (
@@ -882,7 +877,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                               disabled={skillBusy !== "" && skillBusy !== "check"}
                               onClick={() => void updateSkill(skill)}
                             >
-                              {skillBusy === skill.id ? "更新中…" : "更新"}
+                              {skillBusy === skill.id ? i18n.t("agent.updating") : i18n.t("agent.update")}
                             </Button>
                           ) : null}
                           <Button
@@ -892,7 +887,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                             disabled={skillBusy === skill.id}
                             onClick={() => void uninstallSkill(skill)}
                           >
-                            卸载
+                            {i18n.t("agent.uninstall")}
                           </Button>
                         </span>
                       )}
@@ -903,7 +898,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
             </TabsContent>
 
             <TabsContent value="groups" className="grid gap-1.5 pt-3">
-              {detail.streams.length === 0 ? <p className="text-xs text-muted-foreground">还没进过任何群。</p> : null}
+              {detail.streams.length === 0 ? <p className="text-xs text-muted-foreground">{i18n.t("agent.noGroups")}</p> : null}
               {detail.streams.map((row) => {
                 const name = streamNames.get(row.stream_id) ?? shortUuid(row.stream_id);
                 const live = presence?.streams.find((item) => item.stream_id === row.stream_id);
@@ -912,14 +907,14 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                     {/* 整行即入口：透明铺底按钮接点击，权重控件浮在它之上。 */}
                     <a
                       href={`#/stream/${row.stream_id}`}
-                      aria-label={`进入群聊 ${name}`}
+                      aria-label={i18n.tf("agent.enterGroupAria", { name })}
                       className="absolute inset-0 z-0 rounded-md focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal"
                     />
                     <span className="min-w-0 flex-1 truncate">{name}</span>
                     <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{row.role}</span>
                     {live && (live.queued || live.running) ? (
                       <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
-                        排队 {live.queued} · 运行 {live.running}
+                        {i18n.tf("agent.lineQueuedRunning", { queued: live.queued, running: live.running })}
                       </span>
                     ) : null}
                     {live ? <span className="relative z-10"><WeightField agentId={detail.agent.id} streamId={row.stream_id} streamName={name} weight={live.weight} /></span> : null}
@@ -929,7 +924,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
             </TabsContent>
 
             <TabsContent value="queue" className="grid gap-1.5 pt-3">
-              {detail.queue.length === 0 ? <p className="text-xs text-muted-foreground">邮箱是空的。群里 @ ta 就会落一封任务进来。</p> : null}
+              {detail.queue.length === 0 ? <p className="text-xs text-muted-foreground">{i18n.t("agent.queueEmpty")}</p> : null}
               {detail.queue.map((item) => (
                 <div key={item.id} className="flex items-center gap-2 rounded-md border px-2.5 py-2">
                   <Badge
@@ -942,16 +937,16 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                     {streamNames.get(item.stream_id) ?? shortUuid(item.stream_id)}
                   </span>
                   <span className="font-mono text-[11px] text-muted-foreground">
-                    权重 {item.priority} · 时间片 {item.slice_count}
+                    {i18n.tf("agent.mailWeightSlice", { weight: item.priority, slices: item.slice_count })}
                   </span>
-                  <span className="text-[11px] text-muted-foreground">{timeAgo(item.created_at)}</span>
+                  <span className="text-[11px] text-muted-foreground">{timeAgo(i18n, item.created_at)}</span>
                   {item.error ? <span className="text-[11px] text-destructive">{item.error}</span> : null}
                 </div>
               ))}
             </TabsContent>
           </Tabs>
         ) : (
-          <p className="text-xs text-muted-foreground">选一个虚拟员工，或填一份新档案。</p>
+          <p className="text-xs text-muted-foreground">{i18n.t("agent.pickOrCreate")}</p>
         )}
           </>
         )}
@@ -960,22 +955,23 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
   );
 }
 
-const MAIL_TONE: Record<MailItem["status"], { label: string; className: string }> = {
-  queued: { label: "未读", className: "bg-signal/12 text-signal" },
-  running: { label: "处理中", className: "bg-machine/12 text-machine" },
-  done: { label: "已读", className: "bg-muted text-muted-foreground" },
-  failed: { label: "处理失败", className: "bg-destructive/10 text-destructive" },
-  cancelled: { label: "已取消", className: "bg-muted text-muted-foreground" },
+const MAIL_TONE: Record<MailItem["status"], { labelKey: MsgKey; className: string }> = {
+  queued: { labelKey: "deliver.queued", className: "bg-signal/12 text-signal" },
+  running: { labelKey: "deliver.running", className: "bg-machine/12 text-machine" },
+  done: { labelKey: "deliver.done", className: "bg-muted text-muted-foreground" },
+  failed: { labelKey: "deliver.failed", className: "bg-destructive/10 text-destructive" },
+  cancelled: { labelKey: "deliver.cancelled", className: "bg-muted text-muted-foreground" },
 };
 
 function MailBadge({ status }: { status: MailItem["status"] }) {
+  const i18n = useI18n();
   const tone = MAIL_TONE[status] ?? MAIL_TONE.done;
   return (
     <span className={`inline-flex shrink-0 items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] leading-4 ${tone.className}`}>
       {status === "running" ? (
         <span className="size-2 animate-spin rounded-full border border-current border-t-transparent" aria-hidden />
       ) : null}
-      {tone.label}
+      {i18n.t(tone.labelKey)}
     </span>
   );
 }
@@ -992,6 +988,7 @@ function WeightField({
   streamName: string;
   weight: number;
 }) {
+  const i18n = useI18n();
   const [value, setValue] = useState(weight);
   const [busy, setBusy] = useState(false);
   useEffect(() => setValue(weight), [weight]);
@@ -1001,9 +998,9 @@ function WeightField({
     setBusy(true);
     try {
       await post("scheduler.weight", { stream_id: streamId, agent_id: agentId, weight: value });
-      toast.success(`「${streamName}」的权重已设为 ${value}`);
+      toast.success(i18n.tf("agent.weightSaved", { name: streamName, weight: value }));
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy(false);
     }
@@ -1011,7 +1008,7 @@ function WeightField({
 
   return (
     <span className="flex items-center gap-1.5">
-      <span className="text-[11px] text-muted-foreground">本群权重</span>
+      <span className="text-[11px] text-muted-foreground">{i18n.t("agent.weightLabel")}</span>
       <Input
         type="number"
         min={1}
@@ -1023,7 +1020,7 @@ function WeightField({
       />
       {dirty ? (
         <Button size="xs" variant="outline" disabled={busy} onClick={() => void save()}>
-          保存
+          {i18n.t("agent.save")}
         </Button>
       ) : null}
     </span>
@@ -1032,6 +1029,7 @@ function WeightField({
 
 /** 主人视角的实时现场：正在处理哪条、还排着几封。 */
 function AgentPresenceStrip({ detail, error }: { detail: AgentPresenceDetail | null; error: string }) {
+  const i18n = useI18n();
   if (error && !detail) return <Notice>{error}</Notice>;
   if (!detail) return null;
   const current = detail.current;
@@ -1044,24 +1042,24 @@ function AgentPresenceStrip({ detail, error }: { detail: AgentPresenceDetail | n
           {current ? (
             <Badge className="gap-1.5 rounded-sm bg-machine/12 text-[11px] font-normal text-machine">
               <span className="size-2 animate-spin rounded-full border border-current border-t-transparent" aria-hidden />
-              处理中
+              {i18n.t("deliver.running")}
             </Badge>
           ) : (
-            <Badge variant="secondary" className="rounded-sm text-[11px] font-normal">空闲</Badge>
+            <Badge variant="secondary" className="rounded-sm text-[11px] font-normal">{i18n.t("agent.idle")}</Badge>
           )}
           {current ? (
             <span className="min-w-0 truncate text-xs">
-              {currentItem?.stream_name ?? "未知群"} · 第 #{current.seq || "—"} 条
+              {currentItem?.stream_name ?? i18n.t("agent.unknownStream")} · {i18n.tf("agent.atSequence", { n: current.seq || "—" })}
             </span>
           ) : (
-            <span className="text-xs text-muted-foreground">邮箱里没有进行中的任务。</span>
+            <span className="text-xs text-muted-foreground">{i18n.t("agent.noActiveTask")}</span>
           )}
-          {queued ? <Badge variant="secondary" className="rounded-sm font-mono text-[11px]">排队 {queued}</Badge> : null}
+          {queued ? <Badge variant="secondary" className="rounded-sm font-mono text-[11px]">{i18n.tf("agent.queuedCount", { n: queued })}</Badge> : null}
           <span className="ml-auto flex items-center gap-2 text-[11px] text-muted-foreground">
-            {current?.started_at ? <span>开始于 {timeAgo(current.started_at)}</span> : null}
+            {current?.started_at ? <span>{i18n.tf("agent.startedAt", { time: timeAgo(i18n, current.started_at) })}</span> : null}
             <span className="inline-flex items-center gap-1">
               <span className="size-1.5 animate-pulse rounded-full bg-signal" aria-hidden />
-              每 5 秒自动刷新
+              {i18n.t("agent.autoRefresh")}
             </span>
           </span>
         </div>
@@ -1075,11 +1073,12 @@ function AgentPresenceStrip({ detail, error }: { detail: AgentPresenceDetail | n
 
 /** 非主人视角：只显示群成员本就可见的资料与共同群里的现场，不碰 Key、提示词与记忆。 */
 function GuestProfile({ detail, error }: { detail: AgentPresenceDetail | null; error: string }) {
+  const i18n = useI18n();
   if (!detail) {
     return error ? (
       <Notice>{error}</Notice>
     ) : (
-      <p className="text-xs text-muted-foreground">正在读取现场…</p>
+      <p className="text-xs text-muted-foreground">{i18n.t("agent.guestLoading")}</p>
     );
   }
   const { profile, owner } = detail;
@@ -1094,13 +1093,13 @@ function GuestProfile({ detail, error }: { detail: AgentPresenceDetail | null; e
             <h2 className="flex flex-wrap items-center gap-2 text-base font-semibold">
               {profile.name}
               <Badge variant={profile.status === "paused" ? "secondary" : "outline"} className="rounded-sm text-[10px] font-normal">
-                {profile.status === "paused" ? "暂停接活" : "在岗"}
+                {profile.status === "paused" ? i18n.t("agent.pauseWork") : i18n.t("agent.onDuty")}
               </Badge>
             </h2>
             <p className="mt-0.5 text-sm text-muted-foreground">{profile.role}</p>
             {profile.signature ? <p className="mt-1 text-xs text-muted-foreground">「{profile.signature}」</p> : null}
             <p className="mt-2 font-mono text-[11px] text-muted-foreground">
-              主人 {owner.display_name} · 建档于 {timeAgo(profile.created_at)}
+              {i18n.tf("agent.guestOwnerLine", { owner: owner.display_name, time: timeAgo(i18n, profile.created_at) })}
             </p>
           </div>
         </CardContent>
@@ -1113,15 +1112,15 @@ function GuestProfile({ detail, error }: { detail: AgentPresenceDetail | null; e
               <>
                 <Badge className="gap-1.5 rounded-sm bg-machine/12 text-[11px] font-normal text-machine">
                   <span className="size-2 animate-spin rounded-full border border-current border-t-transparent" aria-hidden />
-                  处理中
+                  {i18n.t("deliver.running")}
                 </Badge>
                 <span className="min-w-0 truncate text-sm">
-                  {currentItem?.stream_name ?? "未知群"} · 第 #{current.seq || "—"} 条
+                  {currentItem?.stream_name ?? i18n.t("agent.unknownStream")} · {i18n.tf("agent.atSequence", { n: current.seq || "—" })}
                 </span>
-                {current.started_at ? <span className="text-[11px] text-muted-foreground">开始于 {timeAgo(current.started_at)}</span> : null}
+                {current.started_at ? <span className="text-[11px] text-muted-foreground">{i18n.tf("agent.startedAt", { time: timeAgo(i18n, current.started_at) })}</span> : null}
               </>
             ) : (
-              <span className="text-sm text-muted-foreground">现在空闲。</span>
+              <span className="text-sm text-muted-foreground">{i18n.t("agent.idleNow")}</span>
             )}
           </div>
           {current?.preview ? <p className="truncate text-xs text-muted-foreground">{current.preview}</p> : null}
@@ -1134,9 +1133,9 @@ function GuestProfile({ detail, error }: { detail: AgentPresenceDetail | null; e
                   className="flex items-center gap-2 rounded-md border px-2.5 py-2 text-sm transition-colors hover:bg-muted/50"
                 >
                   <span className="min-w-0 flex-1 truncate">{row.name}</span>
-                  {row.queued ? <Badge variant="secondary" className="rounded-sm font-mono text-[10px]">排队 {row.queued}</Badge> : null}
-                  {row.running ? <Badge className="rounded-sm font-mono text-[10px]">运行 {row.running}</Badge> : null}
-                  <span className="text-xs text-signal">进入 →</span>
+                  {row.queued ? <Badge variant="secondary" className="rounded-sm font-mono text-[10px]">{i18n.tf("agent.queuedCount", { n: row.queued })}</Badge> : null}
+                  {row.running ? <Badge className="rounded-sm font-mono text-[10px]">{i18n.tf("agent.runningCount", { n: row.running })}</Badge> : null}
+                  <span className="text-xs text-signal">{i18n.t("agent.enterArrow")}</span>
                 </a>
               ))}
             </div>
@@ -1149,24 +1148,24 @@ function GuestProfile({ detail, error }: { detail: AgentPresenceDetail | null; e
       <Card>
         <CardContent className="grid gap-1.5 pt-6">
           <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold">最近的邮箱动态</h3>
-            <span className="text-[11px] text-muted-foreground">只含你们共同所在的群</span>
+            <h3 className="text-sm font-semibold">{i18n.t("agent.recentMail")}</h3>
+            <span className="text-[11px] text-muted-foreground">{i18n.t("agent.sharedOnly")}</span>
           </div>
-          {detail.queue.length === 0 ? <p className="text-xs text-muted-foreground">共同群里的邮箱还是空的。</p> : null}
+          {detail.queue.length === 0 ? <p className="text-xs text-muted-foreground">{i18n.t("agent.guestMailEmpty")}</p> : null}
           {detail.queue.slice(0, 20).map((item) => (
             <div key={item.id} className="flex items-center gap-2 rounded-md border px-2.5 py-2">
               <MailBadge status={item.status} />
               <span className="min-w-0 flex-1 truncate text-xs">
                 {item.stream_name} · #{item.seq || "—"} {item.preview}
               </span>
-              <span className="shrink-0 text-[11px] text-muted-foreground">{timeAgo(item.created_at)}</span>
+              <span className="shrink-0 text-[11px] text-muted-foreground">{timeAgo(i18n, item.created_at)}</span>
             </div>
           ))}
         </CardContent>
       </Card>
 
       <p className="text-[11px] text-muted-foreground">
-        员工档案归主人所有；这里只展示群成员本就能看到的信息，不包含 API Key、系统提示词与记忆。
+        {i18n.t("agent.guestPrivacy")}
       </p>
     </div>
   );

@@ -9,11 +9,12 @@ import { describeCode, describeError, get, post } from "../api";
 import type { Plugin } from "../types";
 import { timeAgo } from "../lib/format";
 import { Field, Notice, TextInput } from "../lib/ui";
+import { useI18n, type MsgKey } from "../lib/i18n";
 
-const STATUS_LABEL: Record<string, string> = {
-  ready: "就绪",
-  error: "连不上",
-  untested: "未检测",
+const STATUS_LABEL: Record<string, MsgKey> = {
+  ready: "plugin.statusReady",
+  error: "plugin.statusError",
+  untested: "plugin.statusUntested",
 };
 
 function hostOf(endpoint: string): string {
@@ -28,11 +29,17 @@ type Draft = { name: string; endpoint: string; token: string };
 const EMPTY: Draft = { name: "", endpoint: "", token: "" };
 
 export function PluginsPanel() {
+  const i18n = useI18n();
   const [items, setItems] = useState<Plugin[]>([]);
   const [limit, setLimit] = useState(12);
   const [addOpen, setAddOpen] = useState(false);
   const [draft, setDraft] = useState<Draft>(EMPTY);
   const [busy, setBusy] = useState("");
+
+  // 「它 tools/list 出来的工具」「可以在 DSH 插件目录里找」都要往句子里夹元素，
+  // 按 {0} 拆成两截，中间自己塞 <span>/<a>。
+  const introParts = i18n.tp("plugin.intro");
+  const catalogParts = i18n.tp("plugin.tipCatalog");
 
   const load = useCallback(async () => {
     try {
@@ -40,7 +47,7 @@ export function PluginsPanel() {
       setItems(result.items);
       setLimit(result.limit);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     }
   }, []);
 
@@ -50,7 +57,7 @@ export function PluginsPanel() {
 
   async function add() {
     if (!draft.name.trim() || !draft.endpoint.trim()) {
-      toast.error("插件名和 MCP 地址都要填。");
+      toast.error(i18n.t("plugin.needNameEndpoint"));
       return;
     }
     setBusy("add");
@@ -63,13 +70,13 @@ export function PluginsPanel() {
       setAddOpen(false);
       setDraft(EMPTY);
       if (result.probe_error) {
-        toast.warning(`已保存，但连不上：${describeCode(result.probe_error)}`);
+        toast.warning(i18n.tf("plugin.savedButUnreachable", { reason: describeCode(i18n, result.probe_error) }));
       } else {
-        toast.success(`已接入 ${result.plugin.name}`);
+        toast.success(i18n.tf("plugin.addedToast", { name: result.plugin.name }));
       }
       await load();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
@@ -82,11 +89,15 @@ export function PluginsPanel() {
         "plugins.probe",
         { id: plugin.id },
       );
-      const skipped = result.skipped?.length ? `，跳过 ${result.skipped.length} 个` : "";
-      toast.success(`读到 ${result.tools.length} 个工具${skipped}`);
+      // 整句两个键，而不是「主句 + 「，跳过 N 个」片段」拼接：日语把补语收进括号，语序对不齐中文。
+      toast.success(
+        result.skipped?.length
+          ? i18n.tf("plugin.probeReadSkipped", { n: result.tools.length, skipped: result.skipped.length })
+          : i18n.tf("plugin.probeRead", { n: result.tools.length }),
+      );
       await load();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
       await load();
     } finally {
       setBusy("");
@@ -97,24 +108,24 @@ export function PluginsPanel() {
     setBusy(plugin.id);
     try {
       await post<{ ok: true }>("plugins.update", { id: plugin.id, enabled });
-      toast.success(enabled ? `已启用 ${plugin.name}` : `已停用 ${plugin.name}`);
+      toast.success(enabled ? i18n.tf("plugin.enabledToast", { name: plugin.name }) : i18n.tf("plugin.disabledToast", { name: plugin.name }));
       await load();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
   }
 
   async function remove(plugin: Plugin) {
-    if (!window.confirm(`删掉插件「${plugin.name}」？它带进来的工具会立刻从员工清单里消失。`)) return;
+    if (!window.confirm(i18n.tf("plugin.removeConfirm", { name: plugin.name }))) return;
     setBusy(plugin.id);
     try {
       await post<{ ok: true }>("plugins.remove", { id: plugin.id });
-      toast.success("已删除");
+      toast.success(i18n.t("common.deleted"));
       await load();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
@@ -124,31 +135,32 @@ export function PluginsPanel() {
     <div className="grid gap-3">
       <div className="flex flex-wrap items-end justify-between gap-2">
         <p className="max-w-[620px] text-xs leading-relaxed text-muted-foreground">
-          接一个标准 MCP 服务，它 <span className="font-mono">tools/list</span> 出来的工具会并进你名下所有虚拟员工的工具清单；
-          员工调用插件工具照样落进 Stream flow 的轨迹。工具名与内置工具重名时内置优先，插件那条会被跳过。
+          {introParts[0]}
+          <span className="font-mono">tools/list</span>
+          {introParts[1]}
         </p>
         <Button
           size="sm"
           className="h-8 rounded-full text-xs"
           onClick={() => setAddOpen((current) => !current)}
         >
-          {addOpen ? "收起" : "接入插件"}
+          {addOpen ? i18n.t("common.collapse") : i18n.t("plugin.addTitle")}
         </Button>
       </div>
 
       {addOpen ? (
         <section className="ws-surface grid gap-3 rounded-xl bg-card p-3.5">
           <div className="grid gap-3 md:grid-cols-[minmax(0,0.8fr)_minmax(0,1.4fr)_minmax(0,1fr)]">
-            <Field label="插件名">
+            <Field label={i18n.t("plugin.nameLabel")}>
               <TextInput
                 value={draft.name}
                 maxLength={40}
                 onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                placeholder="如：天气查询"
+                placeholder={i18n.t("plugin.namePlaceholder")}
                 className="h-8 text-xs"
               />
             </Field>
-            <Field label="MCP 地址" hint="标准 JSON-RPC over HTTP；线上只收 https，本机调试才放行内网地址。">
+            <Field label={i18n.t("plugin.endpointLabel")} hint={i18n.t("plugin.endpointHint")}>
               <TextInput
                 value={draft.endpoint}
                 maxLength={300}
@@ -157,12 +169,12 @@ export function PluginsPanel() {
                 className="h-8 text-xs"
               />
             </Field>
-            <Field label="令牌（可选）" hint="填了就用 Bearer 头发出去，服务端只存密文，界面只回尾号。">
+            <Field label={i18n.t("plugin.tokenLabel")} hint={i18n.t("plugin.tokenHint")}>
               <TextInput
                 value={draft.token}
                 maxLength={400}
                 onChange={(event) => setDraft({ ...draft, token: event.target.value })}
-                placeholder="留空表示这个服务不需要鉴权"
+                placeholder={i18n.t("plugin.tokenPlaceholder")}
                 className="h-8 text-xs"
                 type="password"
               />
@@ -170,10 +182,10 @@ export function PluginsPanel() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Button size="sm" className="h-8 rounded-full text-xs" disabled={busy === "add"} onClick={() => void add()}>
-              {busy === "add" ? "连接中…" : "接入并检测"}
+              {busy === "add" ? i18n.t("plugin.connecting") : i18n.t("plugin.addAndProbe")}
             </Button>
             <p className="text-[11px] leading-relaxed text-muted-foreground">
-              连不上也会先存下来，标成「连不上」，之后可以重新检测。
+              {i18n.tf("plugin.probeFailHint", { status: i18n.t("plugin.statusError") })}
             </p>
           </div>
         </section>
@@ -192,14 +204,14 @@ export function PluginsPanel() {
                   plugin.status === "error" && "bg-destructive/12 text-destructive",
                 )}
               >
-                {STATUS_LABEL[plugin.status] ?? plugin.status}
+                {STATUS_LABEL[plugin.status] ? i18n.t(STATUS_LABEL[plugin.status]) : plugin.status}
               </Badge>
               <Badge variant="secondary" className="rounded-full px-1.5 py-0 text-[10px] leading-4 font-normal">
-                {plugin.enabled ? "已启用" : "已停用"}
+                {plugin.enabled ? i18n.t("plugin.enabledBadge") : i18n.t("plugin.disabledBadge")}
               </Badge>
               {plugin.auth_tail ? (
                 <Badge variant="secondary" className="rounded-full px-1.5 py-0 text-[10px] leading-4 font-normal">
-                  令牌 {plugin.auth_tail}
+                  {i18n.tf("plugin.tokenBadge", { tail: plugin.auth_tail })}
                 </Badge>
               ) : null}
             </div>
@@ -207,7 +219,7 @@ export function PluginsPanel() {
               {hostOf(plugin.endpoint)}
             </p>
             {plugin.status === "error" && plugin.last_error ? (
-              <p className="text-[11px] leading-relaxed text-destructive">{describeCode(plugin.last_error)}</p>
+              <p className="text-[11px] leading-relaxed text-destructive">{describeCode(i18n, plugin.last_error)}</p>
             ) : null}
             {plugin.tools.length ? (
               <div className="flex min-w-0 flex-wrap gap-1">
@@ -227,7 +239,7 @@ export function PluginsPanel() {
                 ) : null}
               </div>
             ) : (
-              <p className="text-[11px] text-muted-foreground">还没有读到工具。</p>
+              <p className="text-[11px] text-muted-foreground">{i18n.t("plugin.noToolsYet")}</p>
             )}
             <div className="mt-auto flex flex-wrap items-center gap-1.5 pt-1">
               <Button
@@ -237,7 +249,7 @@ export function PluginsPanel() {
                 disabled={busy === plugin.id}
                 onClick={() => void probe(plugin)}
               >
-                {busy === plugin.id ? "检测中…" : "重新检测"}
+                {busy === plugin.id ? i18n.t("plugin.probing") : i18n.t("plugin.reprobe")}
               </Button>
               <Button
                 size="sm"
@@ -246,7 +258,7 @@ export function PluginsPanel() {
                 disabled={busy === plugin.id}
                 onClick={() => void toggle(plugin, !plugin.enabled)}
               >
-                {plugin.enabled ? "停用" : "启用"}
+                {plugin.enabled ? i18n.t("plugin.disableAction") : i18n.t("plugin.enableAction")}
               </Button>
               <Button
                 size="sm"
@@ -255,39 +267,41 @@ export function PluginsPanel() {
                 disabled={busy === plugin.id}
                 onClick={() => void remove(plugin)}
               >
-                删除
+                {i18n.t("common.delete")}
               </Button>
               <span className="ml-auto font-mono text-[10px] text-muted-foreground">
-                {plugin.tool_count} 工具{plugin.tools_at ? ` · ${timeAgo(plugin.tools_at)}` : ""}
+                {i18n.tf("plugin.toolsCount", { n: plugin.tool_count })}{plugin.tools_at ? ` · ${timeAgo(i18n, plugin.tools_at)}` : ""}
               </span>
             </div>
           </article>
         ))}
         {!items.length ? (
-          <Notice>还没有接插件。点右上角「接入插件」填一个标准 MCP 地址；想现成的服务可以去 DSH 插件目录翻（见下方说明）。</Notice>
+          <Notice>
+            {i18n.tf("plugin.emptyNotice", { button: i18n.t("plugin.addTitle"), catalog: i18n.t("plugin.catalogName") })}
+          </Notice>
         ) : null}
       </div>
 
       <section className="ws-surface grid gap-1.5 rounded-xl bg-card p-3.5">
-        <h3 className="text-xs font-semibold">用插件前要知道的三件事</h3>
+        <h3 className="text-xs font-semibold">{i18n.t("plugin.tipsTitle")}</h3>
         <p className="text-[11px] leading-relaxed text-muted-foreground">
-          1. 插件的工具名和说明会原样进入模型上下文，等于把一段外部文案喂给你的员工——只接你信任的来源。
+          {i18n.t("plugin.tip1")}
         </p>
         <p className="text-[11px] leading-relaxed text-muted-foreground">
-          2. 工具是账号级的：接一次，你名下所有员工在所有群里都能调用；不想让某个员工用，就先停用这条连接器。
+          {i18n.t("plugin.tip2")}
         </p>
         <p className="text-[11px] leading-relaxed text-muted-foreground">
-          3. 上限每人 {limit} 条、每条最多带 24 个工具；调用超时 60 秒，回包超过 512KB 直接判失败，不会拖垮整轮回复。
-          现成的 MCP 服务可以在{" "}
+          {i18n.tf("plugin.tipLimits", { limit })}{" "}
+          {catalogParts[0]}
           <a
             href="https://awesome-dsh-plugin.com/zh/"
             target="_blank"
             rel="noreferrer"
             className="text-signal hover:underline"
           >
-            DSH 插件目录
+            {i18n.t("plugin.catalogName")}
           </a>
-          {" "}里找，WorkStream 这边不做二次分发，接的是服务本身。
+          {catalogParts[1]}
         </p>
       </section>
     </div>

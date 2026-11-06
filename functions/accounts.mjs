@@ -1,6 +1,7 @@
 // 真实员工账号、验证令牌与开发态收件箱。
 import { hashPassword, hashToken, newSessionToken, verifyPassword } from "./sec.mjs";
 import { smtpEndpoint } from "./runtime.mjs";
+import { LOCALE_IDS } from "./locales.mjs";
 import { Halt, avatarData, email as emailOf, json, later, newId, now, oneOf, text, uuid } from "./util.mjs";
 
 const SESSION_SECONDS = 30 * 24 * 60 * 60;
@@ -107,6 +108,8 @@ export const actions = {
     if (body.prefs && typeof body.prefs === "object") {
       const prefs = { ...(user.prefs ?? {}) };
       if (body.prefs.theme !== undefined) prefs.theme = oneOf(body.prefs.theme, ["light", "dark", "system"], "theme");
+      // 界面语言跟着账户走，换设备登录后不用重选一次；不认识的 id 就地拒，别存进去一个渲染不出来的值。
+      if (body.prefs.lang !== undefined) prefs.lang = oneOf(body.prefs.lang, LOCALE_IDS, "lang");
       prefs.notify_real_email = Boolean(body.prefs.notify_real_email ?? prefs.notify_real_email);
       // 压缩之后自动归并全局记忆：开关只有这一个写入口，dream.mjs 只读不写。
       prefs.dreaming_auto = Boolean(body.prefs.dreaming_auto ?? prefs.dreaming_auto);

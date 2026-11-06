@@ -11,6 +11,7 @@ import { describeError, get } from "../api";
 import type { Attachment, Delivery, Presented } from "../types";
 import { AVATAR_PRESETS, avatarPresetDataUrl, presetPreviewUrl } from "./avatars";
 import { byteSize, initials } from "./format";
+import { useI18n, type I18n, type MsgKey } from "./i18n";
 
 export type Kind = "human" | "agent" | "system";
 
@@ -34,28 +35,29 @@ export function PersonAvatar({
   busy?: boolean;
   title?: string;
 }) {
+  const i18n = useI18n();
   const base =
     "grid size-8 shrink-0 place-items-center overflow-hidden rounded-full text-xs font-semibold select-none";
   const face = avatar ? (
     <img src={avatar} alt="" draggable={false} className="size-full object-cover" />
   ) : (
-    initials(name)
+    initials(i18n, name)
   );
   const avatarNode =
     kind === "agent" ? (
       <span
         className={cn(base, "ring-2 ring-offset-2 ring-offset-background", className)}
         style={{ background: "var(--machine-soft)", color: "var(--machine)", "--tw-ring-color": color ?? "var(--machine)" } as CSSProperties}
-        title="虚拟员工"
+        title={i18n.t("ui.kindAgent")}
       >
         {face}
       </span>
     ) : kind === "system" ? (
-      <span className={cn(base, "bg-muted text-muted-foreground", className)} title="系统">
+      <span className={cn(base, "bg-muted text-muted-foreground", className)} title={i18n.t("ui.kindSystem")}>
         ⚙
       </span>
     ) : (
-      <span className={cn(base, "bg-signal-soft text-signal", className)} title="真实员工">
+      <span className={cn(base, "bg-signal-soft text-signal", className)} title={i18n.t("ui.kindHuman")}>
         {face}
       </span>
     );
@@ -65,7 +67,7 @@ export function PersonAvatar({
       {href ? (
         <a
           href={href}
-          title={title ?? "查看员工详情"}
+          title={title ?? i18n.t("ui.viewAgentDetail")}
           className="inline-flex shrink-0 rounded-full focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal"
           onClick={(event) => event.stopPropagation()}
         >
@@ -74,8 +76,8 @@ export function PersonAvatar({
       ) : avatarNode}
       {busy ? (
         <span
-          aria-label="正在处理任务"
-          title="正在处理任务"
+          aria-label={i18n.t("ui.busyTitle")}
+          title={i18n.t("ui.busyTitle")}
           className="pointer-events-none absolute -right-0.5 -bottom-0.5 size-2.5 animate-spin rounded-full border-2 border-machine border-t-transparent bg-background"
         />
       ) : null}
@@ -127,6 +129,7 @@ export function AvatarPicker({
   avatar?: string | null;
   onChange: (next: string) => void;
 }) {
+  const i18n = useI18n();
   const inputRef = useRef<HTMLInputElement>(null);
   const [working, setWorking] = useState(false);
   const [presetBusy, setPresetBusy] = useState("");
@@ -134,18 +137,18 @@ export function AvatarPicker({
   async function pick(file: File | undefined) {
     if (!file) return;
     if (!file.type.startsWith("image/")) {
-      toast.error("选一张图片文件（PNG / JPEG / WebP）。");
+      toast.error(i18n.t("ui.avatarPickImage"));
       return;
     }
     if (file.size > 8 * 1024 * 1024) {
-      toast.error("图片不要超过 8MB。");
+      toast.error(i18n.t("ui.avatarTooBig"));
       return;
     }
     setWorking(true);
     try {
       onChange(await toAvatarDataUrl(file));
     } catch {
-      toast.error("这张图读不出来，换一张试试。");
+      toast.error(i18n.t("ui.avatarReadFailed"));
     } finally {
       setWorking(false);
       if (inputRef.current) inputRef.current.value = "";
@@ -158,7 +161,7 @@ export function AvatarPicker({
     try {
       onChange(await avatarPresetDataUrl(preset.svg));
     } catch {
-      toast.error("这个默认头像没生成出来，换一个或自己上传。");
+      toast.error(i18n.t("ui.avatarPresetFailed"));
     } finally {
       setPresetBusy("");
     }
@@ -178,7 +181,7 @@ export function AvatarPicker({
               disabled={working}
               onClick={() => inputRef.current?.click()}
             >
-              {working ? "处理中…" : avatar ? "换头像" : "上传头像"}
+              {working ? i18n.t("ui.avatarWorking") : avatar ? i18n.t("ui.avatarChange") : i18n.t("ui.avatarUpload")}
             </Button>
             {avatar ? (
               <Button
@@ -188,21 +191,21 @@ export function AvatarPicker({
                 className="h-7 px-2 text-xs text-muted-foreground"
                 onClick={() => onChange("")}
               >
-                移除
+                {i18n.t("ui.avatarRemove")}
               </Button>
             ) : null}
           </div>
-          <p className="text-[11px] text-muted-foreground">PNG / JPEG / WebP，裁成 128×128 存库，不超过 8MB。</p>
+          <p className="text-[11px] text-muted-foreground">{i18n.t("ui.avatarHint")}</p>
         </div>
       </div>
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="text-[11px] text-muted-foreground">没图就挑一个：</span>
+        <span className="text-[11px] text-muted-foreground">{i18n.t("ui.avatarPresetHint")}</span>
         {AVATAR_PRESETS.map((preset) => (
           <button
             key={preset.key}
             type="button"
-            title={preset.label}
-            aria-label={preset.label}
+            title={i18n.t(preset.labelKey)}
+            aria-label={i18n.t(preset.labelKey)}
             disabled={working || presetBusy !== ""}
             onClick={() => void usePreset(preset)}
             className={cn(
@@ -227,26 +230,28 @@ export function AvatarPicker({
   );
 }
 
-const DELIVERY_TONES: Record<Delivery["status"], { label: string; className: string }> = {
-  queued: { label: "未读", className: "bg-signal-soft text-signal" },
-  running: { label: "处理中", className: "bg-machine-soft text-machine" },
-  done: { label: "已读", className: "bg-muted text-muted-foreground" },
-  failed: { label: "处理失败", className: "bg-destructive/10 text-destructive" },
-  cancelled: { label: "已取消", className: "bg-muted/70 text-muted-foreground" },
+const DELIVERY_TONES: Record<Delivery["status"], { labelKey: MsgKey; className: string }> = {
+  queued: { labelKey: "deliver.queued", className: "bg-signal-soft text-signal" },
+  running: { labelKey: "deliver.running", className: "bg-machine-soft text-machine" },
+  done: { labelKey: "deliver.done", className: "bg-muted text-muted-foreground" },
+  failed: { labelKey: "deliver.failed", className: "bg-destructive/10 text-destructive" },
+  cancelled: { labelKey: "deliver.cancelled", className: "bg-muted/70 text-muted-foreground" },
 };
 
 /** 一条 @ 消息在每位虚拟员工邮箱里的状态：未读 / 处理中 / 已读 / 失败。 */
 export function DeliveryChips({ deliveries, dense = false }: { deliveries?: Delivery[]; dense?: boolean }) {
+  const i18n = useI18n();
   const rows = deliveries ?? [];
   if (!rows.length) return null;
   return (
     <div className="mt-1 flex flex-wrap items-center gap-1">
       {rows.map((row) => {
         const tone = DELIVERY_TONES[row.status] ?? DELIVERY_TONES.done;
+        const label = i18n.t(tone.labelKey);
         return (
           <span
             key={row.agent_id}
-            title={`${row.agent_name} · ${tone.label}${row.error ? ` · ${row.error}` : ""}`}
+            title={`${row.agent_name} · ${label}${row.error ? ` · ${row.error}` : ""}`}
             className={cn(
               "inline-flex items-center gap-1 rounded-full px-1.5 py-0 font-normal",
               dense ? "text-[10px]" : "text-[11px]",
@@ -257,7 +262,7 @@ export function DeliveryChips({ deliveries, dense = false }: { deliveries?: Deli
               <span aria-hidden className="size-1.5 animate-spin rounded-full border border-current border-t-transparent" />
             ) : null}
             <span className="max-w-24 truncate">{row.agent_name}</span>
-            <span className="opacity-80">{tone.label}</span>
+            <span className="opacity-80">{label}</span>
           </span>
         );
       })}
@@ -278,6 +283,7 @@ export function PresentedCards({
   dense?: boolean;
   onOpen?: (item: Presented) => void;
 }) {
+  const i18n = useI18n();
   const rows = items ?? [];
   if (!rows.length) return null;
   const shell = cn(
@@ -294,7 +300,7 @@ export function PresentedCards({
             <span className="min-w-0 flex-1">
               <span className={cn("block truncate font-medium", dense ? "text-[11px]" : "text-xs")}>{item.name}</span>
               <span className="block truncate text-[10px] text-muted-foreground">
-                交付 · {byteSize(item.size_bytes)} · {item.content_type}
+                {i18n.tf("ui.deliveryMeta", { size: byteSize(i18n, item.size_bytes), type: item.content_type })}
               </span>
               {item.note ? (
                 <span className="block whitespace-pre-wrap break-words text-[10px] leading-relaxed text-muted-foreground">
@@ -305,7 +311,7 @@ export function PresentedCards({
           </>
         );
         return onOpen ? (
-          <button key={item.file_id} type="button" className={shell} title="在群文件里预览这份交付物" onClick={() => onOpen(item)}>
+          <button key={item.file_id} type="button" className={shell} title={i18n.t("ui.deliveryOpenTitle")} onClick={() => onOpen(item)}>
             {inner}
           </button>
         ) : (
@@ -319,7 +325,8 @@ export function PresentedCards({
 }
 
 export function RoleBadge({ role }: { role: "owner" | "admin" | "member" }) {
-  const label = role === "owner" ? "群主" : role === "admin" ? "管理员" : "成员";
+  const i18n = useI18n();
+  const label = i18n.t(role === "owner" ? "role.owner" : role === "admin" ? "role.admin" : "role.member");
   return (
     <Badge
       variant="secondary"
@@ -374,6 +381,7 @@ export function MessageImages({ attachments, dense = false }: { attachments?: At
 }
 
 function Thumb({ file, dense, onOpen }: { file: Attachment; dense: boolean; onOpen: () => void }) {
+  const i18n = useI18n();
   const [data, setData] = useState<string | null>(thumbCache.get(file.file_id) ?? null);
   const [error, setError] = useState("");
 
@@ -387,7 +395,7 @@ function Thumb({ file, dense, onOpen }: { file: Attachment; dense: boolean; onOp
         setData(result.attachment.data);
       })
       .catch((reason) => {
-        if (alive) setError(describeError(reason));
+        if (alive) setError(describeError(i18n, reason));
       });
     return () => {
       alive = false;
@@ -406,7 +414,7 @@ function Thumb({ file, dense, onOpen }: { file: Attachment; dense: boolean; onOp
       <span
         className={cn("animate-pulse rounded-md bg-muted", dense ? "size-16" : "size-20")}
         role="img"
-        aria-label={`${file.name} 加载中`}
+        aria-label={i18n.tf("ui.imageLoading", { name: file.name })}
       />
     );
   }
@@ -414,7 +422,7 @@ function Thumb({ file, dense, onOpen }: { file: Attachment; dense: boolean; onOp
     <button
       type="button"
       onClick={onOpen}
-      title={`${file.name} · 点开看原图`}
+      title={i18n.tf("ui.imageOpenTitle", { name: file.name })}
       className="overflow-hidden rounded-md border border-border/60"
     >
       <img
@@ -458,13 +466,13 @@ function Lightbox({ file, onClose }: { file: Attachment; onClose: () => void }) 
   );
 }
 
-export async function copyText(value: string, hint = "已复制") {
+export async function copyText(i18n: I18n, value: string, hint?: string) {
   try {
     await navigator.clipboard.writeText(value);
-    toast.success(hint);
+    toast.success(hint ?? i18n.t("ui.copied"));
     return true;
   } catch {
-    toast.error("浏览器拒绝了剪贴板访问，请手动选中复制。");
+    toast.error(i18n.t("ui.clipboardDenied"));
     return false;
   }
 }
@@ -473,7 +481,7 @@ export async function copyText(value: string, hint = "已复制") {
 export function CopyChip({
   value,
   display,
-  title = "点一下复制",
+  title,
   className,
 }: {
   value: string;
@@ -481,13 +489,14 @@ export function CopyChip({
   title?: string;
   className?: string;
 }) {
+  const i18n = useI18n();
   const [copied, setCopied] = useState(false);
   return (
     <button
       type="button"
-      title={title}
+      title={title ?? i18n.t("ui.clickToCopy")}
       onClick={() => {
-        void copyText(value).then((ok) => {
+        void copyText(i18n, value).then((ok) => {
           if (!ok) return;
           setCopied(true);
           window.setTimeout(() => setCopied(false), 1600);
@@ -498,21 +507,23 @@ export function CopyChip({
         className,
       )}
     >
-      {copied ? "已复制 ✓" : (display ?? value)}
+      {copied ? i18n.t("ui.copiedCheck") : (display ?? value)}
     </button>
   );
 }
 
 export function CopyButton({ value, label, className }: { value: string; label?: string; className?: string }) {
+  const i18n = useI18n();
   return (
     <Button
       type="button"
       size="sm"
       variant="ghost"
       className={cn("h-7 gap-1 px-2 text-xs", className)}
-      onClick={() => void copyText(value)}
+      onClick={() => void copyText(i18n, value)}
     >
-      复制{label ? ` ${label}` : ""}
+      {i18n.t("ui.copy")}
+      {label ? ` ${label}` : ""}
     </Button>
   );
 }

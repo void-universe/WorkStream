@@ -13,6 +13,7 @@ import { isUpdateAvailable } from "../functions/registries.mjs";
 import { CACHE_BREAKPOINT_ID, DEMO_QUOTABLE_HEADERS, PROMPT_SECTIONS, composeSystemPrompt } from "../functions/prompt.mjs";
 import { delegateWindow } from "../functions/delegate.mjs";
 import { BACKENDS, BACKEND_IDS, DEMO_BASE_URL, backendFor, validateBackends } from "../functions/backends.mjs";
+import { LOCALE_IDS } from "../functions/locales.mjs";
 import { skillPrompt } from "../functions/skills.mjs";
 import { store } from "../functions/store.mjs";
 import { closeOrphanSteps, createStepWriter } from "../functions/steps.mjs";
@@ -717,6 +718,26 @@ async function main() {
   check("SVG 头像被拒：默认头像只在前端画，进库的必须是烤好的位图",
     svgAvatar.status === 400 && svgAvatar.payload.error === "invalid_avatar", svgAvatar.payload);
   await call("auth.patch", { token: ana, body: { avatar: AVATAR } });
+
+  // 界面语言：服务端白名单（functions/locales.mjs）和前端清单（src/lib/i18n.ts）各存一份，
+  // 因为 Edge Function 打包不了前端 TS；两份的 id 集合由 dev/check-schema.mjs 静态对账，
+  // 这里证明的是另一头：后端收哪些值、存得下、读得回、被拒的那次不落库。
+  // 循环特意跑满整份清单，包含还没译完的 ar/he —— 界面选不到，但账户里存得下，换到译完的版本就生效。
+  for (const lang of LOCALE_IDS) {
+    const saved = await call("auth.patch", { token: ana, body: { prefs: { lang } } });
+    check(`账户存得下界面语言 ${lang}`, saved.payload.user?.prefs?.lang === lang, saved.payload);
+  }
+  const langMe = await call("auth.me", { token: ana, method: "GET" });
+  check("语言偏好随会话读回（换设备登录后不用再选一次）", langMe.payload.user?.prefs?.lang === LOCALE_IDS[LOCALE_IDS.length - 1], langMe.payload.user);
+  const langBad = await call("auth.patch", { token: ana, body: { prefs: { lang: "Klingon" } } });
+  check("清单外的语言 id 就地被拒（存进去只会渲染成一句空白）", langBad.status === 400 && langBad.payload.error === "invalid_lang", langBad.payload);
+  const langAfterBad = await call("auth.me", { token: ana, method: "GET" });
+  check("被拒的那次没有改动已存的语言", langAfterBad.payload.user?.prefs?.lang === langMe.payload.user?.prefs?.lang, langAfterBad.payload.user?.prefs);
+  await call("auth.patch", { token: ana, body: { prefs: { dreaming_auto: true } } });
+  const langMerge = await call("auth.patch", { token: ana, body: { prefs: { lang: "zh-Hans" } } });
+  check("只改语言不会顺手关掉归并开关（prefs 是合并写，不是整块覆盖）",
+    langMerge.payload.user?.prefs?.lang === "zh-Hans" && langMerge.payload.user?.prefs?.dreaming_auto === true, langMerge.payload.user?.prefs);
+  await call("auth.patch", { token: ana, body: { prefs: { dreaming_auto: false } } });
 
   step("2. 虚拟员工：独立 Key + OpenAI 兼容地址 + 两级 memory");
   const agent = await call("agents.create", {
@@ -1979,11 +2000,56 @@ async function main() {
   const x17UpdateRotate = await call("vms.update", { token: bToken, body: { id: boVmId, secret: "bo-secret-v2" } });
   check("vms.update：换凭据后仍不回显明文", x17UpdateRotate.payload.ok === true
     && !JSON.stringify(x17UpdateRotate.payload).includes("bo-secret-v2"), x17UpdateRotate.payload);
+  // 终端网关是真人浏览器直连的地址，明文入库：形状错了当场炸，URL 里塞凭据一律拒。
+  const x17Gw = await call("vms.update", { token: bToken, body: { id: boVmId, gateway_url: "wss://bo.internal.example:7681/" } });
+  check("vms.update：主人能填终端网关地址，尾斜杠归一化", x17Gw.payload.vm?.gateway_url === "wss://bo.internal.example:7681", x17Gw.payload);
+  const x17GwCross = await call("vms.update", { token: ana, body: { id: boVmId, gateway_url: "wss://build.internal.example:7681" } });
+  check("vms.update：别人改不了我的网关地址", x17GwCross.status === 403 && x17GwCross.payload.error === "vm_not_owned", x17GwCross.payload);
+  const x17GwCreate = await call("vms.create", {
+    token: bToken,
+    body: { label: "带网关的机器", host: "gw.example", port: 22, username: "u", auth_kind: "password", secret: "s3cret-long", gateway_url: "ws://gw.example:7681/" },
+  });
+  check("vms.create：登记时就能带上网关地址，尾斜杠同样归一化", x17GwCreate.payload.vm?.gateway_url === "ws://gw.example:7681", x17GwCreate.payload);
+  await call("vms.delete", { token: bToken, body: { id: x17GwCreate.payload.vm?.id } });
+  const x17GwScheme = await call("vms.create", {
+    token: bToken,
+    body: { label: "x", host: "a.example", port: 22, username: "u", auth_kind: "password", secret: "s3cret-long", gateway_url: "ssh://a.example:7681" },
+  });
+  check("vms.create：非 ws/wss/http/https 的网关地址被拒", x17GwScheme.status === 400 && x17GwScheme.payload.error === "invalid_gateway_url", x17GwScheme.payload);
+  const x17GwUnparse = await call("vms.update", { token: bToken, body: { id: boVmId, gateway_url: "not a url" } });
+  check("vms.update：解析不出来的网关地址被拒", x17GwUnparse.status === 400 && x17GwUnparse.payload.error === "invalid_gateway_url", x17GwUnparse.payload);
+  const x17GwCred = await call("vms.update", { token: bToken, body: { id: boVmId, gateway_url: "ws://tok:pw@bo.internal.example:7681" } });
+  check("vms.update：网关地址带凭据被拒（明文列里不许抄口令）", x17GwCred.status === 400 && x17GwCred.payload.error === "gateway_url_no_credentials", x17GwCred.payload);
+  const x17GwQuery = await call("vms.update", { token: bToken, body: { id: boVmId, gateway_url: "ws://bo.internal.example:7681?token=abc" } });
+  check("vms.update：网关地址带查询串同样被拒", x17GwQuery.status === 400 && x17GwQuery.payload.error === "gateway_url_no_credentials", x17GwQuery.payload);
+  const x17GwUnchanged = await call("vms.update", { token: bToken, body: { id: boVmId, label: "Bo 的构建机" } });
+  check("vms.update：不带 gateway_url 时不会把已填的地址抹掉",
+    x17GwUnchanged.payload.vm?.gateway_url === "wss://bo.internal.example:7681", x17GwUnchanged.payload);
+  const x17ProbeGw = await call("vms.probe", { token: bToken, body: { id: boVmId } });
+  check("vms.probe：填了网关的机器把网关单独探一次，探不通也如实说",
+    x17ProbeGw.payload.probe?.gateway?.reachable === false && typeof x17ProbeGw.payload.probe.gateway.note === "string", x17ProbeGw.payload);
+  // 内网网关在两种形态下的结论必须不同：本机放行私网所以真去探（探不通就说探不通），
+  // 生产形态被 SSRF 闸门挡下，这时只能回 null 并说清"服务端不探它"，不能冒充可达也不能冒充坏了。
+  const x17GwPrivate = await call("vms.update", { token: bToken, body: { id: boVmId, gateway_url: "ws://10.0.0.9:7681" } });
+  check("vms.update：内网网关地址照收（真人浏览器连的就是内网）", x17GwPrivate.payload.vm?.gateway_url === "ws://10.0.0.9:7681", x17GwPrivate.payload);
+  const x17ProbePrivate = await call("vms.probe", { token: bToken, body: { id: boVmId }, entry: prodHandler });
+  check("vms.probe：生产形态不探内网网关，回 null 并说明原因",
+    x17ProbePrivate.payload.probe?.gateway?.reachable === null && typeof x17ProbePrivate.payload.probe.gateway.note === "string", x17ProbePrivate.payload);
+  const x17ProbePrivateDev = await call("vms.probe", { token: bToken, body: { id: boVmId } });
+  check("vms.probe：本机形态放行私网，同一地址探不到就如实说探不到",
+    x17ProbePrivateDev.payload.probe?.gateway?.reachable === false, x17ProbePrivateDev.payload);
+  const x17GwClear = await call("vms.update", { token: bToken, body: { id: boVmId, gateway_url: "" } });
+  check("vms.update：清空网关地址回到点不开的状态", x17GwClear.payload.vm?.gateway_url === "", x17GwClear.payload);
+  const x17ProbeNoGw = await call("vms.probe", { token: bToken, body: { id: boVmId } });
+  check("vms.probe：没填网关的机器不附网关结论", x17ProbeNoGw.payload.probe?.gateway === undefined, x17ProbeNoGw.payload);
+  await call("vms.update", { token: bToken, body: { id: boVmId, gateway_url: "ws://bo.internal.example:7681" } });
   const x17BoList = await call("vms.list", { token: bToken });
   check("vms.list：只列自己的机器且不返回密文",
     (x17BoList.payload.items ?? []).length === 1 && (x17BoList.payload.items ?? [])[0]?.id === boVmId
     && !JSON.stringify(x17BoList.payload).includes("bo-secret") && !JSON.stringify(x17BoList.payload).includes("s3cret")
     && !("secret_cipher" in ((x17BoList.payload.items ?? [])[0] ?? {})), x17BoList.payload);
+  check("vms.list：网关地址要能读回来，否则列表分不出哪台点得开",
+    (x17BoList.payload.items ?? [])[0]?.gateway_url === "ws://bo.internal.example:7681", x17BoList.payload);
   const x17AnaList = await call("vms.list", { token: ana });
   check("vms.list：Ana 的授权清单里能看到已授权的机器",
     (x17AnaList.payload.items ?? []).some((row) => row.id === vm.payload.vm?.id
@@ -1993,8 +2059,13 @@ async function main() {
   const x17MineBo = await call("streams.mine.vms", { token: bToken, method: "GET", body: { stream_id: streamId } });
   check("streams.mine.vms：成员能看到本群授权并带上级别与机器资料",
     (x17MineBo.payload.items ?? []).some((row) => row.vm_id === boVmId && row.level === "sudo" && row.vm?.label === "Bo 的构建机"), x17MineBo.payload);
+  check("streams.mine.vms：机器资料带着网关地址（群设置抽屉据此决定行点不点得开）",
+    (x17MineBo.payload.items ?? []).some((row) => row.vm_id === boVmId && row.vm?.gateway_url === "ws://bo.internal.example:7681"), x17MineBo.payload);
   const x17MineStranger = await call("streams.mine.vms", { token: deeToken, method: "GET", body: { stream_id: streamId } });
   check("streams.mine.vms：非成员看不到本群机器", x17MineStranger.status === 403, x17MineStranger.payload);
+  const x17DetailGw = await call("streams.get", { token: ana, method: "GET", body: { id: streamId } });
+  check("streams.get：群详情的机器行带着网关地址，聊天窗据此决定开不开控制台",
+    (x17DetailGw.payload.vms ?? []).some((row) => row.id === boVmId && row.gateway_url === "ws://bo.internal.example:7681"), x17DetailGw.payload.vms);
   const x17GrantForeignVm = await call("streams.vms.grant", { token: ana, body: { stream_id: streamId, vm_id: boVmId } });
   check("streams.vms.grant：不能把别人的机器授权进群", x17GrantForeignVm.status === 403
     && x17GrantForeignVm.payload.error === "vm_not_owned", x17GrantForeignVm.payload);

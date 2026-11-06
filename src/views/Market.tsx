@@ -2,15 +2,17 @@
 // 从别处链接过来或刷新都能落在对应标签上。
 import { navigate } from "../lib/route";
 import { cn } from "@/lib/utils";
+import { useI18n, type MsgKey } from "../lib/i18n";
 import { PluginsPanel } from "./Plugins";
 import { SkillsPanel } from "./Skills";
 
-const TABS: [string, string, string][] = [
-  ["skills", "技能", "员工学会怎么做"],
-  ["plugins", "插件", "员工能用什么工具"],
+const TABS: [string, MsgKey, MsgKey][] = [
+  ["skills", "market.skills", "market.skillsHint"],
+  ["plugins", "market.plugins", "market.pluginsHint"],
 ];
 
 export function MarketView({ tab, userId }: { tab: string; userId: string }) {
+  const i18n = useI18n();
   const active = TABS.some(([id]) => id === tab) ? tab : "skills";
 
   return (
@@ -19,12 +21,10 @@ export function MarketView({ tab, userId }: { tab: string; userId: string }) {
         <div className="flex flex-wrap items-end justify-between gap-2">
           <div>
             <h1 className="text-lg font-semibold tracking-tight">Market</h1>
-            <p className="text-xs text-muted-foreground">
-              技能教会员工怎么做，插件给员工一双能碰外部世界的手。
-            </p>
+            <p className="text-xs text-muted-foreground">{i18n.t("market.subtitle")}</p>
           </div>
           <div className="flex flex-wrap items-center gap-1">
-            {TABS.map(([id, label, hint]) => (
+            {TABS.map(([id, labelKey, hintKey]) => (
               <button
                 key={id}
                 type="button"
@@ -36,8 +36,8 @@ export function MarketView({ tab, userId }: { tab: string; userId: string }) {
                     : "text-muted-foreground hover:bg-muted",
                 )}
               >
-                {label}
-                <span className={cn("ml-1.5 text-[10px]", active === id ? "opacity-70" : "opacity-60")}>{hint}</span>
+                {i18n.t(labelKey)}
+                <span className={cn("ml-1.5 text-[10px]", active === id ? "opacity-70" : "opacity-60")}>{i18n.t(hintKey)}</span>
               </button>
             ))}
           </div>

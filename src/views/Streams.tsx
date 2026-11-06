@@ -12,6 +12,7 @@ import { DeliveryChips, MentionText, MessageImages, PersonAvatar, PresentedCards
 import { navigate } from "../lib/route";
 import { Composer, mentionablesOf } from "./chat/Composer";
 import { CreateGroup, JoinByUuid } from "./streams/StreamForms";
+import { useI18n, type I18n, type MsgKey } from "../lib/i18n";
 
 type TickResult = {
   ok: true;
@@ -39,9 +40,9 @@ type StreamState = "live" | "queued" | null;
 const LIVE_MS = 9_000;
 const QUEUED_MS = 25_000;
 
-function stateTitle(state: StreamState) {
-  if (state === "live") return "虚拟员工正在推进这个群";
-  if (state === "queued") return "被 @ 派了活，任务在排队等时间片";
+function stateTitle(i18n: I18n, state: StreamState) {
+  if (state === "live") return i18n.t("stream.stateLive");
+  if (state === "queued") return i18n.t("stream.stateQueued");
   return undefined;
 }
 
@@ -55,12 +56,13 @@ type Layout = "grid" | "list" | 2 | 4 | 9;
 
 const BOARD_KEY = "workstream.board";
 const PANE_PAGE = 40;
-const LAYOUTS: { value: Layout; label: string; title: string }[] = [
-  { value: "grid", label: "网格", title: "卡片网格" },
-  { value: "list", label: "列表", title: "一行一个群" },
-  { value: 2, label: "2", title: "2 分屏" },
-  { value: 4, label: "4", title: "4 分屏" },
-  { value: 9, label: "9", title: "9 宫格" },
+// 2/4/9 的胶囊标签就是数字本身，跨语言通用，不进字典；需要译的只有提示语。
+const LAYOUTS: { value: Layout; labelKey?: MsgKey; titleKey: MsgKey }[] = [
+  { value: "grid", labelKey: "stream.layoutGrid", titleKey: "stream.layoutGridTitle" },
+  { value: "list", labelKey: "stream.layoutList", titleKey: "stream.layoutListTitle" },
+  { value: 2, titleKey: "stream.layoutSplit2" },
+  { value: 4, titleKey: "stream.layoutSplit4" },
+  { value: 9, titleKey: "stream.layoutNineGrid" },
 ];
 
 function readPrefs(): { layout: Layout; picked: string[] } {
@@ -90,6 +92,7 @@ export function StreamsView({
   user: User;
   onRefresh: () => Promise<void>;
 }) {
+  const i18n = useI18n();
   const [prefs, setPrefs] = useState(readPrefs);
   const [panel, setPanel] = useState<"create" | "join" | null>(null);
   const [boards, setBoards] = useState<BoardResult["boards"]>([]);
@@ -151,7 +154,7 @@ export function StreamsView({
         setBoards((await get<BoardResult>("scheduler.board")).boards);
         setPollError("");
       } catch (error) {
-        setPollError(describeError(error));
+        setPollError(describeError(i18n, error));
       }
       const tick = await tickPromise;
       if (!tick) return;
@@ -262,9 +265,9 @@ export function StreamsView({
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/60 px-4 py-3">
-        <h1 className="text-lg font-semibold tracking-tight">Stream 面板</h1>
+        <h1 className="text-lg font-semibold tracking-tight">{i18n.t("nav.streamBoard")}</h1>
         <span className="rounded-full bg-muted/70 px-2 py-0.5 text-[11px] text-muted-foreground">
-          {streams.length} 个群 · {prefs.picked.length} 个在台面上
+          {i18n.tf("stream.boardSummary", { groups: streams.length, onBoard: prefs.picked.length })}
         </span>
         <div className="flex items-center gap-1">
           <Button
@@ -273,7 +276,7 @@ export function StreamsView({
             className="h-7 rounded-full px-3 text-xs"
             onClick={() => setPanel((current) => (current === "create" ? null : "create"))}
           >
-            新建群
+            {i18n.t("stream.newGroup")}
           </Button>
           <Button
             size="sm"
@@ -281,21 +284,21 @@ export function StreamsView({
             className="h-7 rounded-full px-3 text-xs text-muted-foreground hover:text-foreground"
             onClick={() => setPanel((current) => (current === "join" ? null : "join"))}
           >
-            凭 UUID 进群
+            {i18n.t("stream.joinByUuid")}
           </Button>
         </div>
         {/* 视图切换：一个胶囊分段控件，比五个独立描边按钮安静得多 */}
         <div className="ml-auto flex items-center gap-2">
-          <span className="hidden text-[11px] text-muted-foreground sm:inline">视图</span>
+          <span className="hidden text-[11px] text-muted-foreground sm:inline">{i18n.t("stream.viewLabel")}</span>
           <div className="flex items-center gap-0.5 rounded-full border border-border/60 bg-muted/40 p-0.5">
             {LAYOUTS.map((option) => {
               const active = prefs.layout === option.value;
               return (
                 <button
-                  key={option.label}
+                  key={String(option.value)}
                   type="button"
                   aria-pressed={active}
-                  title={option.title}
+                  title={i18n.t(option.titleKey)}
                   onClick={() => setLayout(option.value)}
                   className={`h-6 rounded-full px-2.5 font-mono text-[11px] transition-[background-color,color,box-shadow] duration-200 ${
                     active
@@ -303,18 +306,18 @@ export function StreamsView({
                       : "text-muted-foreground hover:text-foreground"
                   }`}
                 >
-                  {option.label}
+                  {option.labelKey ? i18n.t(option.labelKey) : option.value}
                 </button>
               );
             })}
           </div>
         </div>
-        {pollError ? <p className="basis-full text-[11px] text-destructive">队列看板暂不可用：{pollError}</p> : null}
+        {pollError ? <p className="basis-full text-[11px] text-destructive">{i18n.tf("stream.boardUnavailable", { error: pollError })}</p> : null}
       </header>
 
       <Dialog open={panel !== null} onOpenChange={(open) => { if (!open) setPanel(null); }}>
         <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-2xl">
-          <DialogTitle className="sr-only">{panel === "join" ? "凭 UUID 进群" : "新建群"}</DialogTitle>
+          <DialogTitle className="sr-only">{panel === "join" ? i18n.t("stream.joinByUuid") : i18n.t("stream.newGroup")}</DialogTitle>
           {panel === "create" ? (
             <CreateGroup
               agents={agents}
@@ -341,16 +344,14 @@ export function StreamsView({
         {!streams.length ? (
           <div className="grid h-full place-items-center">
             <div className="grid max-w-md gap-2 p-6 text-center">
-              <h2 className="text-lg font-semibold">还没有群</h2>
-              <p className="text-sm leading-relaxed text-muted-foreground">
-                群就是 stream：一个群推进一个项目。用左侧「新建群」建第一个，或者拿别人的 UUID 申请进群。
-              </p>
+              <h2 className="text-lg font-semibold">{i18n.t("stream.emptyTitle")}</h2>
+              <p className="text-sm leading-relaxed text-muted-foreground">{i18n.t("stream.emptyHint")}</p>
             </div>
           </div>
         ) : prefs.layout === "grid" ? (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             <p className="text-[11px] leading-relaxed text-muted-foreground sm:col-span-2 xl:col-span-3">
-              点「分屏」把群放上工作台，再切右上角的 2/4/9 格同时推进多个项目。
+              {i18n.t("stream.splitHint")}
             </p>
             {streams.map((stream) => (
               <StreamTile
@@ -426,6 +427,7 @@ export function StreamsView({
 }
 
 function QueueBadges({ counters, dense }: { counters?: { queued: number; running: number }; dense?: boolean }) {
+  const i18n = useI18n();
   const running = counters?.running ?? 0;
   const queued = counters?.queued ?? 0;
   const text = dense ? "text-[10px]" : "text-[11px]";
@@ -436,25 +438,26 @@ function QueueBadges({ counters, dense }: { counters?: { queued: number; running
           running ? "bg-signal/12 text-signal" : "bg-muted/60 text-muted-foreground/70"
         }`}
       >
-        运行 <span className="tabular-nums">{running}</span>
+        {i18n.t("stream.badgeRunning")} <span className="tabular-nums">{i18n.number(running)}</span>
       </span>
       <span
         className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-mono ${text} ${
           queued ? "bg-machine/12 text-machine" : "bg-muted/60 text-muted-foreground/70"
         }`}
       >
-        排队 <span className="tabular-nums">{queued}</span>
+        {i18n.t("stream.badgeQueued")} <span className="tabular-nums">{i18n.number(queued)}</span>
       </span>
     </>
   );
 }
 
 function PinButton({ pinned, onClick, dense }: { pinned: boolean; onClick: () => void; dense?: boolean }) {
+  const i18n = useI18n();
   return (
     <button
       type="button"
       onClick={onClick}
-      title={pinned ? "从分屏移出" : "放上分屏工作台"}
+      title={pinned ? i18n.t("stream.unpinTitle") : i18n.t("stream.pinTitle")}
       className={`inline-flex h-7 items-center rounded-full px-2.5 font-medium transition-colors duration-200 ${
         dense ? "text-[11px]" : "text-xs"
       } ${
@@ -463,7 +466,7 @@ function PinButton({ pinned, onClick, dense }: { pinned: boolean; onClick: () =>
           : "text-muted-foreground hover:bg-muted/60 hover:text-foreground"
       }`}
     >
-      {pinned ? "已分屏" : "分屏"}
+      {pinned ? i18n.t("stream.pinnedLabel") : i18n.t("stream.pinLabel")}
     </button>
   );
 }
@@ -487,11 +490,12 @@ function StreamTile({
   onExpand: () => void;
   onEnter: () => void;
 }) {
+  const i18n = useI18n();
   const announcement = stream.announcement.trim();
   const border = state === "live" ? "ws-flash-live" : state === "queued" ? "ws-flash-queued" : "";
   return (
     <article
-      title={stateTitle(state)}
+      title={stateTitle(i18n, state)}
       style={flashVars(flash)}
       className={`group ws-surface ws-surface-hover relative grid cursor-pointer gap-2.5 rounded-xl bg-card p-3.5 ${border}`}
     >
@@ -499,7 +503,7 @@ function StreamTile({
       <button
         type="button"
         onClick={onEnter}
-        aria-label={`进入群聊 ${stream.name}`}
+        aria-label={i18n.tf("stream.enterGroup", { name: stream.name })}
         className="absolute inset-0 z-0 rounded-xl focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal"
       />
       <header className="flex items-start gap-2">
@@ -507,17 +511,18 @@ function StreamTile({
         <div className="min-w-0 flex-1 text-left">
           <h2 className="truncate text-[15px] font-semibold tracking-tight">{stream.name}</h2>
           <p className="mt-0.5 font-mono text-[11px] text-muted-foreground/80">
-            {shortUuid(stream.id)} · {Math.max(0, stream.next_seq - 1)} 条 · {stream.agent_count ?? 0} 虚拟
+            {shortUuid(stream.id)} · {i18n.tf("stream.msgCount", { n: Math.max(0, stream.next_seq - 1) })} ·{" "}
+            {i18n.tf("stream.agentCount", { n: stream.agent_count ?? 0 })}
           </p>
         </div>
         {stream.my_role ? <RoleBadge role={stream.my_role} /> : null}
       </header>
       <div className="flex flex-wrap items-center gap-1.5">
         <QueueBadges counters={counters} />
-        <span className="ml-auto text-[11px] text-muted-foreground/70">更新 {timeAgo(stream.updated_at ?? stream.created_at)}</span>
+        <span className="ml-auto text-[11px] text-muted-foreground/70">{i18n.tf("stream.updatedAt", { time: timeAgo(i18n, stream.updated_at ?? stream.created_at) })}</span>
       </div>
       <p className="line-clamp-2 min-h-8 text-xs leading-relaxed text-muted-foreground">
-        {announcement || "（没有公告）"}
+        {announcement || i18n.t("stream.noAnnouncement")}
       </p>
       <footer className="flex items-center gap-0.5">
         <span className="relative z-10 flex items-center gap-0.5">
@@ -527,7 +532,7 @@ function StreamTile({
             onClick={onExpand}
             className="inline-flex h-7 items-center rounded-full px-2.5 text-xs text-muted-foreground transition-colors duration-200 hover:bg-muted/60 hover:text-foreground"
           >
-            展开
+            {i18n.t("common.expand")}
           </button>
         </span>
       </footer>
@@ -554,17 +559,18 @@ function StreamRow({
   onExpand: () => void;
   onEnter: () => void;
 }) {
+  const i18n = useI18n();
   const border = state === "live" ? "ws-flash-live" : state === "queued" ? "ws-flash-queued" : "";
   return (
     <article
-      title={stateTitle(state)}
+      title={stateTitle(i18n, state)}
       style={flashVars(flash)}
       className={`group ws-surface ws-surface-hover relative flex cursor-pointer flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl bg-card px-3.5 py-2.5 ${border}`}
     >
       <button
         type="button"
         onClick={onEnter}
-        aria-label={`进入群聊 ${stream.name}`}
+        aria-label={i18n.tf("stream.enterGroup", { name: stream.name })}
         className="absolute inset-0 z-0 rounded-xl focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal"
       />
       <div className="min-w-0 flex-1 text-left">
@@ -574,8 +580,9 @@ function StreamRow({
           {stream.my_role ? <RoleBadge role={stream.my_role} /> : null}
         </span>
         <span className="font-mono text-[11px] text-muted-foreground/80">
-          {shortUuid(stream.id)} · {Math.max(0, stream.next_seq - 1)} 条 · {stream.agent_count ?? 0} 虚拟 · 更新{" "}
-          {timeAgo(stream.updated_at ?? stream.created_at)}
+          {shortUuid(stream.id)} · {i18n.tf("stream.msgCount", { n: Math.max(0, stream.next_seq - 1) })} ·{" "}
+          {i18n.tf("stream.agentCount", { n: stream.agent_count ?? 0 })} ·{" "}
+          {i18n.tf("stream.updatedAt", { time: timeAgo(i18n, stream.updated_at ?? stream.created_at) })}
         </span>
       </div>
       <QueueBadges counters={counters} dense />
@@ -586,7 +593,7 @@ function StreamRow({
           onClick={onExpand}
           className="inline-flex h-7 items-center rounded-full px-2.5 text-[11px] text-muted-foreground transition-colors duration-200 hover:bg-muted/60 hover:text-foreground"
         >
-          展开
+          {i18n.t("common.expand")}
         </button>
       </span>
     </article>
@@ -602,10 +609,11 @@ function EmptyPane({
   picked: string[];
   onPick: (id: string) => void;
 }) {
+  const i18n = useI18n();
   return (
     <div className="grid min-h-[220px] place-items-center rounded-xl border border-dashed border-border/70 bg-muted/10 p-4 lg:min-h-0">
       <div className="grid justify-items-center gap-2">
-        <p className="text-xs text-muted-foreground">这一格空着，放一个群进来。</p>
+        <p className="text-xs text-muted-foreground">{i18n.t("stream.emptyPane")}</p>
         <NativeSelect
           size="sm"
           className="h-8 w-52 text-xs"
@@ -614,7 +622,7 @@ function EmptyPane({
             if (event.target.value) onPick(event.target.value);
           }}
         >
-          <NativeSelectOption value="">选一个 stream…</NativeSelectOption>
+          <NativeSelectOption value="">{i18n.t("stream.pickStream")}</NativeSelectOption>
           {streams
             .filter((stream) => !picked.includes(stream.id))
             .map((stream) => (
@@ -657,6 +665,7 @@ function StreamPane({
   onQueued: () => void;
   onActivity: () => void;
 }) {
+  const i18n = useI18n();
   const [detail, setDetail] = useState<StreamDetail | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [presence, setPresence] = useState<AgentPresence[]>([]);
@@ -680,7 +689,7 @@ function StreamPane({
         if (nextDetail) setDetail(nextDetail);
         setError("");
       } catch (cause) {
-        if (aliveRef.current) setError(describeError(cause));
+        if (aliveRef.current) setError(describeError(i18n, cause));
       }
     },
     [stream.id],
@@ -751,7 +760,7 @@ function StreamPane({
 
   return (
     <section
-      title={stateTitle(state)}
+      title={stateTitle(i18n, state)}
       style={flashVars(flash)}
       className={`ws-surface flex min-h-[420px] min-w-0 flex-col overflow-hidden rounded-xl bg-card lg:min-h-0 ${border}`}
     >
@@ -762,7 +771,7 @@ function StreamPane({
             size="sm"
             className={`h-7 w-full border-transparent bg-transparent pr-7 pl-2 font-medium hover:bg-muted/40 dark:bg-transparent dark:hover:bg-muted/40 ${dense ? "text-xs" : "text-[13px]"}`}
             value={stream.id}
-            title="换一个群放进这一格"
+            title={i18n.t("stream.swapGroupTitle")}
             onChange={(event) => {
               if (event.target.value && event.target.value !== stream.id) onSwap(event.target.value);
             }}
@@ -780,12 +789,12 @@ function StreamPane({
           variant="ghost"
           className="h-6 rounded-full px-2 text-[11px] text-muted-foreground hover:text-foreground"
           onClick={() => navigate(`/stream/${stream.id}`)}
-          title="打开全屏群聊"
+          title={i18n.t("stream.fullscreenTitle")}
         >
-          全屏
+          {i18n.t("stream.fullscreen")}
         </Button>
         <Button size="sm" variant="ghost" className="h-6 rounded-full px-2 text-[11px] text-muted-foreground" onClick={onRemove}>
-          移除
+          {i18n.t("stream.removeSlot")}
         </Button>
       </header>
 
@@ -797,7 +806,7 @@ function StreamPane({
         <div className={dense ? "grid gap-1.5" : "grid gap-2"}>
           {error ? <p className="text-[11px] text-destructive">{error}</p> : null}
           {!error && messages.length === 0 ? (
-            <p className="py-8 text-center text-xs text-muted-foreground">这个群还很安静，@ 一位虚拟员工开个头。</p>
+            <p className="py-8 text-center text-xs text-muted-foreground">{i18n.t("stream.quietPane")}</p>
           ) : null}
           {messages.map((message) => (
             <PaneMessage
@@ -853,6 +862,8 @@ function PaneMessage({
   presence?: AgentPresence;
   dense: boolean;
 }) {
+  const i18n = useI18n();
+  const quote = i18n.tp("stream.signatureQuote");
   if (message.sender_type === "system" || message.kind === "system") {
     return <p className="py-0.5 text-center text-[10px] leading-relaxed text-muted-foreground">{message.content}</p>;
   }
@@ -875,10 +886,14 @@ function PaneMessage({
             {message.sender_name}
           </span>
           {agent && presence?.signature ? (
-            <span className="max-w-32 truncate text-[10px] text-muted-foreground">「{presence.signature}」</span>
+            <span className="max-w-32 truncate text-[10px] text-muted-foreground">
+              {quote[0]}
+              {presence.signature}
+              {quote[1]}
+            </span>
           ) : null}
-          {agent ? <span className="text-[10px] text-machine/70">虚拟</span> : null}
-          <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{clockOf(message.created_at)}</span>
+          {agent ? <span className="text-[10px] text-machine/70">{i18n.t("ui.kindAgentShort")}</span> : null}
+          <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{clockOf(i18n, message.created_at)}</span>
         </header>
         {message.content || message.attachments?.length ? (
           <div
@@ -895,7 +910,7 @@ function PaneMessage({
         {/* 监控位没有群文件抽屉可开，卡片只用来认出交付物，整块不可点。 */}
         <PresentedCards items={message.presented} dense />
         <DeliveryChips deliveries={message.deliveries} dense />
-        {message.error ? <p className="px-0.5 text-[11px] text-destructive">回执出错：{message.error}</p> : null}
+        {message.error ? <p className="px-0.5 text-[11px] text-destructive">{i18n.tf("stream.receiptError", { error: message.error })}</p> : null}
       </div>
     </article>
   );

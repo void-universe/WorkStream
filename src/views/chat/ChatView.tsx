@@ -1,7 +1,7 @@
 // 群聊主视图：时间线 + @ 派发输入框 + 右侧操作面板。
 // 站点 Function 不能常驻后台，所以时间片推进由这里的轮询驱动（标签页切到后台时自动停）。
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FolderIcon, MegaphoneIcon, SettingsIcon, UsersIcon, XIcon } from "lucide-react";
+import { FolderIcon, MegaphoneIcon, SettingsIcon, TerminalIcon, UsersIcon, XIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,6 +13,8 @@ import { shortUuid, timeAgo } from "../../lib/format";
 import { CopyChip, DeliveryChips, MentionText, MessageImages, PersonAvatar, PresentedCards } from "../../lib/ui";
 import { Composer, mentionablesOf, type SendResult } from "./Composer";
 import { FilesSection, MembersPanel, SettingsPanel } from "./Panels";
+import { TerminalPane } from "./TerminalPane";
+import { useI18n, type MsgKey } from "../../lib/i18n";
 
 type TickResult = {
   ok: true;
@@ -35,10 +37,10 @@ const PAGE = 60;
 /** 右侧抽屉的三个页面；虚拟机、MCP 等低频项收进群设置的「高级设置」。 */
 type DrawerTab = "members" | "files" | "settings";
 
-const DRAWER_TABS: { value: DrawerTab; label: string; title: string }[] = [
-  { value: "members", label: "成员", title: "群成员" },
-  { value: "files", label: "群文件", title: "群文件" },
-  { value: "settings", label: "设置", title: "群设置" },
+const DRAWER_TABS: { value: DrawerTab; labelKey: MsgKey; titleKey: MsgKey }[] = [
+  { value: "members", labelKey: "role.member", titleKey: "chat.membersTitle" },
+  { value: "files", labelKey: "chat.filesTitle", titleKey: "chat.filesTitle" },
+  { value: "settings", labelKey: "nav.settings", titleKey: "chat.settingsTitle" },
 ];
 
 /** 相邻消息间隔超过这个毫秒数才插一条居中的时间分隔。 */
@@ -62,6 +64,7 @@ export function ChatView({
   myAgents: Agent[];
   myVms: Vm[];
 }) {
+  const i18n = useI18n();
   const [detail, setDetail] = useState<StreamDetail | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [presence, setPresence] = useState<AgentPresence[]>([]);
@@ -76,13 +79,16 @@ export function ChatView({
   const [drawer, setDrawer] = useState<DrawerTab | null>(null);
   // 点交付卡片时想直接看的那份文件：抽屉打开到「群文件」页后由 FilesSection 接着预览它。
   const [fileFocus, setFileFocus] = useState<Presented | null>(null);
+  // 终端记住的是虚拟机 id 而不是那行数据：授权撤销或地址改完，下一次读群现场就要跟上，
+  // 不能拿一份旧快照继续往已消失的网关里写字节。
+  const [termId, setTermId] = useState<string | null>(null);
 
   const loadDetail = useCallback(async () => {
     try {
       setDetail(await get<StreamDetail>("streams.get", { id: streamId }));
       setLoadError("");
     } catch (error) {
-      setLoadError(describeError(error));
+      setLoadError(describeError(i18n, error));
     }
   }, [streamId]);
 
@@ -95,7 +101,7 @@ export function ChatView({
       lastSeqRef.current = result.items[result.items.length - 1]?.seq ?? 0;
       messageKeyRef.current = messageKey(result.items);
     } catch (error) {
-      setLoadError(describeError(error));
+      setLoadError(describeError(i18n, error));
     }
   }, [streamId]);
 
@@ -220,7 +226,7 @@ export function ChatView({
         if (node) node.scrollTop = node.scrollHeight - previousHeight;
       });
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     }
   }
 
@@ -230,7 +236,7 @@ export function ChatView({
         <div className="grid gap-3">
           <p className="text-sm text-muted-foreground">{loadError}</p>
           <Button variant="outline" className="justify-self-center" onClick={() => void loadDetail()}>
-            重试
+            {i18n.t("chat.retry")}
           </Button>
         </div>
       </div>
@@ -238,10 +244,19 @@ export function ChatView({
   }
 
   if (!detail) {
-    return <div className="grid h-full place-items-center text-sm text-muted-foreground">正在打开群…</div>;
+    return <div className="grid h-full place-items-center text-sm text-muted-foreground">{i18n.t("chat.opening")}</div>;
   }
 
   const reload = loadDetail;
+  // 只有填了网关地址的虚拟机才进得了终端：没地址的行点了只会拿到一句「连不上」，不如不让它点。
+  const termVms = detail.vms.filter((vm) => vm.gateway_url);
+  const termVm = termVms.find((vm) => vm.id === termId) ?? null;
+  // 抽屉是盖在聊天区上的，和终端重叠；点开终端就把它收起来，别让两块面板叠着互相看不见。
+  const openTerminal = (vmId: string) => {
+    setTermId(vmId);
+    setDrawer(null);
+    setFileFocus(null);
+  };
   // 交付卡片整块可点：点开直接看到群文件里那份原件，不用同事自己按名字去列表里翻。
   const openPresented = (item: Presented) => {
     setFileFocus(item);
@@ -254,25 +269,38 @@ export function ChatView({
   }
 
   return (
-    <div className="grid h-full min-h-0 grid-cols-1">
+    <div className={cn("relative grid h-full min-h-0 grid-cols-1", termVm && "lg:grid-cols-[minmax(0,1fr)_minmax(340px,54%)]")}>
       <section className="relative flex min-h-0 flex-col">
         <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b px-4 py-2.5">
           <h1 className="text-base font-semibold tracking-tight">{detail.stream.name}</h1>
-          <CopyChip value={detail.stream.id} display={shortUuid(detail.stream.id)} title="点一下复制完整群 UUID，别人凭它搜索申请进群" />
-          <span className="text-xs text-muted-foreground">{detail.members.length} 位成员</span>
+          <CopyChip value={detail.stream.id} display={shortUuid(detail.stream.id)} title={i18n.t("chat.uuidCopyTitle")} />
+          <span className="text-xs text-muted-foreground">{i18n.tf("chat.memberCount", { n: detail.members.length })}</span>
           <span className="ml-auto flex items-center gap-0.5">
             {detail.stream.announcement.trim() ? (
-              <Button size="icon-sm" variant="ghost" title="群公告" onClick={() => setDrawer("settings")}>
+              <Button size="icon-sm" variant="ghost" title={i18n.t("chat.announcementTitle")} onClick={() => setDrawer("settings")}>
                 <MegaphoneIcon className="size-4 text-machine" />
               </Button>
             ) : null}
-            <Button size="icon-sm" variant="ghost" title="群成员" onClick={() => setDrawer("members")}>
+            <Button size="icon-sm" variant="ghost" title={i18n.t("chat.membersTitle")} onClick={() => setDrawer("members")}>
               <UsersIcon className="size-4" />
             </Button>
-            <Button size="icon-sm" variant="ghost" title="群文件" onClick={() => setDrawer("files")}>
+            {termVms.length ? (
+              <Button
+                size="icon-sm"
+                variant={termVm ? "secondary" : "ghost"}
+                title={i18n.t("chat.terminalTitle")}
+                onClick={() => {
+                  setTermId(termVm ? null : termVms[0].id);
+                  setDrawer(null);
+                }}
+              >
+                <TerminalIcon className={cn("size-4", termVm && "text-machine")} />
+              </Button>
+            ) : null}
+            <Button size="icon-sm" variant="ghost" title={i18n.t("chat.filesTitle")} onClick={() => setDrawer("files")}>
               <FolderIcon className="size-4" />
             </Button>
-            <Button size="icon-sm" variant="ghost" title="群设置" onClick={() => setDrawer("settings")}>
+            <Button size="icon-sm" variant="ghost" title={i18n.t("chat.settingsTitle")} onClick={() => setDrawer("settings")}>
               <SettingsIcon className="size-4" />
             </Button>
           </span>
@@ -286,11 +314,11 @@ export function ChatView({
           <div className="grid gap-4">
             {hasMore ? (
               <Button size="sm" variant="ghost" className="justify-self-center text-xs" onClick={() => void loadEarlier()}>
-                加载更早的消息
+                {i18n.t("chat.loadEarlier")}
               </Button>
             ) : null}
             {messages.length === 0 ? (
-              <p className="py-10 text-center text-sm text-muted-foreground">群里还很安静，@ 一位虚拟员工开个头。</p>
+              <p className="py-10 text-center text-sm text-muted-foreground">{i18n.t("chat.emptyHint")}</p>
             ) : null}
             {messages.map((message, index) => {
               const previous = messages[index - 1];
@@ -300,7 +328,7 @@ export function ChatView({
               return (
                 <Fragment key={message.id}>
                   {showTime ? (
-                    <p className="text-center text-[11px] text-muted-foreground">{timeAgo(message.created_at)}</p>
+                    <p className="text-center text-[11px] text-muted-foreground">{timeAgo(i18n, message.created_at)}</p>
                   ) : null}
                   <MessageRow
                     message={message}
@@ -330,9 +358,9 @@ export function ChatView({
           <aside className="absolute inset-y-0 right-0 z-30 flex w-[400px] max-w-[88%] flex-col border-l bg-background shadow-[-16px_0_28px_-24px_rgba(0,0,0,0.45)]">
             <div className="flex items-center gap-2 border-b px-4 py-3">
               <h2 className="min-w-0 flex-1 truncate text-sm font-semibold">
-                {DRAWER_TABS.find((tab) => tab.value === drawer)?.title}
+                {i18n.t(DRAWER_TABS.find((tab) => tab.value === drawer)!.titleKey)}
               </h2>
-              <Button size="icon-xs" variant="ghost" title="关闭" onClick={() => { setDrawer(null); setFileFocus(null); }}>
+              <Button size="icon-xs" variant="ghost" title={i18n.t("common.close")} onClick={() => { setDrawer(null); setFileFocus(null); }}>
                 <XIcon className="size-4" />
               </Button>
             </div>
@@ -354,7 +382,7 @@ export function ChatView({
                       "rounded-none border-b-2 border-transparent px-2 text-xs data-[state=active]:border-signal data-[state=active]:bg-transparent",
                     )}
                   >
-                    {tab.label}
+                    {i18n.t(tab.labelKey)}
                   </TabsTrigger>
                 ))}
               </TabsList>
@@ -366,13 +394,23 @@ export function ChatView({
                   <FilesSection detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} focus={fileFocus} />
                 </TabsContent>
                 <TabsContent value="settings" className="mt-0">
-                  <SettingsPanel detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} />
+                  <SettingsPanel detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} onOpenTerminal={openTerminal} />
                 </TabsContent>
               </div>
             </Tabs>
           </aside>
         ) : null}
+
       </section>
+
+      {termVm ? (
+        // 宽窗口是真分屏（左聊天右终端，输入框不被盖住，才能一边敲 dmesg 一边发消息）；
+        // 窄容器里半栏终端没法用，改成整块盖住聊天，关掉就回到群——
+        // 两种尺寸都不要求用户去猜现在在跟哪一层打交道。
+        <aside className="absolute inset-0 z-20 min-h-0 lg:static lg:z-auto lg:min-w-[340px]">
+          <TerminalPane vms={termVms} vmId={termVm.id} onPick={openTerminal} onClose={() => setTermId(null)} />
+        </aside>
+      ) : null}
     </div>
   );
 }
@@ -396,6 +434,7 @@ function MessageRow({
   humanNames: Map<string, string>;
   onOpenFile: (item: Presented) => void;
 }) {
+  const i18n = useI18n();
   if (message.sender_type === "system" || message.kind === "system") {
     return <p className="py-0.5 text-center text-[11px] leading-relaxed text-muted-foreground">{message.content}</p>;
   }
@@ -417,16 +456,16 @@ function MessageRow({
             <span className={cn("text-xs font-medium", agent && "text-machine")}>{message.sender_name}</span>
             {agent ? (
               <Badge variant="outline" className="rounded-full px-1.5 py-0 font-mono text-[10px] font-normal text-machine">
-                虚拟
+                {i18n.t("ui.kindAgentShort")}
               </Badge>
             ) : null}
             {message.on_behalf_of ? (
               <Badge variant="outline" className="rounded-full border-signal/50 px-1.5 py-0 text-[10px] font-normal text-signal">
-                替 @{humanNames.get(message.on_behalf_of) ?? "已不在本群的同事"} 代答
+                {i18n.tf("chat.onBehalfBadge", { name: humanNames.get(message.on_behalf_of) ?? i18n.t("chat.formerMember") })}
               </Badge>
             ) : null}
             {agent && presence?.signature ? (
-              <span className="max-w-40 truncate text-[11px] text-muted-foreground">「{presence.signature}」</span>
+              <span className="max-w-40 truncate text-[11px] text-muted-foreground">{i18n.tf("chat.signatureQuote", { signature: presence.signature })}</span>
             ) : null}
           </header>
         )}
@@ -449,7 +488,7 @@ function MessageRow({
             #{message.seq}
           </span>
         </div>
-        {message.error ? <p className="px-1 text-xs text-destructive">这条的回执出错：{message.error}</p> : null}
+        {message.error ? <p className="px-1 text-xs text-destructive">{i18n.tf("chat.receiptError", { error: message.error })}</p> : null}
       </div>
     </article>
   );

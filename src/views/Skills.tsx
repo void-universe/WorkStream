@@ -14,6 +14,8 @@ import type { InstallOutcome, RegistrySummary, RemoteSkill, Skill, SkillRegistry
 import { byteSize, timeAgo } from "../lib/format";
 import { ALL_AGENTS, ALL_AGENTS_FUTURE, describeInstall, installScope, skippedNote } from "../lib/skills";
 import { Field, Notice, TextInput } from "../lib/ui";
+import { useI18n } from "../lib/i18n";
+import type { I18n } from "../lib/i18n";
 
 type Draft = {
   name: string;
@@ -37,8 +39,8 @@ const EMPTY: Draft = {
   target: "",
 };
 
-const sourceLabel = (skill: Skill) => (
-  skill.always_on ? "内置" : skill.source === "remote" ? "远端快照" : skill.is_public ? "公开" : "仅自己"
+const sourceLabel = (i18n: I18n, skill: Skill) => (
+  skill.always_on ? i18n.t("skill.srcBuiltIn") : skill.source === "remote" ? i18n.t("skill.srcRemoteSnapshot") : skill.is_public ? i18n.t("skill.srcPublic") : i18n.t("skill.srcPrivate")
 );
 
 const card = "ws-surface ws-surface-hover flex min-w-0 flex-col gap-2 rounded-xl bg-card p-3.5";
@@ -64,6 +66,7 @@ function InstallPicker({
   onChange: (next: string) => void;
   disabled?: boolean;
 }) {
+  const i18n = useI18n();
   return (
     <NativeSelect
       className="h-7 w-full text-[11px]"
@@ -71,21 +74,22 @@ function InstallPicker({
       disabled={disabled}
       onChange={(event) => onChange(event.target.value)}
     >
-      <NativeSelectOption value="">装到…</NativeSelectOption>
+      <NativeSelectOption value="">{i18n.t("skill.installTo")}</NativeSelectOption>
       {agents.map((agent) => (
         <NativeSelectOption key={agent.id} value={agent.id}>{agent.name}</NativeSelectOption>
       ))}
       {agents.length > 1 ? (
-        <NativeSelectOption value={ALL_AGENTS}>全部 {agents.length} 个现有员工</NativeSelectOption>
+        <NativeSelectOption value={ALL_AGENTS}>{i18n.tf("skill.allExistingAgents", { n: agents.length })}</NativeSelectOption>
       ) : null}
       {agents.length ? (
-        <NativeSelectOption value={ALL_AGENTS_FUTURE}>现有 + 以后新建的员工</NativeSelectOption>
+        <NativeSelectOption value={ALL_AGENTS_FUTURE}>{i18n.t("skill.allAgentsAndFuture")}</NativeSelectOption>
       ) : null}
     </NativeSelect>
   );
 }
 
 export function SkillsPanel({ userId }: { userId: string }) {
+  const i18n = useI18n();
   const [tab, setTab] = useState<"local" | "remote">("local");
   const [agents, setAgents] = useState<Agent[]>([]);
   const [localQuery, setLocalQuery] = useState("");
@@ -94,13 +98,13 @@ export function SkillsPanel({ userId }: { userId: string }) {
   useEffect(() => {
     void get<{ ok: true; items: Agent[] }>("agents.list")
       .then((result) => setAgents(result.items))
-      .catch((error) => toast.error(describeError(error)));
+      .catch((error) => toast.error(describeError(i18n, error)));
   }, []);
 
   return (
     <div className="grid gap-3">
       <div className="flex flex-wrap items-center gap-1">
-        {([["local", "本地市场"], ["remote", "远端技能源"]] as const).map(([id, label]) => (
+        {([["local", "skill.tabLocal"], ["remote", "skill.tabRemote"]] as const).map(([id, labelKey]) => (
           <button
             key={id}
             type="button"
@@ -112,11 +116,11 @@ export function SkillsPanel({ userId }: { userId: string }) {
                 : "text-muted-foreground hover:bg-muted",
             )}
           >
-            {label}
+            {i18n.t(labelKey)}
           </button>
         ))}
         <p className="ml-auto max-w-[520px] text-[11px] leading-relaxed text-muted-foreground">
-          技能要装到员工才写进上下文；内置的两条平台技能对每个员工始终启用，不用安装。
+          {i18n.t("skill.panelHint")}
         </p>
       </div>
 
@@ -138,6 +142,7 @@ function LocalSkills({
   query: string;
   setQuery: (next: string) => void;
 }) {
+  const i18n = useI18n();
   const [items, setItems] = useState<Skill[]>([]);
   const [targets, setTargets] = useState<Record<string, string>>({});
   const [open, setOpen] = useState<Record<string, boolean>>({});
@@ -151,7 +156,7 @@ function LocalSkills({
       const market = await get<{ ok: true; items: Skill[] }>("skills.market", { q: needle || undefined });
       setItems(market.items);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     }
   }, []);
 
@@ -168,7 +173,7 @@ function LocalSkills({
       const result = await get<{ ok: true; skill: Skill }>("skills.get", { id: skill.id });
       setBodies((current) => ({ ...current, [skill.id]: result.skill.body ?? "" }));
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     }
   }
 
@@ -179,10 +184,10 @@ function LocalSkills({
         skill_id: skill.id,
         ...installScope(target),
       });
-      toast.success(`${skill.name}：${describeInstall(result)}`);
+      toast.success(i18n.tf("skill.installToast", { name: skill.name, detail: describeInstall(i18n, result) }));
       await load(query);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
@@ -203,10 +208,10 @@ function LocalSkills({
       anchor.click();
       URL.revokeObjectURL(url);
       setBodies((current) => ({ ...current, [skill.id]: body }));
-      toast.success("已下载 .md 文件");
+      toast.success(i18n.t("skill.downloadedMd"));
       await load(query);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
@@ -216,10 +221,10 @@ function LocalSkills({
     setBusy(skill.id);
     try {
       await post<{ ok: true; skill: Skill }>("skills.setDefault", { skill_id: skill.id, is_default: isDefault });
-      toast.success(isDefault ? "以后新建的员工会自动装上这条" : "已取消自动安装");
+      toast.success(isDefault ? i18n.t("skill.becameDefault") : i18n.t("skill.defaultCancelled"));
       await load(query);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
@@ -227,7 +232,7 @@ function LocalSkills({
 
   async function upload() {
     if (!draft.name.trim() || !draft.summary.trim() || !draft.body.trim()) {
-      toast.error("技能名、摘要和正文都要填。");
+      toast.error(i18n.t("skill.needNameSummaryBody"));
       return;
     }
     setBusy("upload");
@@ -242,12 +247,12 @@ function LocalSkills({
         is_default: draft.is_default,
         ...(draft.target ? installScope(draft.target) : {}),
       });
-      toast.success(result.install ? `已上传并安装：${describeInstall(result.install)}` : "技能已上传");
+      toast.success(result.install ? i18n.tf("skill.uploadInstallToast", { detail: describeInstall(i18n, result.install) }) : i18n.t("skill.uploadedOnly"));
       setUploadOpen(false);
       setDraft({ ...EMPTY, target: draft.target });
       await load(query);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
@@ -259,41 +264,41 @@ function LocalSkills({
         <Input
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          placeholder="搜索名称、摘要或分类…"
+          placeholder={i18n.t("skill.searchLocalPlaceholder")}
           className="h-8 w-52 text-xs"
         />
-        <p className="font-mono text-[10px] text-muted-foreground">{items.length} 条</p>
+        <p className="font-mono text-[10px] text-muted-foreground">{i18n.tf("skill.itemCount", { n: items.length })}</p>
         <Button
           size="sm"
           className="ml-auto h-8 rounded-full text-xs"
           onClick={() => setUploadOpen((current) => !current)}
         >
-          {uploadOpen ? "收起上传" : "上传技能"}
+          {uploadOpen ? i18n.t("skill.collapseUpload") : i18n.t("skill.uploadSkill")}
         </Button>
       </div>
 
       {uploadOpen ? (
         <section className="ws-surface grid gap-3 rounded-xl bg-card p-3.5">
           <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_110px_96px]">
-            <Field label="技能名">
+            <Field label={i18n.t("skill.nameLabel")}>
               <TextInput
                 value={draft.name}
                 maxLength={60}
                 onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                placeholder="如：发布检查清单"
+                placeholder={i18n.t("skill.namePlaceholder")}
                 className="h-8 text-xs"
               />
             </Field>
-            <Field label="一句话摘要">
+            <Field label={i18n.t("skill.summaryLabel")}>
               <TextInput
                 value={draft.summary}
                 maxLength={300}
                 onChange={(event) => setDraft({ ...draft, summary: event.target.value })}
-                placeholder="这个技能让员工学会什么"
+                placeholder={i18n.t("skill.summaryPlaceholder")}
                 className="h-8 text-xs"
               />
             </Field>
-            <Field label="分类">
+            <Field label={i18n.t("skill.categoryLabel")}>
               <TextInput
                 value={draft.category}
                 maxLength={20}
@@ -301,7 +306,7 @@ function LocalSkills({
                 className="h-8 text-xs"
               />
             </Field>
-            <Field label="版本">
+            <Field label={i18n.t("skill.versionLabel")}>
               <TextInput
                 value={draft.version}
                 maxLength={24}
@@ -311,13 +316,13 @@ function LocalSkills({
               />
             </Field>
           </div>
-          <Field label="技能正文" hint="写给虚拟员工看的操作说明；会和内置技能一起进入上下文，带方案示例更好用。">
+          <Field label={i18n.t("skill.bodyLabel")} hint={i18n.t("skill.bodyHint")}>
             <Textarea
               rows={7}
               value={draft.body}
               maxLength={20000}
               onChange={(event) => setDraft({ ...draft, body: event.target.value })}
-              placeholder={"# 发布检查清单\n1. 备份数据库\n2. 灰度 10%\n3. 观察 30 分钟后全量"}
+              placeholder={i18n.t("skill.bodyPlaceholder")}
               className="text-xs"
             />
           </Field>
@@ -330,7 +335,7 @@ function LocalSkills({
                 checked={draft.is_public}
                 onChange={(event) => setDraft({ ...draft, is_public: event.target.checked })}
               />
-              公开到市场
+              {i18n.t("skill.publishLabel")}
             </label>
             <label className="flex items-center gap-1.5 text-xs">
               <input
@@ -340,10 +345,10 @@ function LocalSkills({
                 checked={draft.is_default}
                 onChange={(event) => setDraft({ ...draft, is_default: event.target.checked })}
               />
-              新员工自动安装
+              {i18n.t("skill.autoInstallLabel")}
             </label>
             <span className="text-[11px] leading-relaxed text-muted-foreground">
-              {draft.is_public ? "公开的默认技能对所有人生成的新员工生效" : "私有的默认技能只对我自己新建的员工生效"}
+              {draft.is_public ? i18n.t("skill.publicDefaultNote") : i18n.t("skill.privateDefaultNote")}
             </span>
             <div className="flex min-w-[240px] flex-1 flex-wrap items-center justify-end gap-1.5">
               <div className="min-w-[180px] flex-1">
@@ -359,7 +364,7 @@ function LocalSkills({
                 disabled={busy === "upload"}
                 onClick={() => void upload()}
               >
-                {busy === "upload" ? "上传中…" : "上传"}
+                {busy === "upload" ? i18n.t("skill.uploading") : i18n.t("skill.upload")}
               </Button>
             </div>
           </div>
@@ -384,13 +389,13 @@ function LocalSkills({
                 variant="secondary"
                 className={cn(chip, "shrink-0", skill.always_on && "bg-signal/12 text-signal")}
               >
-                {sourceLabel(skill)}
+                {sourceLabel(i18n, skill)}
               </Badge>
               {!skill.always_on && skill.is_default ? (
-                <Badge variant="secondary" className={cn(chip, "shrink-0")}>默认</Badge>
+                <Badge variant="secondary" className={cn(chip, "shrink-0")}>{i18n.t("skill.defaultBadge")}</Badge>
               ) : null}
               <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
-                {open[skill.id] ? "收起" : "详情"}
+                {open[skill.id] ? i18n.t("common.collapse") : i18n.t("skill.details")}
               </span>
             </button>
             <p className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">{skill.summary}</p>
@@ -398,8 +403,8 @@ function LocalSkills({
               <div className="grid gap-2">
                 <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-lg bg-muted/40 p-3 font-sans text-[11px] leading-relaxed scrollbar-thin">
                   {skill.always_on
-                    ? "内置技能随每轮回复注入上下文，正文不在这里展开；要完整用法可以在群里让员工 list_skills。"
-                    : bodies[skill.id] ?? "正文读取中…"}
+                    ? i18n.t("skill.alwaysOnBodyNote")
+                    : bodies[skill.id] ?? i18n.t("skill.bodyLoading")}
                 </pre>
                 {skill.owner_id === userId && !skill.always_on ? (
                   <label className="flex items-center gap-1.5 text-xs">
@@ -411,14 +416,14 @@ function LocalSkills({
                       disabled={busy === skill.id}
                       onChange={(event) => void setDefault(skill, event.target.checked)}
                     />
-                    以后新建的员工自动安装这条
+                    {i18n.t("skill.setDefaultFuture")}
                   </label>
                 ) : null}
               </div>
             ) : null}
             <div className="mt-auto flex flex-wrap items-center gap-1.5 pt-1">
               {skill.always_on ? (
-                <span className="min-w-0 flex-1 text-[11px] text-muted-foreground">对每个员工始终启用，不用装</span>
+                <span className="min-w-0 flex-1 text-[11px] text-muted-foreground">{i18n.t("skill.alwaysOnShort")}</span>
               ) : (
                 <div className="min-w-0 flex-1">
                   <InstallPicker
@@ -436,7 +441,7 @@ function LocalSkills({
                   disabled={!targets[skill.id] || busy === skill.id}
                   onClick={() => void install(skill, targets[skill.id] ?? "")}
                 >
-                  {busy === skill.id ? "处理中…" : "安装"}
+                  {busy === skill.id ? i18n.t("skill.processing") : i18n.t("skill.install")}
                 </Button>
               )}
               <Button
@@ -446,16 +451,16 @@ function LocalSkills({
                 disabled={busy === skill.id}
                 onClick={() => void download(skill)}
               >
-                下载
+                {i18n.t("skill.download")}
               </Button>
             </div>
             <p className="font-mono text-[10px] text-muted-foreground">
-              安装 {skill.installs} · 下载 {skill.downloads} · {timeAgo(skill.created_at)}
+              {i18n.tf("skill.stats", { installs: skill.installs, downloads: skill.downloads, ago: timeAgo(i18n, skill.created_at) })}
             </p>
           </article>
         ))}
         {items.length === 0 ? (
-          <p className="text-xs text-muted-foreground">没有匹配的技能。换个关键词，或上传一个新的。</p>
+          <p className="text-xs text-muted-foreground">{i18n.t("skill.localEmpty")}</p>
         ) : null}
       </div>
     </div>
@@ -473,6 +478,7 @@ function RemoteSkills({
   query: string;
   setQuery: (next: string) => void;
 }) {
+  const i18n = useI18n();
   const [items, setItems] = useState<RemoteSkill[]>([]);
   const [sources, setSources] = useState<RegistrySummary[]>([]);
   const [registries, setRegistries] = useState<SkillRegistry[]>([]);
@@ -499,7 +505,7 @@ function RemoteSkills({
       setRegistries(owned.items);
       setManageOpen((current) => current || !owned.items.length);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setLoading(false);
     }
@@ -512,7 +518,7 @@ function RemoteSkills({
 
   async function addRegistry() {
     if (!draft.name.trim() || !draft.index_url.trim()) {
-      toast.error("源名称和 index 地址都要填。");
+      toast.error(i18n.t("skill.needSourceFields"));
       return;
     }
     setBusy("add");
@@ -523,15 +529,15 @@ function RemoteSkills({
         probe: { items: unknown[]; skipped: unknown[]; error: string | null };
       }>("registries.add", { name: draft.name.trim(), index_url: draft.index_url.trim() });
       if (result.probe.error) {
-        toast.warning(`已存下「${result.registry.name}」，但连不上：${describeCode(result.probe.error)}`);
+        toast.warning(i18n.tf("skill.registrySavedUnreachable", { name: result.registry.name, reason: describeCode(i18n, result.probe.error) }));
       } else {
-        toast.success(`已添加，读到 ${result.probe.items.length} 条技能`);
+        toast.success(i18n.tf("skill.addedAndRead", { n: result.probe.items.length }));
       }
       setDraft({ name: "", index_url: "" });
       setSourceId(result.registry.id);
       await load();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
@@ -544,11 +550,11 @@ function RemoteSkills({
         "registries.refresh",
         { id: registry.id },
       );
-      if (result.probe.error) toast.warning(describeCode(result.probe.error));
-      else toast.success(`读到 ${result.probe.items.length} 条技能`);
+      if (result.probe.error) toast.warning(describeCode(i18n, result.probe.error));
+      else toast.success(i18n.tf("skill.readCount", { n: result.probe.items.length }));
       await load();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
@@ -558,25 +564,25 @@ function RemoteSkills({
     setBusy(registry.id);
     try {
       await post<{ ok: true; registry: SkillRegistry }>("registries.update", { id: registry.id, enabled });
-      toast.success(enabled ? `已启用 ${registry.name}` : `已停用 ${registry.name}`);
+      toast.success(enabled ? i18n.tf("skill.sourceEnabled", { name: registry.name }) : i18n.tf("skill.sourceDisabled", { name: registry.name }));
       await load();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
   }
 
   async function removeRegistry(registry: SkillRegistry) {
-    if (!window.confirm(`删掉技能源「${registry.name}」？已经抄到本地的技能会留下，员工继续用。`)) return;
+    if (!window.confirm(i18n.tf("skill.removeSourceConfirm", { name: registry.name }))) return;
     setBusy(registry.id);
     try {
       await post<{ ok: true }>("registries.remove", { id: registry.id });
-      toast.success("已删除技能源");
+      toast.success(i18n.t("skill.sourceDeleted"));
       if (sourceId === registry.id) setSourceId("");
       await load();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
@@ -592,11 +598,15 @@ function RemoteSkills({
         ...installScope(target),
       });
       toast.success(
-        `${result.skill.name} v${result.skill.version ?? "—"} 已抄成本地快照 · ${describeInstall(result.install)}`,
+        i18n.tf("skill.remoteInstallToast", {
+          name: result.skill.name,
+          version: result.skill.version ?? i18n.t("skill.unknownVersion"),
+          detail: describeInstall(i18n, result.install),
+        }),
       );
       await load();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
       await load();
     } finally {
       setBusy("");
@@ -612,16 +622,24 @@ function RemoteSkills({
         "skills.remoteUpdate",
         { skill_id: item.installed_skill_id },
       );
-      toast.success(`${item.name}：v${result.from_version || "—"} → v${result.to_version || "—"}`);
+      toast.success(
+        i18n.tf("skill.updateToast", {
+          name: item.name,
+          from: result.from_version || i18n.t("skill.unknownVersion"),
+          to: result.to_version || i18n.t("skill.unknownVersion"),
+        }),
+      );
       await load();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy("");
     }
   }
 
   const skippedSources = sources.filter((source) => source.skipped.length);
+  // 「index 长这样：…」中间夹着等宽示例段，拆不成整句，按 {0} 切开再插回去。
+  const exampleParts = i18n.tp("skill.indexExampleNote");
 
   return (
     <div className="grid gap-3">
@@ -629,7 +647,7 @@ function RemoteSkills({
         <Input
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          placeholder="搜索名称、简介、slug 或源…"
+          placeholder={i18n.t("skill.searchRemotePlaceholder")}
           className="h-8 w-56 text-xs"
         />
         <NativeSelect
@@ -637,10 +655,10 @@ function RemoteSkills({
           value={sourceId}
           onChange={(event) => setSourceId(event.target.value)}
         >
-          <NativeSelectOption value="">全部启用的源</NativeSelectOption>
+          <NativeSelectOption value="">{i18n.t("skill.allEnabledSources")}</NativeSelectOption>
           {registries.map((registry) => (
             <NativeSelectOption key={registry.id} value={registry.id}>
-              {registry.name}{registry.enabled ? "" : "（已停用）"}
+              {registry.name}{registry.enabled ? "" : i18n.t("skill.disabledSuffix")}
             </NativeSelectOption>
           ))}
         </NativeSelect>
@@ -651,15 +669,15 @@ function RemoteSkills({
           disabled={loading}
           onClick={() => void load()}
         >
-          {loading ? "拉取中…" : "刷新"}
+          {loading ? i18n.t("skill.fetching") : i18n.t("common.refresh")}
         </Button>
-        <p className="font-mono text-[10px] text-muted-foreground">{items.length} 条</p>
+        <p className="font-mono text-[10px] text-muted-foreground">{i18n.tf("skill.itemCount", { n: items.length })}</p>
         <Button
           size="sm"
           className="ml-auto h-8 rounded-full text-xs"
           onClick={() => setManageOpen((current) => !current)}
         >
-          {manageOpen ? "收起技能源" : `技能源 · ${registries.length}`}
+          {manageOpen ? i18n.t("skill.collapseSources") : i18n.tf("skill.sourcesToggle", { n: registries.length })}
         </Button>
       </div>
 
@@ -669,18 +687,18 @@ function RemoteSkills({
             <span
               key={source.id}
               title={source.error
-                ? describeCode(source.error)
+                ? describeCode(i18n, source.error)
                 : source.skipped.length
-                  ? skippedNote(source.skipped)
+                  ? skippedNote(i18n, source.skipped)
                   : source.index_url}
               className={cn(
                 "max-w-full truncate rounded-full border px-2 py-0.5 text-[10px] leading-4",
                 source.error ? "border-machine/40 bg-machine-soft text-machine" : "text-muted-foreground",
               )}
             >
-              {source.name} · {source.error ? "连不上" : `${source.skill_count} 条`}
-              {source.skipped.length ? ` · 跳过 ${source.skipped.length}` : ""}
-              {source.skills_at ? ` · ${timeAgo(source.skills_at)}` : ""}
+              {source.name} · {source.error ? i18n.t("skill.unreachable") : i18n.tf("skill.itemCount", { n: source.skill_count })}
+              {source.skipped.length ? ` · ${i18n.tf("skill.skippedCount", { n: source.skipped.length })}` : ""}
+              {source.skills_at ? ` · ${timeAgo(i18n, source.skills_at)}` : ""}
             </span>
           ))}
         </div>
@@ -689,18 +707,18 @@ function RemoteSkills({
       {manageOpen ? (
         <section className="ws-surface grid gap-3 rounded-xl bg-card p-3.5">
           <div className="grid gap-3 md:grid-cols-[minmax(0,0.6fr)_minmax(0,1.6fr)_auto] md:items-end">
-            <Field label="源名称">
+            <Field label={i18n.t("skill.sourceNameLabel")}>
               <TextInput
                 value={draft.name}
                 maxLength={40}
                 onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                placeholder="如：团队的技能库"
+                placeholder={i18n.t("skill.sourceNamePlaceholder")}
                 className="h-8 text-xs"
               />
             </Field>
             <Field
-              label="index JSON 地址"
-              hint="正文必须和 index 同源；服务端只读源、不写源，线上只收 https，本机调试才放行内网地址。"
+              label={i18n.t("skill.indexUrlLabel")}
+              hint={i18n.t("skill.indexUrlHint")}
             >
               <TextInput
                 value={draft.index_url}
@@ -716,15 +734,15 @@ function RemoteSkills({
               disabled={busy === "add"}
               onClick={() => void addRegistry()}
             >
-              {busy === "add" ? "拉取中…" : "添加并拉取"}
+              {busy === "add" ? i18n.t("skill.fetching") : i18n.t("skill.addAndFetch")}
             </Button>
           </div>
           <p className="break-all text-[11px] leading-relaxed text-muted-foreground">
-            index 长这样：
+            {exampleParts[0]}
             <span className="font-mono">
               {" {\"schema\":1,\"skills\":[{\"slug\":\"release-check\",\"name\":\"发布检查\",\"summary\":\"…\",\"version\":\"1.2.0\",\"body_url\":\"release-check.md\"}]} "}
             </span>
-            ；单个源最多 200 条、每人最多 8 个源。
+            {exampleParts[1]}
           </p>
 
           <div className="grid gap-1.5">
@@ -733,13 +751,13 @@ function RemoteSkills({
                 <span className="min-w-0 flex-1">
                   <span className="flex min-w-0 items-center gap-1.5">
                     <span className="truncate text-sm">{registry.name}</span>
-                    {registry.enabled ? null : <Badge variant="secondary" className={chip}>已停用</Badge>}
+                    {registry.enabled ? null : <Badge variant="secondary" className={chip}>{i18n.t("skill.disabledBadge")}</Badge>}
                     {registry.last_error ? (
                       <Badge
                         variant="secondary"
                         className={cn(chip, "border-machine/40 bg-machine-soft text-machine")}
                       >
-                        {describeCode(registry.last_error)}
+                        {describeCode(i18n, registry.last_error)}
                       </Badge>
                     ) : null}
                   </span>
@@ -747,8 +765,8 @@ function RemoteSkills({
                     className="block truncate font-mono text-[10.5px] text-muted-foreground"
                     title={registry.index_url}
                   >
-                    {hostOf(registry.index_url)} · {registry.skill_count} 条
-                    {registry.skills_at ? ` · ${timeAgo(registry.skills_at)}` : " · 还没拉到"}
+                    {hostOf(registry.index_url)} · {i18n.tf("skill.itemCount", { n: registry.skill_count })}
+                    {registry.skills_at ? ` · ${timeAgo(i18n, registry.skills_at)}` : ` · ${i18n.t("skill.notFetched")}`}
                   </span>
                 </span>
                 <Button
@@ -758,7 +776,7 @@ function RemoteSkills({
                   disabled={busy === registry.id}
                   onClick={() => void refreshRegistry(registry)}
                 >
-                  重测
+                  {i18n.t("skill.retest")}
                 </Button>
                 <Button
                   size="sm"
@@ -767,7 +785,7 @@ function RemoteSkills({
                   disabled={busy === registry.id}
                   onClick={() => void toggleRegistry(registry, !registry.enabled)}
                 >
-                  {registry.enabled ? "停用" : "启用"}
+                  {registry.enabled ? i18n.t("skill.disable") : i18n.t("skill.enable")}
                 </Button>
                 <Button
                   size="sm"
@@ -776,7 +794,7 @@ function RemoteSkills({
                   disabled={busy === registry.id}
                   onClick={() => void removeRegistry(registry)}
                 >
-                  删除
+                  {i18n.t("common.delete")}
                 </Button>
                 <Button
                   size="sm"
@@ -784,13 +802,13 @@ function RemoteSkills({
                   className="h-7 rounded-full px-2 text-[11px]"
                   onClick={() => setSourceId(registry.id)}
                 >
-                  只看这个源
+                  {i18n.t("skill.onlyThisSource")}
                 </Button>
               </div>
             ))}
             {!registries.length ? (
               <p className="text-xs text-muted-foreground">
-                还没有技能源。填一个能公开访问的 index JSON，就能把团队仓库当市场用。
+                {i18n.t("skill.noSourcesYet")}
               </p>
             ) : null}
           </div>
@@ -810,7 +828,7 @@ function RemoteSkills({
                 className="flex min-w-0 items-center gap-1.5 text-left"
               >
                 <h2 className="min-w-0 truncate text-sm font-semibold">{item.name}</h2>
-                <span className="shrink-0 font-mono text-[10px] text-muted-foreground">v{item.version || "—"}</span>
+                <span className="shrink-0 font-mono text-[10px] text-muted-foreground">v{item.version || i18n.t("skill.unknownVersion")}</span>
                 <Badge variant="secondary" className={cn(chip, "shrink-0")}>{item.category}</Badge>
                 <Badge variant="secondary" className={cn(chip, "shrink-0")}>{item.registry_name}</Badge>
                 {item.installed_skill_id ? (
@@ -819,23 +837,23 @@ function RemoteSkills({
                     className={cn(chip, "shrink-0", item.update_available && "bg-signal/12 text-signal")}
                   >
                     {item.update_available
-                      ? `可更新（本地 v${item.installed_version || "—"}）`
-                      : `已装 v${item.installed_version || "—"}`}
+                      ? i18n.tf("skill.updateAvailableBadge", { version: item.installed_version || i18n.t("skill.unknownVersion") })
+                      : i18n.tf("skill.installedBadge", { version: item.installed_version || i18n.t("skill.unknownVersion") })}
                   </Badge>
                 ) : null}
                 <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
-                  {open[key] ? "收起" : "明细"}
+                  {open[key] ? i18n.t("common.collapse") : i18n.t("skill.details")}
                 </span>
               </button>
               <p className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
-                {item.summary || "源上没写简介。"}
+                {item.summary || i18n.t("skill.noSummaryNote")}
               </p>
               {open[key] ? (
                 <div className="grid gap-1 break-all rounded-lg bg-muted/40 p-2.5 font-mono text-[10.5px] leading-relaxed text-muted-foreground">
                   <span>slug · {item.slug}</span>
                   <span>
-                    {item.size ? byteSize(item.size) : "大小未知"} ·{" "}
-                    {item.updated_at ? `源上更新 ${timeAgo(item.updated_at)}` : "源上没写更新时间"}
+                    {item.size ? byteSize(i18n, item.size) : i18n.t("skill.sizeUnknown")} ·{" "}
+                    {item.updated_at ? i18n.tf("skill.sourceUpdatedAgo", { ago: timeAgo(i18n, item.updated_at) }) : i18n.t("skill.noUpdatedAt")}
                   </span>
                   <a href={item.body_url} target="_blank" rel="noreferrer" className="text-signal hover:underline">
                     {hostOf(item.body_url)}/{item.slug}
@@ -857,7 +875,7 @@ function RemoteSkills({
                   disabled={!target || busy === key}
                   onClick={() => void install(item, target)}
                 >
-                  {busy === key ? "处理中…" : item.installed_skill_id ? "再装一次" : "安装"}
+                  {busy === key ? i18n.t("skill.processing") : item.installed_skill_id ? i18n.t("skill.reinstall") : i18n.t("skill.install")}
                 </Button>
                 {item.update_available && item.installed_skill_id ? (
                   <Button
@@ -867,17 +885,17 @@ function RemoteSkills({
                     disabled={busy === key}
                     onClick={() => void update(item)}
                   >
-                    更新
+                    {i18n.t("skill.update")}
                   </Button>
                 ) : null}
                 <a
                   href={item.body_url}
                   target="_blank"
                   rel="noreferrer"
-                  title="在新标签打开源上的正文"
+                  title={i18n.t("skill.openBodyTitle")}
                   className="shrink-0 px-2 text-[11px] text-muted-foreground hover:text-foreground hover:underline"
                 >
-                  下载 link
+                  {i18n.t("skill.downloadLink")}
                 </a>
               </div>
             </article>
@@ -888,20 +906,25 @@ function RemoteSkills({
       {!loading && !items.length ? (
         registries.length ? (
           <Notice tone="warn">
-            这些源上此刻没有可用技能：连不上的源已经在上面标出原因，其余多半是搜索词太窄或条目格式不合。
+            {i18n.t("skill.noRemoteSkillsNote")}
           </Notice>
         ) : (
           <Notice>
-            还没有技能源。点右上角「技能源」填一个 index JSON 地址——比如在 GitHub 上开一个 skills 仓，
-            把清单文件的 raw 地址贴进来；装的时候正文会抄一份到本地并记下版本，源之后怎么改都不影响在用的员工。
+            {i18n.t("skill.getStartedNote")}
           </Notice>
         )
       ) : null}
 
       {skippedSources.length ? (
         <Notice tone="warn">
-          源上有条目被跳过：{skippedSources.map((source) => `${source.name}（${skippedNote(source.skipped)}）`).join("、")}。
-          条目要 slug 小写、名称不重复、正文地址和 index 同源。
+          {i18n.tf("skill.skippedIntro", {
+            list: i18n.list(
+              skippedSources.map((source) =>
+                i18n.tf("skill.skippedItem", { name: source.name, note: skippedNote(i18n, source.skipped) }),
+              ),
+            ),
+          })}
+          {i18n.t("skill.skippedRules")}
         </Notice>
       ) : null}
     </div>

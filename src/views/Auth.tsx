@@ -6,6 +6,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api, describeError, setToken, type User } from "../api";
 import { readBrandMode } from "../lib/brand";
+import { useI18n } from "../lib/i18n";
 import { CopyButton, Field, Notice, TextInput } from "../lib/ui";
 
 type RegisterResult = { ok: true; user: User; verify_link: string };
@@ -13,16 +14,20 @@ type LoginResult = { ok: true; token: string; user: User };
 type VerifyResult = { ok: true; email: string; display_name: string };
 
 export function AuthView({ onSignedIn }: { onSignedIn: (user: User, token?: string) => void }) {
+  const i18n = useI18n();
   const [tab, setTab] = useState("login");
   const [busy, setBusy] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [verifyLink, setVerifyLink] = useState("");
+  // 这句话中间要夹一个 <code> 环境变量名。按 {0} 切开交给 JSX 拼，变量名的落点就跟着各语言自己的语序走，
+  // 而不是被组件里写死的位置绑死在中文句法上。
+  const smtpParts = i18n.tp("auth.smtpNotice");
 
   async function submit(kind: "login" | "register") {
     if (!email.trim() || !password) {
-      toast.error("邮箱和口令都要填。");
+      toast.error(i18n.t("auth.needBoth"));
       return;
     }
     setBusy(true);
@@ -31,16 +36,16 @@ export function AuthView({ onSignedIn }: { onSignedIn: (user: User, token?: stri
         const result = await api<LoginResult>("auth.login", { body: { email, password } });
         setToken(result.token);
         onSignedIn(result.user, result.token);
-        toast.success(`欢迎回来，${result.user.display_name}`);
+        toast.success(i18n.tf("auth.welcomeBack", { name: result.user.display_name }));
         return;
       }
       const result = await api<RegisterResult>("auth.register", {
         body: { email, password, display_name: displayName },
       });
       setVerifyLink(result.verify_link);
-      toast.success("账号已建好，先点验证链接激活邮箱。");
+      toast.success(i18n.t("auth.accountCreated"));
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy(false);
     }
@@ -59,25 +64,23 @@ export function AuthView({ onSignedIn }: { onSignedIn: (user: User, token?: stri
           </span>
           <h1 className="text-xl font-semibold tracking-tight">WorkStream</h1>
         </div>
-        <p className="text-sm text-muted-foreground">
-          真实员工与虚拟员工共用一个群：@ 一下就把活儿派进对方的虚拟邮箱，时间片并行推进。
-        </p>
+        <p className="text-sm text-muted-foreground">{i18n.t("auth.tagline")}</p>
       </header>
 
       <Tabs value={tab} onValueChange={(value) => setTab(String(value))}>
         <TabsList className="grid w-full grid-cols-2">
-          <TabsTrigger value="login">登录</TabsTrigger>
-          <TabsTrigger value="register">注册</TabsTrigger>
+          <TabsTrigger value="login">{i18n.t("auth.loginTab")}</TabsTrigger>
+          <TabsTrigger value="register">{i18n.t("auth.registerTab")}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="login">
           <Card>
             <CardHeader>
-              <CardTitle className="text-base">用邮箱登录</CardTitle>
-              <CardDescription className="text-xs">会话保持 30 天，换口令后所有会话都会失效并需要重新登录。</CardDescription>
+              <CardTitle className="text-base">{i18n.t("auth.loginTitle")}</CardTitle>
+              <CardDescription className="text-xs">{i18n.t("auth.loginDesc")}</CardDescription>
             </CardHeader>
             <CardContent className="grid gap-4">
-              <Field label="邮箱" htmlFor="login-email">
+              <Field label={i18n.t("auth.email")} htmlFor="login-email">
                 <TextInput
                   id="login-email"
                   type="email"
@@ -87,7 +90,7 @@ export function AuthView({ onSignedIn }: { onSignedIn: (user: User, token?: stri
                   placeholder="you@company.com"
                 />
               </Field>
-              <Field label="口令" htmlFor="login-password">
+              <Field label={i18n.t("auth.password")} htmlFor="login-password">
                 <TextInput
                   id="login-password"
                   type="password"
@@ -100,7 +103,7 @@ export function AuthView({ onSignedIn }: { onSignedIn: (user: User, token?: stri
                 />
               </Field>
               <Button onClick={() => void submit("login")} disabled={busy}>
-                {busy ? "正在登录…" : "进入工作台"}
+                {busy ? i18n.t("auth.signingIn") : i18n.t("auth.enter")}
               </Button>
             </CardContent>
           </Card>
@@ -109,20 +112,20 @@ export function AuthView({ onSignedIn }: { onSignedIn: (user: User, token?: stri
         <TabsContent value="register">
           <Card>
             <CardHeader>
-              <CardTitle className="text-base">注册真实员工</CardTitle>
-              <CardDescription className="text-xs">邮箱验证后即可创建虚拟员工、拉群和派活。</CardDescription>
+              <CardTitle className="text-base">{i18n.t("auth.registerTitle")}</CardTitle>
+              <CardDescription className="text-xs">{i18n.t("auth.registerDesc")}</CardDescription>
             </CardHeader>
             <CardContent className="grid gap-4">
-              <Field label="姓名 / 花名" htmlFor="register-name" hint="群里 @ 你就是这个名字，控制在 24 字以内。">
+              <Field label={i18n.t("auth.name")} htmlFor="register-name" hint={i18n.t("auth.nameHint")}>
                 <TextInput
                   id="register-name"
                   value={displayName}
                   maxLength={24}
                   onChange={(event) => setDisplayName(event.target.value)}
-                  placeholder="如：李工"
+                  placeholder={i18n.t("auth.namePlaceholder")}
                 />
               </Field>
-              <Field label="邮箱" htmlFor="register-email">
+              <Field label={i18n.t("auth.email")} htmlFor="register-email">
                 <TextInput
                   id="register-email"
                   type="email"
@@ -132,7 +135,7 @@ export function AuthView({ onSignedIn }: { onSignedIn: (user: User, token?: stri
                   placeholder="you@company.com"
                 />
               </Field>
-              <Field label="口令" htmlFor="register-password" hint="至少 8 位；服务端只存 PBKDF2 派生值。">
+              <Field label={i18n.t("auth.password")} htmlFor="register-password" hint={i18n.t("auth.passwordHint")}>
                 <TextInput
                   id="register-password"
                   type="password"
@@ -145,20 +148,20 @@ export function AuthView({ onSignedIn }: { onSignedIn: (user: User, token?: stri
                 />
               </Field>
               <Button onClick={() => void submit("register")} disabled={busy}>
-                {busy ? "正在注册…" : "注册并发送验证链接"}
+                {busy ? i18n.t("auth.registering") : i18n.t("auth.registerButton")}
               </Button>
               {verifyLink ? (
                 <div className="grid gap-2">
                   <Notice>
-                    当前没接 SMTP 中继，验证链接直接显示在这里，同时也存进了站内收件箱。接上
+                    {smtpParts[0]}
                     <code className="mx-1 font-mono">WORKSTREAM_SMTP_URL</code>
-                    后会真发邮件。
+                    {smtpParts[1]}
                   </Notice>
                   <div className="flex items-center gap-2">
                     <Button size="sm" asChild>
-                      <a href={verifyLink}>现在去验证</a>
+                      <a href={verifyLink}>{i18n.t("auth.verifyNow")}</a>
                     </Button>
-                    <CopyButton value={verifyLink} label="链接" />
+                    <CopyButton value={verifyLink} label={i18n.t("auth.copyLinkLabel")} />
                   </div>
                 </div>
               ) : null}
@@ -167,12 +170,13 @@ export function AuthView({ onSignedIn }: { onSignedIn: (user: User, token?: stri
         </TabsContent>
       </Tabs>
 
-      <p className="text-center text-xs text-muted-foreground">copy right www.void-universe.com</p>
+      <p className="text-center text-xs text-muted-foreground">{i18n.t("auth.copyright")}</p>
     </main>
   );
 }
 
 export function VerifyView({ token }: { token: string }) {
+  const i18n = useI18n();
   const [state, setState] = useState<{ phase: "idle" | "busy" | "done" | "error"; message: string }>({
     phase: "idle",
     message: "",
@@ -182,9 +186,9 @@ export function VerifyView({ token }: { token: string }) {
     setState({ phase: "busy", message: "" });
     try {
       const result = await api<VerifyResult>("auth.verify", { body: { token } });
-      setState({ phase: "done", message: `${result.email}（${result.display_name}）已验证。` });
+      setState({ phase: "done", message: i18n.tf("verify.verified", { email: result.email, name: result.display_name }) });
     } catch (error) {
-      setState({ phase: "error", message: describeError(error) });
+      setState({ phase: "error", message: describeError(i18n, error) });
     }
   }
 
@@ -192,21 +196,21 @@ export function VerifyView({ token }: { token: string }) {
     <main className="mx-auto flex min-h-dvh w-full max-w-md flex-col justify-center gap-4 px-5">
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">验证邮箱</CardTitle>
+          <CardTitle className="text-base">{i18n.t("verify.title")}</CardTitle>
           <CardDescription className="text-xs">
-            {token ? `令牌 ${token.slice(0, 10)}…` : "这条链接里没有令牌，请回到站内收件箱重新点。"}
+            {token ? i18n.tf("verify.tokenHint", { token: token.slice(0, 10) }) : i18n.t("verify.noToken")}
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3">
           {state.phase === "idle" ? (
-            <Button onClick={() => void run()}>确认验证</Button>
+            <Button onClick={() => void run()}>{i18n.t("verify.confirm")}</Button>
           ) : null}
-          {state.phase === "busy" ? <p className="text-sm text-muted-foreground">处理中…</p> : null}
+          {state.phase === "busy" ? <p className="text-sm text-muted-foreground">{i18n.t("verify.processing")}</p> : null}
           {state.phase === "done" ? (
             <>
               <Notice>{state.message}</Notice>
               <Button asChild>
-                <a href="#/login">去登录</a>
+                <a href="#/login">{i18n.t("verify.goLogin")}</a>
               </Button>
             </>
           ) : null}

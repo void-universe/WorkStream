@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { clockOf } from "../../lib/format";
+import { useI18n, type I18n, type MsgKey } from "../../lib/i18n";
 import { hitRateOf, newUsage, tallyUsage } from "../../lib/usageStats.mjs";
 import { describeError, get } from "../../api";
 import type { AgentPresenceDetail, AgentProfileMail, RunStep, TrajectoryResponse } from "../../types";
@@ -46,14 +47,13 @@ type Lane = {
   usage: UsageStat;
 };
 
-const grouped = (value: number) => value.toLocaleString("en-US");
-
-const MAIL_LABEL: Record<AgentProfileMail["status"], string> = {
-  queued: "未读",
-  running: "处理中",
-  done: "已读",
-  failed: "失败",
-  cancelled: "已取消",
+// 存字典键而不是文案：切语言后要到渲染期才取词，模块级常量拿不到 hook。
+const MAIL_LABEL: Record<AgentProfileMail["status"], MsgKey> = {
+  queued: "deliver.queued",
+  running: "deliver.running",
+  done: "deliver.done",
+  failed: "flow.failed",
+  cancelled: "deliver.cancelled",
 };
 
 function stamp(iso: string | null): number | null {
@@ -73,13 +73,12 @@ function durationText(msValue: number): string {
   return `${Math.round(msValue / 60_000)}min`;
 }
 
-function axisLabel(stampMs: number, withSeconds: boolean): string {
-  if (!withSeconds) return clockOf(new Date(stampMs).toISOString());
-  const date = new Date(stampMs);
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
+function axisLabel(i18n: I18n, stampMs: number, withSeconds: boolean): string {
+  return clockOf(i18n, new Date(stampMs).toISOString(), withSeconds);
 }
 
 export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
+  const i18n = useI18n();
   const now = Date.now();
   const [mode, setMode] = useState<"sequence" | "time">("sequence");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -190,7 +189,8 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
       const leftWeight = left.priority ?? -1;
       const rightWeight = right.priority ?? -1;
       if (leftWeight !== rightWeight) return rightWeight - leftWeight;
-      return left.name.localeCompare(right.name, "zh-CN");
+      // lane 名是用户起的群名：排序规则跟着阅读者的语言走，而不是永远按中文拼音。
+      return left.name.localeCompare(right.name, i18n.intl);
     });
 
     return {
@@ -217,7 +217,7 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
     setLoadingMail(mailId);
     get<TrajectoryResponse>("agents.trajectory", { mail_id: mailId })
       .then((data) => setCache((prev) => ({ ...prev, [mailId]: data })))
-      .catch((error) => setFailed((prev) => ({ ...prev, [mailId]: describeError(error) })))
+      .catch((error) => setFailed((prev) => ({ ...prev, [mailId]: describeError(i18n, error) })))
       .finally(() => {
         inFlight.current.delete(mailId);
         setLoadingMail(null);
@@ -299,12 +299,15 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
   if (!flow) return null;
 
   const withSeconds = flow.last.start - flow.first.start < 5 * 60_000;
-  const ticks = [0, 1 / 3, 2 / 3, 1].map((ratio) => ({
+  const rawTicks = [0, 1 / 3, 2 / 3, 1].map((ratio) => ({
     left: ratio * 100,
     label: mode === "sequence" || !flow.domain
       ? `#${Math.max(1, Math.round(1 + ratio * (flow.count - 1)))}`
-      : axisLabel(flow.domain.start + flow.domain.span * ratio, withSeconds),
+      : axisLabel(i18n, flow.domain.start + flow.domain.span * ratio, withSeconds),
   }));
+  // 顺序模式下刻度是「第几步」：步数少于刻度数时四个刻度会算出同一个序号，
+  // 一排 "#1 #1 #2 #2" 读起来像坏了。相邻同 label 只留第一个，两端的位置仍然对得上。
+  const ticks = rawTicks.filter((tick, index) => index === 0 || tick.label !== rawTicks[index - 1].label);
   const nowLeft = flow.domain
     ? Math.min(Math.max(((now - flow.domain.start) / flow.domain.span) * 100, 0), 100)
     : null;
@@ -342,26 +345,26 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
             <h2 className="flex items-center gap-2 text-sm font-semibold">
               Stream flow
               <Badge variant="secondary" className="rounded-full px-1.5 py-0 font-mono text-[10px]">
-                {flow.stepCount} 步
+                {i18n.tf("flow.stepsCount", { n: flow.stepCount })}
               </Badge>
             </h2>
             <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
-              {mode === "sequence" ? "每颗是轨迹里的一步（一轮模型调用或一次工具调用），按开始先后等宽排列。" : "长条的真实宽度是这一步占用的时间。"}
-              {" "}点一颗看细节，按住横向拖动可以框选一段时间。
+              {i18n.t(mode === "sequence" ? "flow.modeSequenceHint" : "flow.modeTimeHint")}
+              {" "}{i18n.t("flow.interactionHint")}
             </p>
           </div>
           <div className="flex flex-wrap items-center justify-end gap-2.5 text-[10px] text-muted-foreground">
             <span className="inline-flex items-center gap-1">
               <span className="ws-flow-note h-2 w-5 rounded-full bg-machine" aria-hidden />
-              进行中
+              {i18n.t("flow.running")}
             </span>
             <span className="inline-flex items-center gap-1">
               <span className="h-3 w-5 rounded-full bg-muted-foreground/70" aria-hidden />
-              模型轮
+              {i18n.t("flow.modelTurn")}
             </span>
             <span className="inline-flex items-center gap-1">
               <span className="h-1.5 w-5 rounded-[2px] bg-muted-foreground/70" aria-hidden />
-              工具
+              {i18n.t("flow.tool")}
             </span>
             <span className="inline-flex items-center gap-1">
               <span
@@ -369,18 +372,18 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
                 style={{ backgroundImage: "repeating-linear-gradient(45deg, var(--destructive) 0 2px, transparent 2px 5px)" }}
                 aria-hidden
               />
-              失败
+              {i18n.t("flow.failed")}
             </span>
             <span className="inline-flex items-center gap-1">
               <span className="h-2 w-5 rounded-full border border-muted-foreground/70" aria-hidden />
-              已掐断
+              {i18n.t("flow.aborted")}
             </span>
             <span className="inline-flex items-center gap-1">
               <span className="h-2 w-5 rounded-full border border-dashed border-muted-foreground/60" aria-hidden />
-              未读
+              {i18n.t("deliver.queued")}
             </span>
             <div className="flex overflow-hidden rounded-full border">
-              {([["sequence", "顺序"], ["time", "真实时间"]] as const).map(([value, label]) => (
+              {([["sequence", "flow.modeSequence"], ["time", "flow.modeTime"]] as const).map(([value, labelKey]) => (
                 <button
                   key={value}
                   type="button"
@@ -394,7 +397,7 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
                     mode === value ? "bg-foreground text-background" : "hover:bg-muted",
                   )}
                 >
-                  {label}
+                  {i18n.t(labelKey)}
                 </button>
               ))}
             </div>
@@ -408,9 +411,13 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
                 <div key={lane.id} className="grid h-7 min-w-0 content-start gap-0.5 leading-tight">
                   <p className="truncate text-[11px]">{lane.name}</p>
                   <p className="truncate font-mono text-[9.5px] text-muted-foreground">
-                    权重 {lane.priority ?? "—"} ·{" "}
-                    {lane.steps ? `${lane.steps} 步` : lane.noTrace ? `无轨迹 ${lane.noTrace}` : "0 步"}
-                    {lane.queued ? ` · 排队 ${lane.queued}` : ""}
+                    {i18n.tf("flow.weight", { n: lane.priority ?? "—" })} ·{" "}
+                    {lane.steps
+                      ? i18n.tf("flow.stepsCount", { n: lane.steps })
+                      : lane.noTrace
+                        ? i18n.tf("flow.noTraceCount", { n: lane.noTrace })
+                        : i18n.tf("flow.stepsCount", { n: 0 })}
+                    {lane.queued ? ` · ${i18n.tf("flow.queuedCount", { n: lane.queued })}` : ""}
                   </p>
                 </div>
               ))}
@@ -433,7 +440,7 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
                     key={lane.id}
                     className="relative h-7 overflow-hidden rounded-md bg-muted/30"
                     role="group"
-                    aria-label={`${lane.name}：${lane.units.length} 步轨迹`}
+                    aria-label={i18n.tf("flow.laneAria", { name: lane.name, n: lane.units.length })}
                     style={{ backgroundImage: "repeating-linear-gradient(90deg, var(--border) 0 1px, transparent 1px 25%)" }}
                   >
                     {lane.units.map((unit) => {
@@ -445,8 +452,14 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
                       const isSelected = unit.id === selectedId;
                       const dimmed = inRange ? !inRange.has(unit.id) : false;
                       const label = isMail
-                        ? `${lane.name} · 一封${MAIL_LABEL[unit.mail.status]}的邮件`
-                        : `${lane.name} · 第 ${unit.ordinal} 颗 · ${unit.kind === "model" ? "模型轮" : "工具"} ${unit.step?.name ?? ""} · ${durationText(Math.max(unit.end - unit.start, 0))}`;
+                        ? i18n.tf("flow.mailUnitAria", { name: lane.name, status: i18n.t(MAIL_LABEL[unit.mail.status]) })
+                        : i18n.tf("flow.stepUnitAria", {
+                            name: lane.name,
+                            n: unit.ordinal,
+                            kind: i18n.t(unit.kind === "model" ? "flow.modelTurn" : "flow.tool"),
+                            stepName: unit.step?.name ?? "",
+                            duration: durationText(Math.max(unit.end - unit.start, 0)),
+                          });
                       return (
                         <button
                           key={unit.id}
@@ -456,6 +469,10 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
                           aria-pressed={isSelected}
                           aria-disabled={isMail || undefined}
                           title={label}
+                          // 格子只有键盘处理时，鼠标用户看着能点（cursor-pointer）却点开不了检视器。
+                          onClick={() => {
+                            if (!isMail) setSelectedId((prev) => (prev === unit.id ? null : unit.id));
+                          }}
                           onKeyDown={(event) => {
                             if (event.key === "Enter" || event.key === " ") {
                               event.preventDefault();
@@ -541,11 +558,11 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
           <aside className="grid min-w-0 content-start gap-2 rounded-lg border bg-card/60 p-3">
             {inRange ? (
               <p className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md bg-muted/60 px-2 py-1 font-mono text-[10px]">
-                <span>框选 {rangeUnits.length} 颗</span>
-                <span>工具 {rangeSteps.filter((step) => step.kind === "tool").length} 次</span>
+                <span>{i18n.tf("flow.rangeUnits", { n: rangeUnits.length })}</span>
+                <span>{i18n.tf("flow.rangeTools", { n: rangeSteps.filter((step) => step.kind === "tool").length })}</span>
                 <span>{durationText(rangeMs)}</span>
-                {rangeTokens ? <span>{rangeTokens} tok</span> : null}
-                {rangeUsage.reported ? <span>命中 {hitRateOf(rangeUsage)}</span> : null}
+                {rangeTokens ? <span>{i18n.number(rangeTokens)} tok</span> : null}
+                {rangeUsage.reported ? <span>{i18n.tf("flow.hitValue", { n: hitRateOf(rangeUsage) })}</span> : null}
                 <button
                   type="button"
                   onClick={() => {
@@ -554,7 +571,7 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
                   }}
                   className="ml-auto rounded-full border px-1.5 text-[10px] hover:bg-muted"
                 >
-                  清除
+                  {i18n.t("common.clear")}
                 </button>
               </p>
             ) : null}
@@ -570,22 +587,22 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
         </div>
 
         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-md border bg-muted/30 px-2 py-1.5 font-mono text-[10px]">
-          <span className="text-muted-foreground">缓存命中（本视图 {detail.queue.length} 封信）</span>
+          <span className="text-muted-foreground">{i18n.tf("flow.cacheHitTitle", { n: detail.queue.length })}</span>
           {flow.usage.reported ? (
             <>
-              <span>输入 {grouped(flow.usage.input)}</span>
-              <span>命中 {grouped(flow.usage.cached)}</span>
+              <span>{i18n.tf("flow.inputTokens", { n: flow.usage.input })}</span>
+              <span>{i18n.tf("flow.hitValue", { n: flow.usage.cached })}</span>
               <span className="font-semibold">{hitRateOf(flow.usage)}</span>
             </>
           ) : (
-            <span>这条后端不回报用量</span>
+            <span>{i18n.t("flow.noUsage")}</span>
           )}
           <span className="text-muted-foreground">
-            模型轮 {flow.usage.rounds}（有用量 {flow.usage.reported}）
+            {i18n.tf("flow.modelRounds", { rounds: flow.usage.rounds, reported: flow.usage.reported })}
           </span>
           {usageRows.length > 1 ? (
             <>
-              <span className="text-muted-foreground">分群</span>
+              <span className="text-muted-foreground">{i18n.t("flow.byStream")}</span>
               {usageRows.map(([name, entry]) => (
                 <span key={name} className="inline-flex items-center gap-1" title={name}>
                   <span className="h-1.5 w-1.5 rounded-full" style={{ background: entry.color }} aria-hidden />
@@ -598,12 +615,9 @@ export function StreamFlow({ detail }: { detail: AgentPresenceDetail }) {
         </div>
 
         <p className="text-[10px] leading-relaxed text-muted-foreground">
-          纵轴第一行是权重最高的群，同权重按群名排列。虚线是还没开始处理的邮件，跑起来后才会变成实心长条；
-          斜纹是失败，空心是被插话掐断。轨迹上线前跑完的邮件没有步骤记录，所以不会有音符。
-          框选时窗口外的步骤只是变暗、不会消失，方便对回上下文。按 Esc 清除选择。
+          {i18n.t("flow.legendHint")}
           <br />
-          命中率按 token 加权（命中 ÷ 输入），只算上游同时回报了这两个数的模型轮：被掐断的轮拿不到末尾用量块，
-          QCA 与演示后端不回报用量，都不进分母；轨迹一次最多读 240 步。
+          {i18n.t("flow.hitRateNote")}
         </p>
       </CardContent>
     </Card>

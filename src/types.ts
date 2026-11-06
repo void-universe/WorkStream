@@ -5,7 +5,7 @@ export type User = {
   display_name: string;
   avatar?: string | null;
   at_channel: "virtual" | "real_email";
-  prefs: { theme?: "light" | "dark" | "system"; notify_real_email?: boolean; dreaming_auto?: boolean };
+  prefs: { theme?: "light" | "dark" | "system"; notify_real_email?: boolean; dreaming_auto?: boolean; lang?: string };
   delegate: {
     agent_id: string | null;
     start_at: string | null;
@@ -419,7 +419,14 @@ export type GroupFile = {
   uploaded_name?: string;
 };
 
-export type Probe = { reachable: boolean; checked_at: string; note: string; http_status?: number };
+export type Probe = {
+  reachable: boolean;
+  checked_at: string;
+  note: string;
+  http_status?: number;
+  // 网关探活三态：布尔是真/假，null 是「服务端不出网探它」——内网网关要在浏览器里连。
+  gateway?: { reachable: boolean | null; note: string; http_status?: number };
+};
 
 export type Vm = {
   id: string;
@@ -429,6 +436,7 @@ export type Vm = {
   username: string;
   auth_kind: "password" | "key";
   workdir: string;
+  gateway_url?: string;
   key_source?: string;
   last_probe: Probe | null;
   granted_to?: { stream_id: string; level: string }[];
@@ -443,6 +451,7 @@ export type StreamVm = {
   port?: number;
   username?: string;
   workdir?: string;
+  gateway_url?: string;
   last_probe?: Probe | null;
 };
 

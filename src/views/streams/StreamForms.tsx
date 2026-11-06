@@ -9,6 +9,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { describeError, get, post, type Agent } from "../../api";
 import type { Stream, Vm } from "../../types";
 import { shortUuid } from "../../lib/format";
+import { useI18n } from "../../lib/i18n";
 import { navigate } from "../../lib/route";
 import { CopyButton, Field, Notice } from "../../lib/ui";
 
@@ -23,6 +24,7 @@ export function CreateGroup({
   onCreated: () => Promise<void>;
   onCancel: () => void;
 }) {
+  const i18n = useI18n();
   const [name, setName] = useState("");
   const [policy, setPolicy] = useState<"request" | "invite_only">("request");
   const [announcement, setAnnouncement] = useState("");
@@ -32,7 +34,7 @@ export function CreateGroup({
 
   async function create() {
     if (!name.trim()) {
-      toast.error("给群起个名字。");
+      toast.error(i18n.t("streamForm.needName"));
       return;
     }
     setBusy(true);
@@ -44,11 +46,11 @@ export function CreateGroup({
         agent_ids: pickedAgents,
         vm_ids: pickedVms,
       });
-      toast.success(`群已建好，UUID ${shortUuid(result.stream.id)}`);
+      toast.success(i18n.tf("streamForm.createdToast", { uuid: shortUuid(result.stream.id) }));
       await onCreated();
       navigate(`/stream/${result.stream.id}`);
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy(false);
     }
@@ -57,60 +59,60 @@ export function CreateGroup({
   return (
     <section className="grid gap-3 rounded-lg border bg-card p-3">
       <header className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-        <h2 className="text-sm font-semibold">新建群</h2>
-        <p className="text-[11px] text-muted-foreground">群就是 stream，一个群推进一个项目。</p>
+        <h2 className="text-sm font-semibold">{i18n.t("streamForm.createTitle")}</h2>
+        <p className="text-[11px] text-muted-foreground">{i18n.t("streamForm.createHint")}</p>
       </header>
       <div className="grid gap-3 md:grid-cols-2">
-        <Field label="群名" htmlFor="new-stream-name">
+        <Field label={i18n.t("streamForm.nameLabel")} htmlFor="new-stream-name">
           <Input
             id="new-stream-name"
             value={name}
             maxLength={60}
             onChange={(event) => setName(event.target.value)}
-            placeholder="如：交付周会"
+            placeholder={i18n.t("streamForm.namePlaceholder")}
             className="h-8 text-xs"
           />
         </Field>
-        <Field label="进群方式">
+        <Field label={i18n.t("streamForm.joinPolicyLabel")}>
           <NativeSelect className="h-8 text-xs" value={policy} onChange={(event) => setPolicy(event.target.value as "request" | "invite_only")}>
-            <NativeSelectOption value="request">凭 UUID 申请，群主/管理员审批</NativeSelectOption>
-            <NativeSelectOption value="invite_only">只接受邮箱邀请</NativeSelectOption>
+            <NativeSelectOption value="request">{i18n.t("streamForm.policyRequest")}</NativeSelectOption>
+            <NativeSelectOption value="invite_only">{i18n.t("streamForm.policyInviteOnly")}</NativeSelectOption>
           </NativeSelect>
         </Field>
-        <Field label="首批虚拟员工" hint="建群时就拉进来，之后群里 @ 得到。">
+        <Field label={i18n.t("streamForm.firstAgentsLabel")} hint={i18n.t("streamForm.firstAgentsHint")}>
           <ChipPick
             items={agents.map((agent) => ({ id: agent.id, label: agent.name, color: agent.color }))}
             picked={pickedAgents}
             onToggle={(id) => setPicked((current) => (current.includes(id) ? current.filter((value) => value !== id) : [...current, id]))}
-            empty="还没有虚拟员工"
+            empty={i18n.t("streamForm.noAgents")}
           />
         </Field>
-        <Field label="绑定办公虚拟机" hint="建群时可以先绑一台或多台，也可以之后在群面板里补。">
+        <Field label={i18n.t("streamForm.bindVmLabel")} hint={i18n.t("streamForm.bindVmHint")}>
           <ChipPick
             items={vms.map((vm) => ({ id: vm.id, label: vm.label }))}
             picked={pickedVms}
             onToggle={(id) => setPickedVms((current) => (current.includes(id) ? current.filter((value) => value !== id) : [...current, id]))}
-            empty="还没有登记虚拟机"
+            empty={i18n.t("streamForm.noVms")}
           />
         </Field>
         <div className="md:col-span-2">
-          <Field label="开场公告（可选）">
+          <Field label={i18n.t("streamForm.announcementLabel")}>
             <Textarea
               rows={2}
               value={announcement}
               onChange={(event) => setAnnouncement(event.target.value)}
               className="text-xs"
-              placeholder="本群的交付节奏与验收口径"
+              placeholder={i18n.t("streamForm.announcementPlaceholder")}
             />
           </Field>
         </div>
       </div>
       <div className="flex items-center gap-2">
         <Button size="sm" className="text-xs" onClick={() => void create()} disabled={busy}>
-          {busy ? "建群中…" : "建群"}
+          {busy ? i18n.t("streamForm.creating") : i18n.t("streamForm.createAction")}
         </Button>
         <Button size="sm" variant="ghost" className="text-xs" onClick={onCancel} disabled={busy}>
-          取消
+          {i18n.t("streamForm.cancel")}
         </Button>
       </div>
     </section>
@@ -118,6 +120,7 @@ export function CreateGroup({
 }
 
 export function JoinByUuid({ onDone, onCancel }: { onDone: () => Promise<void>; onCancel: () => void }) {
+  const i18n = useI18n();
   const [uuid, setUuid] = useState("");
   const [preview, setPreview] = useState<{ uuid: string; name: string; join_policy: string; member_count: number } | null>(null);
   const [already, setAlready] = useState(false);
@@ -131,7 +134,7 @@ export function JoinByUuid({ onDone, onCancel }: { onDone: () => Promise<void>; 
       setAlready(result.already_member);
     } catch (error) {
       setPreview(null);
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy(false);
     }
@@ -141,12 +144,12 @@ export function JoinByUuid({ onDone, onCancel }: { onDone: () => Promise<void>; 
     setBusy(true);
     try {
       const result = await post<{ ok: true; already_member?: boolean; status?: string }>("streams.apply", { stream_uuid: uuid.trim() });
-      toast.success(result.already_member ? "你已经在这个群里了" : "申请已递交，等群主或管理员审批");
+      toast.success(result.already_member ? i18n.t("streamForm.alreadyMemberToast") : i18n.t("streamForm.appliedToast"));
       setUuid("");
       setPreview(null);
       await onDone();
     } catch (error) {
-      toast.error(describeError(error));
+      toast.error(describeError(i18n, error));
     } finally {
       setBusy(false);
     }
@@ -155,18 +158,18 @@ export function JoinByUuid({ onDone, onCancel }: { onDone: () => Promise<void>; 
   return (
     <section className="grid gap-3 rounded-lg border bg-card p-3">
       <header className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-        <h2 className="text-sm font-semibold">凭 UUID 进群</h2>
-        <p className="text-[11px] text-muted-foreground">群主把 UUID 发给你，查一下就能申请。</p>
+        <h2 className="text-sm font-semibold">{i18n.t("streamForm.joinTitle")}</h2>
+        <p className="text-[11px] text-muted-foreground">{i18n.t("streamForm.joinHint")}</p>
       </header>
       <div className="flex max-w-xl gap-2">
         <Input
           value={uuid}
           onChange={(event) => setUuid(event.target.value)}
-          placeholder="粘贴群 UUID"
+          placeholder={i18n.t("streamForm.uuidPlaceholder")}
           className="h-8 font-mono text-xs"
         />
         <Button size="sm" variant="outline" className="h-8 shrink-0 text-xs" onClick={() => void lookup()} disabled={busy || uuid.trim().length < 20}>
-          查
+          {i18n.t("streamForm.lookup")}
         </Button>
       </div>
       {preview ? (
@@ -174,25 +177,25 @@ export function JoinByUuid({ onDone, onCancel }: { onDone: () => Promise<void>; 
           <div className="flex items-center gap-2 text-sm">
             <span className="min-w-0 flex-1 truncate">{preview.name}</span>
             <Badge variant="secondary" className="rounded-sm text-[11px]">
-              {preview.member_count} 人 · {preview.join_policy === "invite_only" ? "仅邀请" : "可申请"}
+              {i18n.tf("streamForm.memberCount", { n: preview.member_count })} · {preview.join_policy === "invite_only" ? i18n.t("streamForm.policyInviteShort") : i18n.t("streamForm.policyRequestShort")}
             </Badge>
           </div>
           {already ? (
             <Button size="sm" variant="outline" className="justify-self-start text-xs" onClick={() => navigate(`/stream/${preview.uuid}`)}>
-              我已经在群里，进入
+              {i18n.t("streamForm.alreadyEnter")}
             </Button>
           ) : preview.join_policy === "invite_only" ? (
-            <Notice>这个群只接受邀请，让群主按邮箱邀请你。</Notice>
+            <Notice>{i18n.t("streamForm.inviteOnlyNotice")}</Notice>
           ) : (
             <Button size="sm" className="justify-self-start text-xs" onClick={() => void apply()} disabled={busy}>
-              申请进群
+              {i18n.t("streamForm.applyAction")}
             </Button>
           )}
           <CopyButton value={preview.uuid} label="UUID" className="justify-self-start" />
         </div>
       ) : null}
       <Button size="sm" variant="ghost" className="justify-self-start text-xs" onClick={onCancel} disabled={busy}>
-        取消
+        {i18n.t("streamForm.cancel")}
       </Button>
     </section>
   );
