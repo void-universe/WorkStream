@@ -1,6 +1,7 @@
 // 现场状态：邮箱里正在处理哪条、还排着多少、头像旁的个性签名。
 // 群聊（messages.list 的 presence）和员工详情页（agents.presence）共用这里的查询。
 import { truncate } from "./util.mjs";
+import { systemCopy } from "./copy.mjs";
 import { lightSteps } from "./steps.mjs";
 
 const MAIL_COLUMNS =
@@ -78,8 +79,10 @@ export async function streamPresence(db, streamId, viewerId = null) {
 }
 
 /** 单个员工的现场：资料（不含 Key/提示词/记忆）、所在群、当前任务与最近邮箱记录。
- *  streamIds 用于非主人视角：只回双方共同所在的群，避免泄露别的群的任务内容。 */
-export async function agentPresence(db, agentId, { streamIds = null } = {}) {
+ *  streamIds 用于非主人视角：只回双方共同所在的群，避免泄露别的群的任务内容。
+ *  lang 是读者账号的界面语言，只用于兜底名（群行/主人行已经不在了），由调用方从 user.prefs 取。 */
+export async function agentPresence(db, agentId, { streamIds = null, lang = "zh" } = {}) {
+  const copy = systemCopy(lang);
   const agent = await db.agents.byId(agentId, {
     columns: "id,owner_id,name,role,signature,avatar,color,status,created_at",
   });
@@ -118,12 +121,12 @@ export async function agentPresence(db, agentId, { streamIds = null } = {}) {
   const active = mail.filter((row) => row.status === "queued" || row.status === "running");
   return {
     profile: agent,
-    owner: { id: owner?.id ?? agent.owner_id, display_name: owner?.display_name ?? "已注销用户" },
+    owner: { id: owner?.id ?? agent.owner_id, display_name: owner?.display_name ?? copy.userDeleted() },
     streams: memberships.map((row) => {
       const mine = active.filter((item) => item.stream_id === row.stream_id);
       return {
         stream_id: row.stream_id,
-        name: streamName.get(row.stream_id) ?? "已删除的群",
+        name: streamName.get(row.stream_id) ?? copy.streamDeleted(),
         role: row.role,
         weight: weightOf.get(row.stream_id) ?? 1,
         queued: mine.filter((item) => item.status === "queued").length,
@@ -136,7 +139,7 @@ export async function agentPresence(db, agentId, { streamIds = null } = {}) {
       return {
         id: row.id,
         stream_id: row.stream_id,
-        stream_name: streamName.get(row.stream_id) ?? "已删除的群",
+        stream_name: streamName.get(row.stream_id) ?? copy.streamDeleted(),
         status: row.status,
         priority: row.priority,
         trigger_seq: row.trigger_seq,

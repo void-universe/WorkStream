@@ -19,6 +19,8 @@ import { store } from "../functions/store.mjs";
 import { closeOrphanSteps, createStepWriter } from "../functions/steps.mjs";
 import { askCloudAgent, flattenPrompt, parseAgentId, QcaError } from "../functions/qca.mjs";
 import { completeForAgent } from "../functions/agents.mjs";
+import { demoCopy, systemCopy } from "../functions/copy.mjs";
+import { parseTranscript, renderTranscript } from "../functions/transcript.mjs";
 import { Interrupted, newId } from "../functions/util.mjs";
 import { createFixtureClient } from "./fixture-supabase.mjs";
 import { fileRenderers, registerFileRenderer, renderGroupFile } from "../src/lib/renderers/index.mjs";
@@ -1629,6 +1631,43 @@ async function main() {
   check("全局记忆不进演示模型可摘录的那几块：对照本群长期记忆照样被摘（同一把尺子的两侧）",
     !ownedSlots.quotable.includes("哨标DREAMBLOCK") && ownedSlots.quotable.includes("长期记忆甲"),
     { 摘录: ownedSlots.quotable });
+  step("8d4. 转录行：渲染与反解析同源，演示摘录按读者语言重排");
+  const transcriptRows = [
+    { seq: 3, kind: "message", sender_type: "human", sender_name: "张三", content: "看下这个报错" },
+    { seq: 4, kind: "message", sender_type: "agent", sender_name: "小M", content: "收到，我先复现" },
+    { seq: 5, kind: "system", sender_type: "system", sender_name: "系统", content: "张三上传了文件" },
+    { seq: 6, kind: "message", sender_type: "human", sender_name: "李四", content: "两张截图", attachments: [{}, {}] },
+  ];
+  const transcriptText = renderTranscript(transcriptRows);
+  const parsedRows = parseTranscript(transcriptText);
+  check("反解析把行首记号、类型、名字、正文与附图数都无损带回来",
+    parsedRows.length === transcriptRows.length
+    && parsedRows.every((row, index) => row.marker === (transcriptRows[index].kind === "system" ? "·" : "#")
+      && row.seq === transcriptRows[index].seq
+      && row.sender === transcriptRows[index].sender_name
+      && row.body === transcriptRows[index].content
+      && row.images === (transcriptRows[index].attachments?.length ?? 0)),
+    parsedRows);
+  check("中文重排逐字等于模型看到的那一行（行格式只有一份，不是第二套写法）",
+    parsedRows.every((row, index) => demoCopy("zh").line(row) === transcriptText.split("\n")[index]),
+    parsedRows.map((row) => demoCopy("zh").line(row)));
+  const enLines = parsedRows.map((row) => demoCopy("en").line(row));
+  check("英文重排：[human]/[virtual]/[system] 标签与半角冒号，图片数分单复数",
+    enLines[0] === "#3 [human] 张三: 看下这个报错"
+    && enLines[1] === "#4 [virtual] 小M: 收到，我先复现"
+    && enLines[2] === "·5 [system] 系统: 张三上传了文件"
+    && enLines[3] === "#6 [human] 李四: 两张截图 (2 images)",
+    enLines);
+  check("英文重排的格式里不再有中文标签（名字与正文是数据，标签才是要翻的那一层）",
+    enLines.every((line) => !/\[(人|虚拟|系统)\]/.test(line)), enLines);
+  check("读侧兜底名两种语言各一套，中文那套仍是界面上原有的句子",
+    systemCopy("zh").streamDeleted() === "已删除的群" && systemCopy("en").streamDeleted() === "Deleted group"
+    && systemCopy("zh").userDeleted() === "已注销用户" && systemCopy("en").userDeleted() === "Deactivated user"
+    && systemCopy("zh").agentDeleted() === "已删除的虚拟员工" && systemCopy("en").agentDeleted() === "Deleted virtual employee"
+    && systemCopy("zh").vmDeleted() === "已删除的虚拟机" && systemCopy("en").vmDeleted() === "Deleted VM"
+    && systemCopy("zh").unknownUploader() === "未知" && systemCopy("en").unknownUploader() === "Unknown",
+    { zh: systemCopy("zh").streamDeleted(), en: systemCopy("en").streamDeleted() });
+
   step("8e. 突发排队：同群第二封的上下文里必须带着第一封刚落的回复");
   const burst = async (content) => call("messages.send", {
     token: ana,
@@ -1813,6 +1852,11 @@ async function main() {
   const x13Orphan = await call("streams.invites.mine", { token: deeToken });
   check("孤儿邀请在待办里显示为「已删除的群」而不是空白", (x13Orphan.payload.items ?? [])
     .some((row) => row.stream_name === "已删除的群"), x13Orphan.payload);
+  await call("auth.patch", { token: deeToken, body: { prefs: { lang: "en" } } });
+  const x13OrphanEn = await call("streams.invites.mine", { token: deeToken });
+  check("对照：同一个兜底名按读者语言给（界面停在 en 时读 Deleted group）", (x13OrphanEn.payload.items ?? [])
+    .some((row) => row.stream_name === "Deleted group"), x13OrphanEn.payload);
+  await call("auth.patch", { token: deeToken, body: { prefs: { lang: "zh-Hans" } } });
 
   step("14. 移交、退群与停用：权限跟着群主一起走");
   const g1Dir = await call("streams.get", { token: ana, method: "GET", body: { id: g1id } });
@@ -3492,6 +3536,10 @@ async function main() {
     String(enReplies.at(-1)?.content).includes("one more line for the record")
       && !String(enReplies.at(-1)?.content).includes("请按上面的上下文回应这条任务"),
     String(enReplies.at(-1)?.content).slice(0, 120));
+  check("切 en 后摘录的转录行也换了格式：英文回复里没有 [人]/[虚拟]/[系统]",
+    /\[(human|virtual|system)\]/.test(String(enReplies.at(-1)?.content))
+      && !/\[(人|虚拟|系统)\]/.test(String(enReplies.at(-1)?.content)),
+    String(enReplies.at(-1)?.content).slice(0, 160));
 
   // 落库的系统行同一条口径：语言在写入那一刻按操作者的界面语言定。同一个人改两次公告，
   // 两侧都断死整句——只断一侧的话，「永远回落中文」和「永远英文」都能蒙过去。

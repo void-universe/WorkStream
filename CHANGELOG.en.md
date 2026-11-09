@@ -6,7 +6,7 @@ A version number only holds at the moment a tag is cut: `package.json` is curren
 
 ## Unreleased (1.0.0 candidate)
 
-- Self-check floor: `npm run qa` **858 checks, 0 failures** (the count follows the final summary line; the floor is recorded in [AGENTS.md](AGENTS.md) and may only go up, never down).
+- Self-check floor: `npm run qa` **865 checks, 0 failures** (the count follows the final summary line; the floor is recorded in [AGENTS.md](AGENTS.md) and may only go up, never down).
 - Migrations `sql/0001_init.sql` -> `sql/0014_vm_gateway.sql` are in place alongside the code; the deployed environment's database is still empty and not one of the fourteen migrations has ever been applied -- see "Not finished yet" for why.
 
 ### Supported capabilities

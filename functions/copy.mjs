@@ -4,18 +4,27 @@
 // 代价是群成员语言不一致时，系统行显示的是操作者那一种；彻底的做法是存结构化事件、
 // 由前端按各自 locale 渲染，那要给 messages 加列并回填历史行，所以现在按写入者定。
 // 轨迹 Context 页签里的原始提示词不在这张表：那是服务端内部文本，口径另记，不跟会话文本混一张表。
+// line 是转录行的显示侧重排：上下文那一种写法只有一份（functions/transcript.mjs，它同时是计费口径），
+// 演示模型把它摘录进群时按读者语言重排一遍；中文那一套必须与 transcript.mjs 渲染出的字节相同，
+// 否则中文界面上的摘录就不再是模型真看到的那一行（smoke 里逐字对着）。
+const KIND_EN = { 人: "human", 虚拟: "virtual", 系统: "system" };
+
 const DEMO = {
   zh: {
     ack: (prompt) => `（演示模型）收到，我把这条任务记进队列了：${prompt}`,
     factsLead: "我当前掌握的要点：",
     summaryEmpty: "（演示压缩：本段没有可摘录的发言。）",
     note: "演示模型：不回报思考链与用量",
+    line: ({ marker, seq, kind, sender, body, images }) =>
+      `${marker}${seq} [${kind}] ${sender}：${body}${images ? `（附 ${images} 图）` : ""}`,
   },
   en: {
     ack: (prompt) => `(demo model) Noted, I have queued this task: ${prompt}`,
     factsLead: "What I hold right now:",
     summaryEmpty: "(demo compression: nothing quotable in this window.)",
     note: "demo model: reports neither reasoning nor usage",
+    line: ({ marker, seq, kind, sender, body, images }) =>
+      `${marker}${seq} [${KIND_EN[kind] ?? kind}] ${sender}: ${body}${images ? ` (${images} image${images > 1 ? "s" : ""})` : ""}`,
   },
 };
 
@@ -40,6 +49,14 @@ const SYSTEM = {
     vmGranted: ({ who, label, level }) =>
       `${who ? `${who} 把` : ""}虚拟机「${label}」授权给本群（级别：${level === "sudo" ? "可用 sudo" : "普通用户"}）。`,
     runFailed: ({ agent, code }) => `虚拟员工「${agent}」这次没能完成：${code}。要再试请重新 @ 他。`,
+    // 读侧兜底名：群行/员工行/主人行/虚拟机行已经不在了，这些名字不落库，每次读取时按读者的语言给。
+    // 只有回给界面的字段走这张表；进模型上下文的那几处（dream 的群名、技能出处、工具结果里的群名）
+    // 保持中文写法不动——那是上下文的口径，跟读者界面语言不是一个轴。
+    streamDeleted: () => "已删除的群",
+    userDeleted: () => "已注销用户",
+    agentDeleted: () => "已删除的虚拟员工",
+    vmDeleted: () => "已删除的虚拟机",
+    unknownUploader: () => "未知",
   },
   en: {
     fileUploaded: ({ who, name, size }) => `${who} uploaded the group file “${name}” (${size} bytes).`,
@@ -60,6 +77,11 @@ const SYSTEM = {
     vmGranted: ({ who, label, level }) =>
       `${who ? `${who} granted` : "Granted"} the VM “${label}” to this group (level: ${level === "sudo" ? "sudo" : "member"}).`,
     runFailed: ({ agent, code }) => `The virtual employee “${agent}” could not finish this run: ${code}. @ them again to retry.`,
+    streamDeleted: () => "Deleted group",
+    userDeleted: () => "Deactivated user",
+    agentDeleted: () => "Deleted virtual employee",
+    vmDeleted: () => "Deleted VM",
+    unknownUploader: () => "Unknown",
   },
 };
 

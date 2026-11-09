@@ -1,5 +1,6 @@
 // 轨迹读取：员工详情页的时间线点开某一步时，按这封邮箱信取回全部步骤原文。
 // 权限口径和 agents.presence 一致——员工主人，或这封信所在群的成员；群已删则成员行不在，读不到。
+import { langOf, systemCopy } from "./copy.mjs";
 import { toolSchemas } from "./mcp.mjs";
 import { connectorSchemas } from "./plugins.mjs";
 import { fullSteps } from "./steps.mjs";
@@ -31,7 +32,7 @@ export const actions = {
       mail: {
         id: mail.id,
         agent: agent ? { id: agent.id, name: agent.name, role: agent.role } : null,
-        stream: stream ? { id: stream.id, name: stream.name } : { id: mail.stream_id, name: "已删除的群" },
+        stream: stream ? { id: stream.id, name: stream.name } : { id: mail.stream_id, name: systemCopy(langOf(user.prefs)).streamDeleted() },
         status: mail.status,
         error: mail.error,
         trigger_seq: mail.trigger_seq,

@@ -14,19 +14,27 @@ export function renderTranscript(rows) {
 }
 
 const LINE = /^([#·])(\d+) \[(人|虚拟|系统)\] ([^：]*)：(.*)$/;
+const IMAGES = /（附 (\d+) 图）$/;
 
 // 拆回渲染好的转录。行格式只在这一个文件里定义，反向解析也得在这儿：
 // 别处另写一份正则，渲染改一个字它就静默失配，读出来的是空而不是报错。
+// 反解析要无损（行首记号与附图数都带回来）：演示模型摘录的那几行要按读者的语言重排一遍
+// （functions/copy.mjs 的 line），少带一个字段就等于把摘录改短了，而摘录必须与原文一致。
 export function parseTranscript(text) {
   return String(text).split("\n")
     .map((line) => LINE.exec(line))
     .filter(Boolean)
-    .map(([, , seq, kind, sender, body]) => ({
-      seq: Number(seq),
-      kind,
-      sender,
-      body: body.replace(/（附 \d+ 图）$/, ""),
-    }));
+    .map(([, marker, seq, kind, sender, body]) => {
+      const images = IMAGES.exec(body);
+      return {
+        marker,
+        seq: Number(seq),
+        kind,
+        sender,
+        body: images ? body.slice(0, -images[0].length) : body,
+        images: images ? Number(images[1]) : 0,
+      };
+    });
 }
 
 /** 单条记录渲染后的字符数（不含行间的分隔符，加多少由调用处按用法决定）。 */

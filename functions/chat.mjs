@@ -2,6 +2,7 @@
 import { deliver } from "./accounts.mjs";
 import { AGENT_COLUMNS } from "./agents.mjs";
 import { fireInterrupt } from "./bus.mjs";
+import { langOf, systemCopy } from "./copy.mjs";
 import { requireMembership } from "./perm.mjs";
 import { streamPresence } from "./presence.mjs";
 import { queueDelegateMail } from "./delegate.mjs";
@@ -117,7 +118,7 @@ export const actions = {
       const list = byMessage.get(row.message_id) ?? [];
       list.push({
         agent_id: row.agent_id,
-        agent_name: agentNames.get(row.agent_id) ?? "已删除的虚拟员工",
+        agent_name: agentNames.get(row.agent_id) ?? systemCopy(langOf(user.prefs)).agentDeleted(),
         status: row.status,
         started_at: row.started_at,
         finished_at: row.finished_at,

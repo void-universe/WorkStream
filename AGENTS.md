@@ -5,7 +5,7 @@ WorkStream is a "humans x virtual employees" collaboration desk: a Vite static f
 ## Environment and gates
 
 - **Node must be 22.12+; `engines` is `>=22.12.0 <23`.** The system Node on this machine is v24 and gets stopped by [scripts/check-node.mjs](scripts/check-node.mjs) in `preinstall`/`predev`/`prebuild`. Prefix every `npm`/`npx` call with `export PATH="/d/tools/node22:$PATH"` (portable Node 22).
-- **`npm run qa` is the only full gate** (= check-node + check-schema + smoke). Run it before merging a change; it reports in the thousands: `dev/smoke.mjs` drives the real handler against a local fake database, and **858 checks, 0 failures** is the current floor -- it may only rise.
+- **`npm run qa` is the only full gate** (= check-node + check-schema + smoke). Run it before merging a change; it reports in the thousands: `dev/smoke.mjs` drives the real handler against a local fake database, and **865 checks, 0 failures** is the current floor -- it may only rise.
 - **`npm run build` = `tsc --noEmit && node scripts/build.mjs`**; type checking lives in the build, not in qa.
 - **This repo has no ESLint configuration**: do not run `npx eslint`, do not suggest adding a linter in place of a static cross-check. When an invariant needs to be machine-verifiable, write it the way `dev/check-schema.mjs` is written -- a static reconciliation plus one `check()` in `dev/smoke.mjs`.
 - Start the server with `--worker` (or `WORKSTREAM_WORKER=1`): [functions/worker.mjs](functions/worker.mjs) is the resident scheduler loop; without it progress depends on the frontend polling one slice every 5 seconds, and the inbox stops the moment the page is hidden (see [dev/local-function.mjs:17](dev/local-function.mjs#L17)).

@@ -3,7 +3,7 @@ import { open, seal } from "./sec.mjs";
 import { agentPresence } from "./presence.mjs";
 import { askCloudAgent, checkCloudAccess, parseAgentId } from "./qca.mjs";
 import { BACKENDS, BACKEND_IDS, DEMO_BASE_URL, backendFor } from "./backends.mjs";
-import { demoCopy, demoLang } from "./copy.mjs";
+import { demoCopy, demoLang, langOf } from "./copy.mjs";
 import { parseTranscript } from "./transcript.mjs";
 import { installDefaultSkillsFor, skillsForAgent } from "./skills.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, Interrupted, avatarData, int, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
@@ -40,7 +40,7 @@ export const actions = {
     const streams = await db.members.list([["principal_type", "agent"], ["principal_id", agent.id]], {
       columns: "stream_id,role,joined_at", limit: 100,
     });
-    const presence = await agentPresence(db, agent.id);
+    const presence = await agentPresence(db, agent.id, { lang: langOf(user.prefs) });
     return json({
       ok: true,
       agent,
@@ -73,7 +73,7 @@ export const actions = {
       shared = [...new Set(theirs.filter((row) => mineSet.has(row.stream_id)).map((row) => row.stream_id))];
       if (!shared.length) throw new Halt("agent_profile_forbidden", 403);
     }
-    const detail = await agentPresence(db, agentId, { streamIds: shared });
+    const detail = await agentPresence(db, agentId, { streamIds: shared, lang: langOf(user.prefs) });
     if (!detail) throw new Halt("agent_not_found", 404);
     return json({ ok: true, is_owner: isOwner, ...detail });
   },
@@ -580,7 +580,12 @@ function demoComplete({ messages, tools, summary, lang, quotable }) {
   // 只从 quotable 里摘录：装配那一刻按槽位 id 挑出来的转录与两段记忆，本来就是群里可见的内容。
   // 指令块（守则、替身须知、触发消息）是内部提示，演示模型照抄进正文等于把提示词念给全群听。
   const quotableText = String(quotable ?? "");
-  const facts = (quotableText.match(/^[^\n]{6,120}$/gm) ?? []).slice(-3).map((line) => truncate(line, 80));
+  // 摘录按读者的语言重排一遍：转录行的格式（[人]、全角冒号）是中文写法，原样贴进英文界面
+  // 就是一道中文标签。中文那一套与 transcript.mjs 渲染出的字节相同，所以摘录仍是模型看到的那一行。
+  const facts = (quotableText.match(/^[^\n]{6,120}$/gm) ?? []).slice(-3).map((line) => {
+    const [row] = parseTranscript(line);
+    return truncate(row ? copy.line(row) : line, 80);
+  });
   // 复述的那一句得是群里真说过的话。用户位那一条是内部包装语（composeAsk 只有一句“按上面回应”），
   // 照抄它等于把提示词念进群，所以要回应谁的话从转录里取；转录里没有人的发言才退回用户位。
   const asked = parseTranscript(quotableText).findLast((row) => row.kind === "人")?.body;

@@ -52,7 +52,8 @@ export async function deleteGroupFile(db, { file, userId, role }) {
   return removed;
 }
 
-async function memberDirectory(db, streamId) {
+async function memberDirectory(db, streamId, lang) {
+  const copy = systemCopy(lang);
   const rows = await db.members.list([["stream_id", streamId]], {
     columns: "id,principal_type,principal_id,role,joined_at", limit: 300,
   });
@@ -76,7 +77,7 @@ async function memberDirectory(db, streamId) {
       id: m.principal_id,
       role: m.role,
       joined_at: m.joined_at,
-      display_name: byHuman.get(m.principal_id)?.display_name ?? "已注销员工",
+      display_name: byHuman.get(m.principal_id)?.display_name ?? copy.userDeleted(),
       email: byHuman.get(m.principal_id)?.email ?? "",
       avatar: byHuman.get(m.principal_id)?.avatar ?? null,
     })),
@@ -85,7 +86,7 @@ async function memberDirectory(db, streamId) {
       type: "agent",
       role: m.role,
       joined_at: m.joined_at,
-      agent: byAgent.get(m.principal_id) ?? { id: m.principal_id, name: "已删除的虚拟员工", owner_id: "" },
+      agent: byAgent.get(m.principal_id) ?? { id: m.principal_id, name: copy.agentDeleted(), owner_id: "" },
     })),
   };
 }
@@ -218,7 +219,9 @@ export const actions = {
     if (!stream) throw new Halt("stream_not_found", 404);
     const membership = await humanMembership(db, streamId, user.id);
     if (!membership) throw new Halt("not_stream_member", 403);
-    const directory = await memberDirectory(db, streamId);
+    const lang = langOf(user.prefs);
+    const copy = systemCopy(lang);
+    const directory = await memberDirectory(db, streamId, lang);
     const files = await db.files.list([["stream_id", streamId]], { columns: FILE_COLUMNS, limit: 200 });
     const granted = await db.stream_vms.list([["stream_id", streamId]], { columns: "vm_id,level,id", limit: 50 });
     const vmIds = granted.map((g) => g.vm_id);
@@ -239,7 +242,7 @@ export const actions = {
       files,
       vms: granted.map((g) => ({
         grant_id: g.id, level: g.level,
-        ...(vmRows.find((v) => v.id === g.vm_id) ?? { id: g.vm_id, label: "已删除的虚拟机" }),
+        ...(vmRows.find((v) => v.id === g.vm_id) ?? { id: g.vm_id, label: copy.vmDeleted() }),
       })),
       requests: membership.role === "owner" || membership.role === "admin" ? open : [],
     });
@@ -428,7 +431,8 @@ export const actions = {
     const ids = rows.map((r) => r.stream_id);
     const streams = ids.length ? await db.streams.list([["id", ids]], { columns: "id,name,owner_id", limit: 50 }) : [];
     const names = new Map(streams.map((s) => [s.id, s.name]));
-    return json({ ok: true, items: rows.map((r) => ({ ...r, stream_name: names.get(r.stream_id) ?? "已删除的群" })) });
+    const copy = systemCopy(langOf(user.prefs));
+    return json({ ok: true, items: rows.map((r) => ({ ...r, stream_name: names.get(r.stream_id) ?? copy.streamDeleted() })) });
   },
 
   async "streams.invites.accept"({ db, user, body }) {
@@ -576,7 +580,7 @@ export const actions = {
     const rows = await db.files.list([["stream_id", streamId]], { columns: FILE_COLUMNS, order: ["created_at", { ascending: false }], limit: 200 });
     const owners = await db.users.list([["id", rows.map((r) => r.uploaded_by)]], { columns: "id,display_name", limit: 200 });
     const names = new Map(owners.map((o) => [o.id, o.display_name]));
-    return json({ ok: true, items: rows.map((r) => ({ ...r, uploaded_name: names.get(r.uploaded_by) ?? "未知" })) });
+    return json({ ok: true, items: rows.map((r) => ({ ...r, uploaded_name: names.get(r.uploaded_by) ?? systemCopy(langOf(user.prefs)).unknownUploader() })) });
   },
 
   async "files.upload"({ db, user, body }) {
