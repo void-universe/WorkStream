@@ -545,6 +545,7 @@ for (const [code, where] of composed) {
 const DOC_PAIRS = [
   ["README.zh.md", "README.md"],
   ["CHANGELOG.md", "CHANGELOG.en.md"],
+  ["docs/guide.md", "docs/guide.en.md"],
   ["docs/arch/scheduler.md", "docs/arch/scheduler.en.md"],
 ];
 // 单语文档必须在这里登记，并说得出为什么只有一份。
