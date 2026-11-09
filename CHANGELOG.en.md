@@ -2,9 +2,9 @@
 
 **English** · [简体中文](CHANGELOG.md)
 
-A version number only holds at the moment a tag is cut: `package.json` is currently `0.1.0`, the repo has no tags at all, so the first section below is called **Unreleased (1.0.0 candidate)** -- it records the capabilities already merged into `main` and already pinned into `npm run qa`. The source of truth for feature behavior itself remains [README.md](README.md) and [docs/arch/scheduler.en.md](docs/arch/scheduler.en.md); this file only records "which merge brought what" and "what is still missing", without copying a second manual.
+A version number only holds at the moment a tag is cut: `package.json` is currently `0.1.1`, the newest tag is `v0.1.1`, so the first section below is called **0.1.1 (1.0.0 candidate)** -- it records the capabilities already merged into `main` and already pinned into `npm run qa`. The source of truth for feature behavior itself remains [README.md](README.md) and [docs/arch/scheduler.en.md](docs/arch/scheduler.en.md); this file only records "which merge brought what" and "what is still missing", without copying a second manual.
 
-## Unreleased (1.0.0 candidate)
+## 0.1.1 (1.0.0 candidate)
 
 - Self-check floor: `npm run qa` **865 checks, 0 failures** (the count follows the final summary line; the floor is recorded in [AGENTS.md](AGENTS.md) and may only go up, never down).
 - Migrations `sql/0001_init.sql` -> `sql/0014_vm_gateway.sql` are in place alongside the code; the deployed environment's database is still empty and not one of the fourteen migrations has ever been applied -- see "Not finished yet" for why.
@@ -48,7 +48,7 @@ A version number only holds at the moment a tag is cut: `package.json` is curren
 | 6 | `install.sh` server-side install script | Not started |
 | 7 | Docs = derived artifacts of the source: gen + paired `--check` gate (tool list / action list / knob list) | Not started; these lists are kept in sync by hand for now |
 | 8 | `docs/postmortem`: three admission rules per incident + every guardrail pointing at one re-runnable gate | Not started |
-| 9 | Version numbers and tags: `package.json` is still `0.1.0` and the first section of this file is still Unreleased | Can only move after someone decides "1.0.0 is exactly these" |
+| 9 | Deciding what 1.0.0 is: `package.json` and the newest tag are already at `0.1.1` | Can only move after someone decides "1.0.0 is exactly these" |
 | 10 | Dictionaries for the other 14 languages | The UI copy has already been extracted (dictionary of 1278 keys, the four key sets agree); translating whole sentences is all that remains; flip `complete` to `true` and register the dictionary file and the option unlocks itself - conversely, no dictionary, no option in the UI |
 | 11 | Inline marking of server-generated text on non-Chinese UIs | The system lines in a stream and the demo employee's conversational replies already follow the actor's UI language (the Chinese and English template sets in `functions/copy.mjs`); what is left -- virtual-inbox mail, compaction and merge summaries -- is still Chinese, disclosed today with one central sentence on the settings page, and should be marked in place when it appears in an English UI, which requires the backend to carry an origin marker on the message. One more thing: a system line's language is decided by its writer, so when the members of a stream do not share a language the line shows the actor's; the thorough fix is storing a structured event and rendering it per viewer locale, which needs a column on `messages` plus a backfill of historical rows |
 | 12 | The right-to-left batch: `<html dir>` and a mirrored layout, shipped together with Arabic and Hebrew | Not started; it is the precondition for shipping those two languages; currently `dir` is always `ltr` |
