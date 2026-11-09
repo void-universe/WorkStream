@@ -10,7 +10,7 @@ import { executeTool, INTERNAL_TOOL_NAMES } from "../functions/mcp.mjs";
 import { connectorToolDefs } from "../functions/plugins.mjs";
 import { catchUp, clockToMs, dueOwnerIds, fireDueSchedules, nextOccurrence, upcomingOccurrences } from "../functions/cron.mjs";
 import { isUpdateAvailable } from "../functions/registries.mjs";
-import { CACHE_BREAKPOINT_ID, DEMO_QUOTABLE_SLOTS, PROMPT_SECTIONS, composeSystemPrompt } from "../functions/prompt.mjs";
+import { CACHE_BREAKPOINT_ID, PROMPT_SECTIONS, composeSystemPrompt } from "../functions/prompt.mjs";
 import { delegateWindow } from "../functions/delegate.mjs";
 import { BACKENDS, BACKEND_IDS, DEMO_BASE_URL, backendFor, validateBackends } from "../functions/backends.mjs";
 import { LOCALE_IDS } from "../functions/locales.mjs";
@@ -1553,19 +1553,6 @@ async function main() {
     composed.system.includes("调用 search_history / read_window 工具")
     && composed.system.includes("需要时用 set_signature 更新")
     && !composed.system.includes("本次由云端 Agent 作答"), {});
-  // 演示模型的可摘录块认槽位 id、在装配这一刻单独交出去：事后从 system 里按空行切块切不准，
-  // 群消息正文本来就可能带空行。清单里的 id 打错或块被删，quotable 会静默变成空串——摘录跟着消失。
-  const quotableIds = composed.promptSlots.map(([id]) => id).filter((id) => DEMO_QUOTABLE_SLOTS.includes(id));
-  check("演示模型可摘录的槽位都在表里，交出去的那一份恰好是这几块、内部指令一个字都不带",
-    DEMO_QUOTABLE_SLOTS.every((id) => PROMPT_SECTIONS.some((section) => section.id === id))
-    && quotableIds.join(",") === "memory.common,transcript,memory.stream"
-    && composed.quotable.length === composed.promptSlots
-      .filter(([id]) => DEMO_QUOTABLE_SLOTS.includes(id))
-      .reduce((total, [, len], index) => total + len + (index ? 1 : 0), 0)
-    && composed.quotable.includes("长期记忆甲") && composed.quotable.includes("窗口里的一条") && composed.quotable.includes("本群记忆甲")
-    && !composed.quotable.includes("一条守则") && !composed.quotable.includes("一句签名") && !composed.quotable.includes("@小S 干活"),
-    { 可摘录: quotableIds, 字数: composed.quotable.length });
-
   step("8d3. 后端清单：这条通道吃不吃工具是字段，不是注释");
   check("三条通道的能力位都在表上，只有不吃工具的那条带措辞",
     BACKENDS.map((entry) => entry.id).join(",") === "openai,demo,qca"
@@ -1626,11 +1613,6 @@ async function main() {
     && PROMPT_SECTIONS.find((section) => section.id === "memory.owner")?.volatile === false
     && CACHE_BREAKPOINT_ID === "memory.common",
     { 槽位: ownedSlots.promptSlots.map(([id]) => id) });
-  // 全局记忆看着和两段记忆同类，但它是跨群归并出来的结论，在这个群里念出来就是串群——
-  // 所以它必须在可摘录清单外，而本群那两段必须在清单内。
-  check("全局记忆不进演示模型可摘录的那几块：对照本群长期记忆照样被摘（同一把尺子的两侧）",
-    !ownedSlots.quotable.includes("哨标DREAMBLOCK") && ownedSlots.quotable.includes("长期记忆甲"),
-    { 摘录: ownedSlots.quotable });
   step("8d4. 转录行：渲染与反解析同源，演示摘录按读者语言重排");
   const transcriptRows = [
     { seq: 3, kind: "message", sender_type: "human", sender_name: "张三", content: "看下这个报错" },
@@ -1667,6 +1649,34 @@ async function main() {
     && systemCopy("zh").vmDeleted() === "已删除的虚拟机" && systemCopy("en").vmDeleted() === "Deleted VM"
     && systemCopy("zh").unknownUploader() === "未知" && systemCopy("en").unknownUploader() === "Unknown",
     { zh: systemCopy("zh").streamDeleted(), en: systemCopy("en").streamDeleted() });
+  // 摘录只取窗口里的真人发言：虚拟员工自己的回帖是多行的，里面还引着上一轮摘录的转录行与记忆行。
+  // 按正文扫行会把这些二次转述当成新事实（回帖复读上一条回帖），内部提示块也会一起被念进群。
+  const demoWindow = [
+    { seq: 3, sender_type: "human", sender_name: "张三", content: "看下这个报错" },
+    { seq: 4, sender_type: "agent", sender_name: "小审", content: "上一条摘录：\n#9 [人] 赵六：旧结论\n- 旧记忆里的结论" },
+    { seq: 5, sender_type: "human", sender_name: "李四", content: "两张截图", attachments: [{}, {}] },
+    { seq: 7, sender_type: "human", sender_name: "王五", content: "先看日志" },
+  ];
+  const demoAgent = { owner_id: "u-demo", name: "小审", backend: "openai", api_base_url: DEMO_BASE_URL, model: "demo" };
+  const demoReply = async (lang) => (await completeForAgent({
+    db: { users: { byId: async () => ({ id: "u-demo", prefs: { lang } }) } },
+    agent: demoAgent,
+    messages: [{ role: "user", content: "请按上面的上下文回应这条任务。" }],
+    window: demoWindow,
+  })).content;
+  const zhDemo = await demoReply("zh-Hans");
+  check("演示摘录只取窗口里的真人发言：回帖里二次转述的转录行与记忆行不再被当成事实",
+    zhDemo.includes("#3 [人] 张三：看下这个报错")
+    && zhDemo.includes("#5 [人] 李四：两张截图（附 2 图）")
+    && zhDemo.includes("#7 [人] 王五：先看日志")
+    && !zhDemo.includes("旧结论") && !zhDemo.includes("旧记忆") && !zhDemo.includes("上一条摘录"),
+    zhDemo);
+  const enDemo = await demoReply("en");
+  check("对照：英文界面下的摘录同样只取真人发言，行内标签全是英文",
+    enDemo.includes("#3 [human] 张三: 看下这个报错")
+    && enDemo.includes("#5 [human] 李四: 两张截图 (2 images)")
+    && !/\[(人|虚拟|系统)\]/.test(enDemo) && !enDemo.includes("旧结论"),
+    enDemo);
 
   step("8e. 突发排队：同群第二封的上下文里必须带着第一封刚落的回复");
   const burst = async (content) => call("messages.send", {

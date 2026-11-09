@@ -464,9 +464,9 @@ export async function runTask({ db, env, mailId }) {
         // 这一步实际落下的提示词槽位与各自字符数：命中率掉了要对得出是哪一块动了。
         // 单列一个字段而不是塞进 context——那块有 800 字上限，槽位清单不该被它挤掉。
         promptSlots: built.promptSlots,
-        // 演示模型只准摘录这几块（prompt.mjs 按槽位 id 挑好的），别让它回头去拆装配好的正文：
-        // 块与块之间是空行，而群消息正文本来就可能带空行，按空行切会把转录从中间切断。
-        quotable: built.quotable,
+        // 演示模型的摘录只许取自这一轮真正进上下文的那些记录：给的是行本身，
+        // 不是拼好的正文，内部提示块与上一轮回帖里的二次转述都到不了它手里。
+        window: prepared.window,
         contextNote: {
           from: prepared.window[0]?.seq ?? null,
           to: prepared.window.at(-1)?.seq ?? null,
@@ -689,12 +689,11 @@ async function imageParts(db, message, limit = 4) {
  *  后端条目在这里解析一次：措辞（吃不吃工具）与传输走的是同一份判定，不能各查各的。 */
 async function buildContext({ db, agent, stream, prepared, trigger, skills, steerNote, delegate, cron }) {
   const images = await imageParts(db, trigger);
-  const { system, promptSlots, quotable } = composeSystemPrompt({
+  const { system, promptSlots } = composeSystemPrompt({
     agent, stream, prepared, trigger, skills, steerNote, delegate, cron, backend: backendFor(agent),
   });
   return {
     promptSlots,
-    quotable,
     messages: [
       { role: "system", content: system },
       { role: "user", content: composeAsk({ images }) },
@@ -894,7 +893,7 @@ async function compress({ db, env, agent, stream, prepared, key, trace }) {
 
 /** 工具回路：最多两轮，工具执行都走内部 MCP 实现，作用域锁死在 (agent, stream, owner)。
  *  每一轮模型调用和每一次工具调用都落一条 run_steps，员工详情页的时间线读的就是它。 */
-async function withTools({ db, env, agent, stream, key, messages, watch, trace, contextNote, promptSlots, quotable }) {
+async function withTools({ db, env, agent, stream, key, messages, watch, trace, contextNote, promptSlots, window }) {
   const started = Date.now();
   const backend = backendFor(agent);
   // 主人启用中的插件工具并进这一轮的清单；重名时内置优先，插件让位——让位不是丢弃，
@@ -925,7 +924,7 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
         tools,
         timeoutMs: 180000,
         onInterrupt: watch,
-        quotable,
+        window,
       });
     } catch (error) {
       const preempted = error instanceof Interrupted;
