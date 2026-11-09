@@ -1,5 +1,6 @@
 // 调度与虚拟员工执行引擎：邮箱 FIFO + 按权重的时间片、上下文压缩、MCP 工具回路。
 import { AGENT_COLUMNS, AGENT_SECRET_COLUMNS, completeForAgent, upstreamCode } from "./agents.mjs";
+import { demoCopy, ownerLang, systemCopy } from "./copy.mjs";
 import { backendFor } from "./backends.mjs";
 import { armInterrupt, disarmInterrupt, fireInterrupt } from "./bus.mjs";
 import { shapeMessage, streamWeight } from "./chat.mjs";
@@ -463,6 +464,9 @@ export async function runTask({ db, env, mailId }) {
         // 这一步实际落下的提示词槽位与各自字符数：命中率掉了要对得出是哪一块动了。
         // 单列一个字段而不是塞进 context——那块有 800 字上限，槽位清单不该被它挤掉。
         promptSlots: built.promptSlots,
+        // 演示模型只准摘录这几块（prompt.mjs 按槽位 id 挑好的），别让它回头去拆装配好的正文：
+        // 块与块之间是空行，而群消息正文本来就可能带空行，按空行切会把转录从中间切断。
+        quotable: built.quotable,
         contextNote: {
           from: prepared.window[0]?.seq ?? null,
           to: prepared.window.at(-1)?.seq ?? null,
@@ -479,7 +483,7 @@ export async function runTask({ db, env, mailId }) {
           streamId: stream.id, senderType: "system", senderId: agent.owner_id, senderName: "系统",
           // 邮箱里没有自动重投：claim 只从 queued 走 CAS，跑坏的这封直接结在 failed。
           // 所以这句要说清下一步在谁手里——重新 @ 才会再生成一封，而不是等它自己缓过来。
-          content: `虚拟员工「${agent.name}」这次没能完成：${code}。要再试请重新 @ 他。`,
+          content: systemCopy(await ownerLang(db, agent.owner_id)).runFailed({ agent: agent.name, code }),
         });
         return { status: "failed", error: String(code) };
       }
@@ -685,11 +689,12 @@ async function imageParts(db, message, limit = 4) {
  *  后端条目在这里解析一次：措辞（吃不吃工具）与传输走的是同一份判定，不能各查各的。 */
 async function buildContext({ db, agent, stream, prepared, trigger, skills, steerNote, delegate, cron }) {
   const images = await imageParts(db, trigger);
-  const { system, promptSlots } = composeSystemPrompt({
+  const { system, promptSlots, quotable } = composeSystemPrompt({
     agent, stream, prepared, trigger, skills, steerNote, delegate, cron, backend: backendFor(agent),
   });
   return {
     promptSlots,
+    quotable,
     messages: [
       { role: "system", content: system },
       { role: "user", content: composeAsk({ images }) },
@@ -889,7 +894,7 @@ async function compress({ db, env, agent, stream, prepared, key, trace }) {
 
 /** 工具回路：最多两轮，工具执行都走内部 MCP 实现，作用域锁死在 (agent, stream, owner)。
  *  每一轮模型调用和每一次工具调用都落一条 run_steps，员工详情页的时间线读的就是它。 */
-async function withTools({ db, env, agent, stream, key, messages, watch, trace, contextNote, promptSlots }) {
+async function withTools({ db, env, agent, stream, key, messages, watch, trace, contextNote, promptSlots, quotable }) {
   const started = Date.now();
   const backend = backendFor(agent);
   // 主人启用中的插件工具并进这一轮的清单；重名时内置优先，插件让位——让位不是丢弃，
@@ -920,6 +925,7 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
         tools,
         timeoutMs: 180000,
         onInterrupt: watch,
+        quotable,
       });
     } catch (error) {
       const preempted = error instanceof Interrupted;
@@ -943,7 +949,7 @@ async function withTools({ db, env, agent, stream, key, messages, watch, trace, 
         context,
         prompt_slots: promptSlots,
         tool_names: (answer.tool_calls ?? []).map((call) => call?.function?.name).join(", "),
-        note: (answer.mode === "demo" ? "演示模型：不回报思考链与用量" : `finish_reason：${answer.finish_reason ?? "—"}`) + shadowNote,
+        note: (answer.mode === "demo" ? demoCopy(await ownerLang(db, agent.owner_id)).note : `finish_reason：${answer.finish_reason ?? "—"}`) + shadowNote,
       },
       usage: answer.usage,
       firstTokenMs: answer.first_token_ms,

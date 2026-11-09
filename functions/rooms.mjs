@@ -1,6 +1,7 @@
 // 群（stream）：UUID 申请进群、邀请、成员角色、公告、群文件、消息与 @ 派发。
 import { deliver } from "./accounts.mjs";
 import { AGENT_COLUMNS } from "./agents.mjs";
+import { langOf, systemCopy } from "./copy.mjs";
 import { delegateStatus } from "./delegate.mjs";
 import { STREAM_COLUMNS, humanMembership, requireMembership, requireRole } from "./perm.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, email as emailOf, int, json, newId, now, oneOf, text, uuid } from "./util.mjs";
@@ -12,7 +13,7 @@ const FILE_COLUMNS = "id,stream_id,name,size_bytes,content_type,store,uploaded_b
 export const MAX_FILE_BYTES = 400_000;
 
 /** 群文件写入统一走这里：UI 上传与 MCP 工具共用同一套命名/大小规则。 */
-export async function createGroupFile(db, { streamId, userId, userName, name, contentType, content }) {
+export async function createGroupFile(db, { streamId, userId, userName, lang, name, contentType, content }) {
   const cleanName = text(name, { max: 120, name: "name" });
   if (cleanName.includes("/") || cleanName.includes("\\") || cleanName.startsWith(".")) {
     throw new Halt("invalid_file_name", 400);
@@ -35,7 +36,7 @@ export async function createGroupFile(db, { streamId, userId, userName, name, co
   if (!created) throw new Halt("file_write_failed", 503);
   await insertMessage(db, {
     streamId, senderType: "system", senderId: userId, senderName: "系统",
-    content: `${userName} 上传了群文件「${cleanName}」（${size} 字节）。`,
+    content: systemCopy(lang).fileUploaded({ who: userName, name: cleanName, size }),
   });
   return created;
 }
@@ -206,7 +207,7 @@ export const actions = {
     }
     await insertMessage(db, {
       streamId: id, senderType: "system", senderId: user.id, senderName: "系统",
-      content: `${user.display_name} 创建了群「${name}」。群 UUID：${id}`,
+      content: systemCopy(langOf(user.prefs)).streamCreated({ who: user.display_name, name, id }),
     });
     return json({ ok: true, stream: await db.streams.byId(id, { columns: STREAM_COLUMNS }) });
   },
@@ -273,9 +274,10 @@ export const actions = {
     const content = text(body.content ?? "", { max: 4000, required: false });
     const updated = await db.streams.claim([["id", streamId]], { announcement: content, announcement_at: now() });
     if (!updated) throw new Halt("stream_write_failed", 503);
+    const copy = systemCopy(langOf(user.prefs));
     await insertMessage(db, {
       streamId, senderType: "system", senderId: user.id, senderName: "系统",
-      content: content ? `群公告已更新：${content}` : "群公告已清空。",
+      content: content ? copy.announcementSet({ content }) : copy.announcementCleared(),
     });
     return json({ ok: true, content });
   },
@@ -311,7 +313,7 @@ export const actions = {
     await db.streams.patch([["id", streamId]], { owner_id: target.principal_id, updated_at: now() });
     await insertMessage(db, {
       streamId, senderType: "system", senderId: user.id, senderName: "系统",
-      content: "群主已移交。",
+      content: systemCopy(langOf(user.prefs)).ownerTransferred(),
     });
     return json({ ok: true });
   },
@@ -377,11 +379,12 @@ export const actions = {
     await db.requests.claim([["id", requestId], ["status", "pending"]], {
       status: approve ? "approved" : "rejected", handled_by: user.id, handled_at: now(),
     });
+    const decided = systemCopy(langOf(user.prefs));
     await insertMessage(db, {
       streamId: request.stream_id, senderType: "system", senderId: user.id, senderName: "系统",
       content: approve
-        ? `${request.applicant_name ?? "新成员"} 已加入群。`
-        : `${request.applicant_name ?? "申请"} 的进群申请被拒绝。`,
+        ? decided.memberJoined({ who: request.applicant_name })
+        : decided.joinRejected({ who: request.applicant_name }),
     });
     return json({ ok: true, status: approve ? "approved" : "rejected" });
   },
@@ -472,7 +475,7 @@ export const actions = {
     }, { columns: "id" });
     await insertMessage(db, {
       streamId, senderType: "system", senderId: user.id, senderName: "系统",
-      content: `${user.display_name} 把虚拟员工「${agent.name}」拉进了群。`,
+      content: systemCopy(langOf(user.prefs)).agentAdded({ who: user.display_name, agent: agent.name }),
     });
     return json({ ok: true, agent });
   },
@@ -488,9 +491,10 @@ export const actions = {
     const role = oneOf(body.role, ["admin", "member"], "role");
     const updated = await db.members.claim([["id", membership.id]], { role });
     if (!updated) throw new Halt("member_write_failed", 503);
+    const ranks = systemCopy(langOf(user.prefs));
     await insertMessage(db, {
       streamId, senderType: "system", senderId: user.id, senderName: "系统",
-      content: role === "admin" ? "成员已被提升为管理员。" : "管理员已被降为普通成员。",
+      content: role === "admin" ? ranks.promotedAdmin() : ranks.demotedMember(),
     });
     return json({ ok: true, role });
   },
@@ -515,9 +519,10 @@ export const actions = {
     if (membership.principal_type === "agent") {
       await db.qca_sessions.removeAll([["agent_id", membership.principal_id], ["stream_id", streamId]]);
     }
+    const removed = systemCopy(langOf(user.prefs));
     await insertMessage(db, {
       streamId, senderType: "system", senderId: user.id, senderName: "系统",
-      content: `${membership.principal_type === "agent" ? "虚拟员工" : "成员"}已被移出群。`,
+      content: membership.principal_type === "agent" ? removed.agentRemoved() : removed.memberRemoved(),
     });
     return json({ ok: true, removed: membership.id });
   },
@@ -581,6 +586,7 @@ export const actions = {
       streamId,
       userId: user.id,
       userName: user.display_name,
+      lang: langOf(user.prefs),
       name: body.name,
       contentType: body.content_type ?? "text/plain",
       content: body.content,

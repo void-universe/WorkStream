@@ -10,7 +10,7 @@ import { executeTool, INTERNAL_TOOL_NAMES } from "../functions/mcp.mjs";
 import { connectorToolDefs } from "../functions/plugins.mjs";
 import { catchUp, clockToMs, dueOwnerIds, fireDueSchedules, nextOccurrence, upcomingOccurrences } from "../functions/cron.mjs";
 import { isUpdateAvailable } from "../functions/registries.mjs";
-import { CACHE_BREAKPOINT_ID, DEMO_QUOTABLE_HEADERS, PROMPT_SECTIONS, composeSystemPrompt } from "../functions/prompt.mjs";
+import { CACHE_BREAKPOINT_ID, DEMO_QUOTABLE_SLOTS, PROMPT_SECTIONS, composeSystemPrompt } from "../functions/prompt.mjs";
 import { delegateWindow } from "../functions/delegate.mjs";
 import { BACKENDS, BACKEND_IDS, DEMO_BASE_URL, backendFor, validateBackends } from "../functions/backends.mjs";
 import { LOCALE_IDS } from "../functions/locales.mjs";
@@ -1551,10 +1551,18 @@ async function main() {
     composed.system.includes("调用 search_history / read_window 工具")
     && composed.system.includes("需要时用 set_signature 更新")
     && !composed.system.includes("本次由云端 Agent 作答"), {});
-  // 演示模型按抬头挑可摘录的块：改了块措辞没改这份清单，过滤会静默失效、内部指令又会被念进群。
-  check("演示模型允许摘录的抬头都真的出现在装配出来的正文里",
-    DEMO_QUOTABLE_HEADERS.every((header) => composed.system.includes(header)),
-    { 缺: DEMO_QUOTABLE_HEADERS.filter((header) => !composed.system.includes(header)) });
+  // 演示模型的可摘录块认槽位 id、在装配这一刻单独交出去：事后从 system 里按空行切块切不准，
+  // 群消息正文本来就可能带空行。清单里的 id 打错或块被删，quotable 会静默变成空串——摘录跟着消失。
+  const quotableIds = composed.promptSlots.map(([id]) => id).filter((id) => DEMO_QUOTABLE_SLOTS.includes(id));
+  check("演示模型可摘录的槽位都在表里，交出去的那一份恰好是这几块、内部指令一个字都不带",
+    DEMO_QUOTABLE_SLOTS.every((id) => PROMPT_SECTIONS.some((section) => section.id === id))
+    && quotableIds.join(",") === "memory.common,transcript,memory.stream"
+    && composed.quotable.length === composed.promptSlots
+      .filter(([id]) => DEMO_QUOTABLE_SLOTS.includes(id))
+      .reduce((total, [, len], index) => total + len + (index ? 1 : 0), 0)
+    && composed.quotable.includes("长期记忆甲") && composed.quotable.includes("窗口里的一条") && composed.quotable.includes("本群记忆甲")
+    && !composed.quotable.includes("一条守则") && !composed.quotable.includes("一句签名") && !composed.quotable.includes("@小S 干活"),
+    { 可摘录: quotableIds, 字数: composed.quotable.length });
 
   step("8d3. 后端清单：这条通道吃不吃工具是字段，不是注释");
   check("三条通道的能力位都在表上，只有不吃工具的那条带措辞",
@@ -1616,14 +1624,11 @@ async function main() {
     && PROMPT_SECTIONS.find((section) => section.id === "memory.owner")?.volatile === false
     && CACHE_BREAKPOINT_ID === "memory.common",
     { 槽位: ownedSlots.promptSlots.map(([id]) => id) });
-  // 演示模型按抬头挑可摘录的块：全局记忆看着和两段记忆同类，但它是跨群归并出来的结论，
-  // 在这个群里念出来就是串群——所以它必须在清单外，而本群那两段必须在清单内。
-  const demoPick = (systemText) => systemText.split("\n\n")
-    .filter((block) => DEMO_QUOTABLE_HEADERS.some((header) => block.startsWith(header)))
-    .join("\n");
+  // 全局记忆看着和两段记忆同类，但它是跨群归并出来的结论，在这个群里念出来就是串群——
+  // 所以它必须在可摘录清单外，而本群那两段必须在清单内。
   check("全局记忆不进演示模型可摘录的那几块：对照本群长期记忆照样被摘（同一把尺子的两侧）",
-    !demoPick(ownedSlots.system).includes("哨标DREAMBLOCK") && demoPick(ownedSlots.system).includes("长期记忆甲"),
-    { 摘录: demoPick(ownedSlots.system) });
+    !ownedSlots.quotable.includes("哨标DREAMBLOCK") && ownedSlots.quotable.includes("长期记忆甲"),
+    { 摘录: ownedSlots.quotable });
   step("8e. 突发排队：同群第二封的上下文里必须带着第一封刚落的回复");
   const burst = async (content) => call("messages.send", {
     token: ana,
@@ -3436,12 +3441,73 @@ async function main() {
   check("回复带着 on_behalf_of，界面据此标出是代答", dReply?.on_behalf_of === linId, dReply);
   check("代答正文不念内部指令：替身须知和触发消息都留在提示词里",
     !String(dReply?.content).includes("这一轮你是") && !String(dReply?.content).includes("上一条 @ 你的消息"), dReply?.content);
+  // 用户位那一条永远是内部包装语（composeAsk 只有一句“请按上面的上下文回应这条任务。”），
+  // 复述它等于把提示词念进群，所以要回应谁的话得从转录里取。判别器是后半句：
+  // 前半句在摘录里也会出现，只看它会漏掉「照抄包装语」这个回归。
+  check("代答复述的是群里那句话，用户位的包装语没进群",
+    String(dReply?.content).includes("@林 这个报错你帮我看下")
+      && !String(dReply?.content).includes("请按上面的上下文回应这条任务"), dReply?.content);
   check("对照：转录与记忆照旧摘录得出来（演示模型仍能证明上下文进得去）",
     /建档：|韩：@林/.test(String(dReply?.content)), dReply?.content);
   // 演示模型会把触发消息原样摘录进回复，所以这条回复天然又 @ 了主人：正是自我触发的现场。
   const dLoopMail = await db.mail.list([["agent_id", standInId], ["stream_id", dStreamId]], { columns: "id,status,message_id", limit: 10 });
   check("替身的回复里 @ 了主人：不再给自己派活，队列里没有第二封",
     dLoopMail.length === 1, dLoopMail);
+
+  // 演示模型那两句会话体文本跟 owner 的界面语言走：切 en 后回帖起头与轨迹 note 一起换，
+  // 切回 zh 又一起换回来——两侧同时断言，「语言没接上、永远回落中文」就过不了。
+  const standInReplies = async () => ((await call("messages.list", {
+    token: hanToken, method: "GET", body: { stream_id: dStreamId },
+  })).payload.items ?? []).filter((m) => m.sender_type === "agent");
+  const enBefore = (await standInReplies()).filter((m) => String(m.content).startsWith("(demo model)")).length;
+  await call("auth.patch", { token: linToken, body: { prefs: { lang: "en" } } });
+  const enSend = await call("messages.send", {
+    token: hanToken,
+    body: { stream_id: dStreamId, content: "@林 one more line for the record", mentions: [{ type: "human", id: linId }] },
+  });
+  await call("scheduler.tick", { token: linToken, method: "GET" });
+  const enReplies = await standInReplies();
+  check("owner 界面切 en：演示回帖起头换英文模板",
+    enReplies.filter((m) => String(m.content).startsWith("(demo model)")).length === enBefore + 1,
+    enReplies.map((m) => String(m.content).slice(0, 40)));
+  const enMail = await db.mail.list([["message_id", enSend.payload.message?.id]], { columns: "id", limit: 1 });
+  const enSteps = await db.run_steps.list([["mail_id", enMail[0]?.id]], {
+    columns: "kind,detail", order: ["seq", { ascending: true }],
+  });
+  check("同一轮的轨迹 note 也读英文：两句会话体一起换",
+    enSteps.some((s) => s.kind === "model" && String(s.detail?.note ?? "").startsWith("demo model: reports neither")),
+    enSteps.map((s) => s.detail?.note));
+  await call("auth.patch", { token: linToken, body: { prefs: { lang: "zh-Hans" } } });
+  const zhBefore = (await standInReplies()).filter((m) => String(m.content).startsWith("（演示模型）")).length;
+  await call("messages.send", {
+    token: hanToken,
+    body: { stream_id: dStreamId, content: "@林 这条换回中文记", mentions: [{ type: "human", id: linId }] },
+  });
+  await call("scheduler.tick", { token: linToken, method: "GET" });
+  const zhReplies = await standInReplies();
+  check("对照：切回 zh 后下一条回帖起头回到中文模板",
+    zhReplies.filter((m) => String(m.content).startsWith("（演示模型）")).length === zhBefore + 1,
+    zhReplies.map((m) => String(m.content).slice(0, 40)));
+  check("切 en 后复述的那句是英文原文：包装语在两种语言下都进不了群",
+    String(enReplies.at(-1)?.content).includes("one more line for the record")
+      && !String(enReplies.at(-1)?.content).includes("请按上面的上下文回应这条任务"),
+    String(enReplies.at(-1)?.content).slice(0, 120));
+
+  // 落库的系统行同一条口径：语言在写入那一刻按操作者的界面语言定。同一个人改两次公告，
+  // 两侧都断死整句——只断一侧的话，「永远回落中文」和「永远英文」都能蒙过去。
+  const lastSystemLine = async () => ((await call("messages.list", {
+    token: linToken, method: "GET", body: { stream_id: dStreamId },
+  })).payload.items ?? []).filter((m) => m.sender_type === "system").at(-1)?.content ?? "";
+  await call("auth.patch", { token: linToken, body: { prefs: { lang: "en" } } });
+  await call("streams.announcement", { token: linToken, body: { stream_id: dStreamId, content: "Friday delivery, same basis as last time." } });
+  const enSystem = await lastSystemLine();
+  check("界面停在 en 时改公告：落库的系统行走英文模板，一个汉字都没有",
+    enSystem === "Group announcement updated: Friday delivery, same basis as last time.", enSystem);
+  await call("auth.patch", { token: linToken, body: { prefs: { lang: "zh-Hans" } } });
+  await call("streams.announcement", { token: linToken, body: { stream_id: dStreamId, content: "周五交付，照上次口径。" } });
+  const zhSystem = await lastSystemLine();
+  check("对照：切回 zh 后改公告，同一条系统行回到中文模板",
+    zhSystem === "群公告已更新：周五交付，照上次口径。", zhSystem);
 
   const offHere = await call("delegate.stream", { token: linToken, body: { stream_id: dStreamId, mode: "off" } });
   check("本群关掉压过全局「立即」", offHere.payload.active === false && offHere.payload.reason === "stream_off", offHere.payload);

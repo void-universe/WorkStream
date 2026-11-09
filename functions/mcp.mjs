@@ -4,6 +4,7 @@
 //       只作用于该群：读工具 + 发消息 / 邀请真人 / 改公告。
 import { deliver } from "./accounts.mjs";
 import { streamWeight } from "./chat.mjs";
+import { langOf, ownerLang, systemCopy } from "./copy.mjs";
 import { queueDelegateMail } from "./delegate.mjs";
 import { createGroupFile, deleteGroupFile, insertMessage } from "./rooms.mjs";
 import { createPipeline } from "./pipeline.mjs";
@@ -329,7 +330,7 @@ async function postAndFanout(db, { streamId, senderType, senderId, senderName, c
 }
 
 async function createStream(db, scope, args) {
-  const owner = await db.users.byId(scope.ownerId, { columns: "id,display_name" });
+  const owner = await db.users.byId(scope.ownerId, { columns: "id,display_name,prefs" });
   if (!owner) return { error: "owner_missing" };
   const name = text(args.name, { max: 60, name: "name" });
   const announcement = text(args.announcement ?? "", { max: 4000, required: false });
@@ -378,7 +379,7 @@ async function createStream(db, scope, args) {
   }
   await insertMessage(db, {
     streamId: id, senderType: "system", senderId: scope.ownerId, senderName: "系统",
-    content: `${owner.display_name} 通过 WorkStream 技能创建了群「${name}」。群 UUID：${id}`,
+    content: systemCopy(langOf(owner.prefs)).streamCreatedBySkill({ who: owner.display_name, name, id }),
   });
   return {
     stream_id: id,
@@ -446,13 +447,14 @@ const TOOL_HANDLERS = {
     return { name: file.name, size_bytes: file.size_bytes, content: truncate(file.content ?? "", 12000) };
   },
   upload_file: async ({ db, scope, args, env, streamId }) => {
-    const owner = await db.users.byId(scope.ownerId, { columns: "id,display_name" });
+    const owner = await db.users.byId(scope.ownerId, { columns: "id,display_name,prefs" });
     if (!owner) return { error: "owner_missing" };
     try {
       const file = await createGroupFile(db, {
         streamId,
         userId: scope.ownerId,
         userName: owner.display_name,
+        lang: langOf(owner.prefs),
         name: args.name,
         contentType: args.content_type,
         content: args.content,
@@ -642,7 +644,7 @@ const TOOL_HANDLERS = {
     }, { columns: "id" });
     await insertMessage(db, {
       streamId: targetStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
-      content: `虚拟员工「${agent.name}」被拉进了群。`,
+      content: systemCopy(await ownerLang(db, scope.ownerId)).agentAddedByTool({ agent: agent.name }),
     });
     return { ok: true, agent_id: agent.id, agent_name: agent.name, stream_id: targetStreamId };
   },
@@ -694,9 +696,10 @@ const TOOL_HANDLERS = {
     await db.streams.patch([["id", targetStreamId]], {
       announcement: content, announcement_at: now(), updated_at: now(),
     });
+    const copy = systemCopy(await ownerLang(db, scope.ownerId));
     await insertMessage(db, {
       streamId: targetStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
-      content: content ? `群公告已更新：${content}` : "群公告已清空。",
+      content: content ? copy.announcementSet({ content }) : copy.announcementCleared(),
     });
     return { ok: true, stream_id: targetStreamId, announcement: content };
   },
@@ -729,7 +732,7 @@ const TOOL_HANDLERS = {
         }, { columns: "id" });
         await insertMessage(db, {
           streamId: grantStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
-          content: `虚拟机「${label}」已登记并授权给本群。`,
+          content: systemCopy(await ownerLang(db, scope.ownerId)).vmRegistered({ label }),
         });
         grantedTo = grantStreamId;
       }
@@ -759,9 +762,10 @@ const TOOL_HANDLERS = {
       granted_by: scope.ownerId, created_at: now(),
     }, { columns: "id" });
     if (!created) return { error: "grant_failed" };
+    const granted = systemCopy(await ownerLang(db, scope.ownerId));
     await insertMessage(db, {
       streamId: targetStreamId, senderType: "system", senderId: scope.ownerId, senderName: "系统",
-      content: `虚拟机「${vm.label}」授权给本群（级别：${level === "sudo" ? "可用 sudo" : "普通用户"}）。`,
+      content: granted.vmGranted({ label: vm.label, level }),
     });
     return { ok: true, grant_id: created.id, level, stream_id: targetStreamId };
   },

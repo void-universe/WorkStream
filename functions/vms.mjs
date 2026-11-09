@@ -4,8 +4,9 @@
 // 真人的交互终端不在这一条链上：浏览器直连 VM 上的 WebSocket 网关（src/lib/terminal.mjs），
 // 服务端只存网关地址、不代理会话，所以 VM 口令依旧只以密文躺在 secret_cipher 里。
 import { seal } from "./sec.mjs";
+import { langOf, systemCopy } from "./copy.mjs";
 import { requireMembership, requireRole } from "./perm.mjs";
-import { nextSeq } from "./rooms.mjs";
+import { insertMessage } from "./rooms.mjs";
 import { Halt, json, newId, now, oneOf, randomHex, safeApiBaseUrl, sha256Hex, text, uuid } from "./util.mjs";
 
 const VM_COLUMNS = "id,label,host,port,username,auth_kind,workdir,gateway_url,last_probe,owner_id,created_at,updated_at";
@@ -125,12 +126,12 @@ export const actions = {
       id: newId(), stream_id: streamId, vm_id: vmId, level, granted_by: user.id, created_at: now(),
     }, { columns: "id" });
     if (!created) throw new Halt("grant_failed", 503);
-    await db.messages.insert({
-      id: newId(), stream_id: streamId, seq: await nextSeq(db, streamId), sender_type: "system",
-      sender_id: user.id, sender_name: "系统",
-      content: `${user.display_name} 把虚拟机「${vm.label}」授权给本群（级别：${level === "sudo" ? "可用 sudo" : "普通用户"}）。`,
-      mentions: [], reply_to: null, kind: "system", error: null, created_at: now(),
-    }, { columns: "id" });
+    // 走 insertMessage 而不是自己拼一行：那一行少写 attachments / presented / on_behalf_of 三列，
+    // 而且绕开了唯一那个系统行写入口——check-schema 7c 按写入口扫硬编码文案，绕开就等于躲过闸。
+    await insertMessage(db, {
+      streamId, senderType: "system", senderId: user.id, senderName: "系统",
+      content: systemCopy(langOf(user.prefs)).vmGranted({ who: user.display_name, label: vm.label, level }),
+    });
     return json({ ok: true, grant_id: created.id });
   },
 

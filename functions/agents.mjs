@@ -3,7 +3,8 @@ import { open, seal } from "./sec.mjs";
 import { agentPresence } from "./presence.mjs";
 import { askCloudAgent, checkCloudAccess, parseAgentId } from "./qca.mjs";
 import { BACKENDS, BACKEND_IDS, DEMO_BASE_URL, backendFor } from "./backends.mjs";
-import { DEMO_QUOTABLE_HEADERS } from "./prompt.mjs";
+import { demoCopy, demoLang } from "./copy.mjs";
+import { parseTranscript } from "./transcript.mjs";
 import { installDefaultSkillsFor, skillsForAgent } from "./skills.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, Interrupted, avatarData, int, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
 
@@ -382,8 +383,8 @@ export async function chatCompletion({
 /** 内置演示模型：不联网，基于传入的 memory 与历史做抽取式回应，用来在没有任何真实 Key 时
  *  也能端到端跑通 @ 派发、队列、压缩与插话。没有真实思考链和用量，字段一律留空，
  *  前端据此标注"演示模型不回报"，而不是编一个数字让轨迹看起来像真的。 */
-async function demoRound({ messages, tools, summary }) {
-  return { reasoning: "", usage: null, finish_reason: null, first_token_ms: null, ...demoComplete({ messages, tools, summary }) };
+async function demoRound({ messages, tools, summary, lang, quotable }) {
+  return { reasoning: "", usage: null, finish_reason: null, first_token_ms: null, ...demoComplete({ messages, tools, summary, lang, quotable }) };
 }
 
 /**
@@ -395,7 +396,8 @@ const TRANSPORT_ROUTES = {
   chat: ({ agent, key, ...rest }) => chatCompletion({
     baseUrl: agent.api_base_url, apiKey: key, model: agent.model, ...rest,
   }),
-  demo: ({ messages, tools, summary }) => demoRound({ messages, tools, summary }),
+  demo: async ({ db, agent, messages, tools, summary, quotable }) =>
+    demoRound({ messages, tools, summary, quotable, lang: await demoLang(db, agent) }),
   cloud: ({ db, agent, streamId, key, messages, timeoutMs, onInterrupt, persistSession }) =>
     askCloudAgent({ db, agent, streamId, pat: key, messages, timeoutMs, onInterrupt, persistSession }),
 };
@@ -416,9 +418,9 @@ const TRANSPORT_ROUTES = {
  * 入参一律原样递给那条通道，各自只取自己要的：过去在这里手写分支时漏传过 persistSession，
  * 压缩那轮"不复用群里 session"的注释就成了假话——加字段只要写进表和签名就不会再丢。
  */
-export async function completeForAgent({ db, agent, streamId, key, messages, tools, maxTokens, timeoutMs, summary, onInterrupt, persistSession }) {
+export async function completeForAgent({ db, agent, streamId, key, messages, tools, maxTokens, timeoutMs, summary, quotable, onInterrupt, persistSession }) {
   const route = TRANSPORT_ROUTES[backendFor(agent).transport];
-  return route({ db, agent, streamId, key, messages, tools, maxTokens, timeoutMs, summary, onInterrupt, persistSession });
+  return route({ db, agent, streamId, key, messages, tools, maxTokens, timeoutMs, summary, quotable, onInterrupt, persistSession });
 }
 
 const IDLE_MS = 800;
@@ -552,7 +554,8 @@ async function readUpstreamStream(stream, { onInterrupt, started }) {
 }
 
 /** 内置演示模型：有工具请求就先“查询”，否则基于上下文给出可核对的摘要式回复。 */
-function demoComplete({ messages, tools, summary }) {
+function demoComplete({ messages, tools, summary, lang, quotable }) {
+  const copy = demoCopy(lang);
   const last = [...messages].reverse().find((m) => m.role === "user");
   const prompt = String(last?.content ?? "");
   const wantsTool = Boolean(tools?.length) && /查|history|之前|上文|历史|文件/.test(prompt);
@@ -572,21 +575,20 @@ function demoComplete({ messages, tools, summary }) {
   }
   if (summary) {
     const lines = summary.lines.slice(0, 6).map((line) => `- ${truncate(line, 90)}`);
-    return { mode: "demo", content: lines.join("\n") || "（演示压缩：本段没有可摘录的发言。）", tool_calls: [] };
+    return { mode: "demo", content: lines.join("\n") || copy.summaryEmpty, tool_calls: [] };
   }
-  const context = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n");
-  // 只从转录与两段记忆里摘录：它们本来就是群里可见的内容。指令块（守则、替身须知、触发消息）
-  // 是内部提示，演示模型照抄进正文等于把提示词念给全群听。
-  const quotable = context
-    .split("\n\n")
-    .filter((block) => DEMO_QUOTABLE_HEADERS.some((header) => block.startsWith(header)))
-    .join("\n");
-  const facts = (quotable.match(/^[^\n]{6,120}$/gm) ?? []).slice(-3).map((line) => truncate(line, 80));
+  // 只从 quotable 里摘录：装配那一刻按槽位 id 挑出来的转录与两段记忆，本来就是群里可见的内容。
+  // 指令块（守则、替身须知、触发消息）是内部提示，演示模型照抄进正文等于把提示词念给全群听。
+  const quotableText = String(quotable ?? "");
+  const facts = (quotableText.match(/^[^\n]{6,120}$/gm) ?? []).slice(-3).map((line) => truncate(line, 80));
+  // 复述的那一句得是群里真说过的话。用户位那一条是内部包装语（composeAsk 只有一句“按上面回应”），
+  // 照抄它等于把提示词念进群，所以要回应谁的话从转录里取；转录里没有人的发言才退回用户位。
+  const asked = parseTranscript(quotableText).findLast((row) => row.kind === "人")?.body;
   return {
     mode: "demo",
     content: [
-      `（演示模型）收到，我把这条任务记进队列了：${truncate(prompt, 120)}`,
-      facts.length ? `我当前掌握的要点：\n${facts.join("\n")}` : "",
+      copy.ack(truncate(asked || prompt, 120)),
+      facts.length ? `${copy.factsLead}\n${facts.join("\n")}` : "",
     ].filter(Boolean).join("\n\n"),
     tool_calls: [],
   };

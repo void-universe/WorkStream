@@ -13,5 +13,21 @@ export function renderTranscript(rows) {
   return rows.map(renderLine).join("\n");
 }
 
+const LINE = /^([#·])(\d+) \[(人|虚拟|系统)\] ([^：]*)：(.*)$/;
+
+// 拆回渲染好的转录。行格式只在这一个文件里定义，反向解析也得在这儿：
+// 别处另写一份正则，渲染改一个字它就静默失配，读出来的是空而不是报错。
+export function parseTranscript(text) {
+  return String(text).split("\n")
+    .map((line) => LINE.exec(line))
+    .filter(Boolean)
+    .map(([, , seq, kind, sender, body]) => ({
+      seq: Number(seq),
+      kind,
+      sender,
+      body: body.replace(/（附 \d+ 图）$/, ""),
+    }));
+}
+
 /** 单条记录渲染后的字符数（不含行间的分隔符，加多少由调用处按用法决定）。 */
 export const rowChars = (row) => renderLine(row).length;

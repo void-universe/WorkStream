@@ -52,7 +52,7 @@
   "lang.title": "Zuerst die Oberflächensprache wählen",
   "lang.hint": "Zuerst auf diesem Gerät gespeichert, nach der Anmeldung auch in Ihrem Konto.",
   "lang.available": "Verfügbar",
-  "lang.settingsHint": "Nur die Oberflächentexte. Von Server erzeugte Raumnachrichten, E-Mails und Zusammenfassungen sind weiterhin Chinesisch.",
+  "lang.settingsHint": "Nur die Oberflächentexte. Systemhinweise in der Gruppe und die Antworten des Demo-Mitarbeiters folgen dieser Sprache (nur Chinesisch und Englisch, andere Sprachen fallen auf Englisch zurück); vom Server erzeugte E-Mails, Zusammenfassungen und einige Hinweise sind weiterhin Chinesisch.",
   "lang.comingSoon": "Demnächst",
   "lang.comingSoonHint": "Für {n} Sprachen fehlen noch die Oberflächentexte; sie stehen auf der Liste, sind aber nicht wählbar. Arabisch und Hebräisch warten zusätzlich auf die Rechts-nach-links-Umstellung.",
   "lang.continue": "Weiter",

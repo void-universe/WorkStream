@@ -358,6 +358,41 @@ for (const path of srcFiles) {
   }
 }
 
+/* ---------- 7c. 落进群里的系统行只能出自两套模板 ---------- */
+// 系统行是存进 messages.content 的句子：写死中文在中文界面上一切正常，切到英文才知道它没跟语言走，
+// 冒烟只钉得住断过的那几条。所以在源码形状这一层收口——写入口的对象字面量里
+// 一旦又出现中文（注释与恒为「系统」的 senderName 除外），就是新增了一条不跟界面语言的句子。
+// 两种写入形状都要扫：绕开 insertMessage 助手、直接 db.messages.insert 的那一行照样落进群，
+// 只认一种形状的话，虚拟机授权那条播报就在闸门外写死了中文（本轮就是这么漏出来的）。
+const objectLiteral = (text, open) => {
+  let depth = 0;
+  for (let index = open; index < text.length; index += 1) {
+    if (text[index] === "{") depth += 1;
+    else if (text[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return text.slice(open, index + 1);
+    }
+  }
+  return null;
+};
+let systemLineSites = 0;
+for (const file of readdirSync(functionDir).filter((name) => name.endsWith(".mjs"))) {
+  const text = stripComments(readFileSync(join(functionDir, file), "utf8"));
+  for (const match of text.matchAll(/insertMessage\(db,\s*\{|db\.messages\.insert\(\s*\{/g)) {
+    const literal = objectLiteral(text, match.index + match[0].length - 1);
+    if (!literal || !/sender_?[Tt]ype: "system"/.test(literal)) continue;
+    systemLineSites += 1;
+    const hardcoded = literal.replace(/sender_?[Nn]ame: "[^"]*"/g, "").match(/[\u4e00-\u9fff][^\n]*/);
+    if (hardcoded) {
+      problems.push(`functions/${file} 有条系统行写死了中文「${hardcoded[0].slice(0, 40)}」：句子搬进 functions/copy.mjs 的两套模板，中英一起给`);
+    }
+  }
+}
+const SYSTEM_LINE_FLOOR = 15;
+if (systemLineSites < SYSTEM_LINE_FLOOR) {
+  problems.push(`只扫出 ${systemLineSites} 处系统行写入点，地板是 ${SYSTEM_LINE_FLOOR}：先确认不是这段配对扫描失配了，失配等于这道闸空跑`);
+}
+
 /* ---------- 8. 服务端错误码与前端错误码文案 ---------- */
 // 前端按码查字典：漏一个码不会报错，只会把 account_missing 这种内部标识直接贴到用户眼前，
 // 四种语言一样难看、一样没用。冒烟断的是状态码，从没断过「这句文案在不在」。
@@ -636,6 +671,7 @@ console.log(`后端清单（${BACKEND_IDS.length}）：${BACKEND_IDS.join(", ")}
 console.log(`界面语言（${clientIds.length}，已译完 ${completeIds.length}）：字典 ${dictNames.join(", ")}`);
 console.log(`取词点（${usedKeys.size} 个键，扫 src/ 全量 .ts/.tsx）`);
 console.log(`界面文案裸奔（${[...bareCounts.values()].reduce((n, c) => n + c, 0)} 行，分布在 ${bareCounts.size} 个文件；表里记了 ${Object.keys(BARE_COPY_CEILING).length} 处欠债）`);
+console.log(`群内系统行（${systemLineSites} 处写入点，句子只出自 functions/copy.mjs 的中英两套模板）`);
 console.log(`服务端错误码（字面可扫 ${serverCodes.size} 个 + 拼出来 ${composed.size} 个）与前端文案（ERROR_KEYS ${codeToKey.size} 条）`);
 console.log(`文档双语配对（${DOC_PAIRS.length} 对：${DOC_PAIRS.map(([zh]) => zh.replace(/\.md$/, "")).join(", ")}；速记别名 ${Object.keys(SPAN_ALIASES).length} 条；单语 ${Object.keys(SINGLE_LANGUAGE_DOCS).length} 份：${Object.keys(SINGLE_LANGUAGE_DOCS).join(", ")}）`);
 if (dynamicWrites.size) console.log(`按变量传参、无法静态展开写入列的表：${[...dynamicWrites].join(", ")}`);

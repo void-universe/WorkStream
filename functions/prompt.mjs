@@ -12,7 +12,7 @@
 // 这条不变量由 dev/smoke.mjs 的 8d 兜住：两轮请求的公共前缀必须覆盖整段上一轮窗口，且可复用 ≥95%。
 import { imageMark, renderTranscript } from "./transcript.mjs";
 
-// 内容块的抬头：装配用它，演示模型摘录它，两边必须读同一份，否则过滤会跟着正文悄悄失效。
+// 内容块的抬头：装配用它拼出每一块的正文。外面认块靠 id（见 DEMO_QUOTABLE_SLOTS），不靠这些文字。
 const MEMORY_COMMON_HEADER = "你的长期记忆（common）：";
 const MEMORY_STREAM_HEADER = "本群记忆：";
 const MEMORY_OWNER_HEADER = "我的全局记忆（跨群归并，只用来判断，别把别的群的细节念给这个群听）：";
@@ -23,8 +23,9 @@ const TRANSCRIPT_HEADER = "最近记录：";
  * 指令块（守则、替身须知、触发消息）是内部提示，念到群里等于把提示词摊在同事面前。
  * 全局记忆那一块看着和两段记忆同类，但它不对称：那是跨群归并出来的结论，别的群的细节
  * 在这个群里念出来就是串群，所以它不进这份清单（dev/smoke.mjs 拿哨标钉住这一条）。
+ * 认 id 不认抬头文字：抬头是措辞，改一个字不该悄悄改掉「哪几块能被摘录」。
  */
-export const DEMO_QUOTABLE_HEADERS = [MEMORY_COMMON_HEADER, MEMORY_STREAM_HEADER, TRANSCRIPT_HEADER];
+export const DEMO_QUOTABLE_SLOTS = ["memory.common", "transcript", "memory.stream"];
 
 /**
  * 一个槽位 = { id, order, volatile, build }。
@@ -191,6 +192,8 @@ const ORDERED = PROMPT_SECTIONS
  * 装配 system 正文。返回的 `promptSlots` 是这一步实际落下的块，按发出顺序给出
  * `[槽位 id, 字符数, 是否每轮重写]`——只记口径不记正文（正文里大半是群里本来就能翻的转录），
  * 命中率掉了就靠它对出断点动到了哪一块。
+ * `quotable` 是演示模型被允许摘录的那几块的正文（DEMO_QUOTABLE_SLOTS）：在装配这一刻单独交出去，
+ * 因为事后从 system 里按空行切块切不准——群消息正文里本来就可能带空行。
  */
 export function composeSystemPrompt(ctx) {
   const blocks = [];
@@ -202,6 +205,10 @@ export function composeSystemPrompt(ctx) {
   return {
     system: blocks.map((block) => block.text).join("\n\n"),
     promptSlots: blocks.map((block) => [block.id, block.text.length, block.volatile]),
+    quotable: blocks
+      .filter((block) => DEMO_QUOTABLE_SLOTS.includes(block.id))
+      .map((block) => block.text)
+      .join("\n"),
   };
 }
 
