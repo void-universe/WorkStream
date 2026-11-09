@@ -541,8 +541,9 @@ for (const [code, where] of composed) {
 // 界面切换帮不上忙、冒烟也永远看不见——只能按形状对账：标题层级序列、表格行列、正文规模、
 // 内联码与链接集合。内联码和链接是「事实」不是「文案」，两种语言里必须逐字一样；
 // 段落数与表格行数是结构，翻译既不该增也不该删。
+// README 的英文那份是仓库首页，中文那份才带语言后缀；其余文档仍是「中文主名 + .en 英文」。
 const DOC_PAIRS = [
-  ["README.md", "README.en.md"],
+  ["README.zh.md", "README.md"],
   ["CHANGELOG.md", "CHANGELOG.en.md"],
   ["docs/arch/scheduler.md", "docs/arch/scheduler.en.md"],
 ];
@@ -673,7 +674,7 @@ console.log(`取词点（${usedKeys.size} 个键，扫 src/ 全量 .ts/.tsx）`)
 console.log(`界面文案裸奔（${[...bareCounts.values()].reduce((n, c) => n + c, 0)} 行，分布在 ${bareCounts.size} 个文件；表里记了 ${Object.keys(BARE_COPY_CEILING).length} 处欠债）`);
 console.log(`群内系统行（${systemLineSites} 处写入点，句子只出自 functions/copy.mjs 的中英两套模板）`);
 console.log(`服务端错误码（字面可扫 ${serverCodes.size} 个 + 拼出来 ${composed.size} 个）与前端文案（ERROR_KEYS ${codeToKey.size} 条）`);
-console.log(`文档双语配对（${DOC_PAIRS.length} 对：${DOC_PAIRS.map(([zh]) => zh.replace(/\.md$/, "")).join(", ")}；速记别名 ${Object.keys(SPAN_ALIASES).length} 条；单语 ${Object.keys(SINGLE_LANGUAGE_DOCS).length} 份：${Object.keys(SINGLE_LANGUAGE_DOCS).join(", ")}）`);
+console.log(`文档双语配对（${DOC_PAIRS.length} 对：${DOC_PAIRS.map(([zh]) => zh.replace(/\.zh\.md$|\.md$/, "")).join(", ")}；速记别名 ${Object.keys(SPAN_ALIASES).length} 条；单语 ${Object.keys(SINGLE_LANGUAGE_DOCS).length} 份：${Object.keys(SINGLE_LANGUAGE_DOCS).join(", ")}）`);
 if (dynamicWrites.size) console.log(`按变量传参、无法静态展开写入列的表：${[...dynamicWrites].join(", ")}`);
 if (problems.length) {
   console.log(`发现 ${problems.length} 处不一致：\n- ${problems.join("\n- ")}`);
