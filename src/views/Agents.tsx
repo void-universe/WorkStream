@@ -102,13 +102,15 @@ const EMPTY: Draft = {
   role: "",
   signature: "",
   avatar: "",
-  api_base_url: "demo://local",
-  api_key: "demo",
-  model: "demo",
+  // 新建档默认规范入口：地址/令牌/模型留空等用户填真实值。演示端点是显式选项——
+  // 切到 openai 时 switchBackend 会把 demo://local 与 demo 模型还回来（prev_openai_url）。
+  api_base_url: "",
+  api_key: "",
+  model: "",
   system_prompt: "",
   context_chars: 200000,
   status: "active",
-  backend: "openai",
+  backend: "stream",
   qca_agent_id: "",
   prev_openai_url: "demo://local",
 };

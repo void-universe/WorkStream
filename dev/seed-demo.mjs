@@ -45,6 +45,7 @@ step(`登录成功：${login.user.display_name}`);
 const agent = await call("agents.create", {
   name: "小审",
   role: "整理验收清单并跟踪回归项",
+  backend: "openai",
   api_base_url: "demo://local",
   api_key: "demo",
   model: "demo",

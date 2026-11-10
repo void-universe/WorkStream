@@ -1003,7 +1003,7 @@ async function main() {
   const agent = await call("agents.create", {
     token: ana,
     body: {
-      name: "小Q", role: "资料整理", signature: "资料整理 · 先列清单再动手",
+      name: "小Q", role: "资料整理", backend: "openai", signature: "资料整理 · 先列清单再动手",
       avatar: AVATAR,
       api_base_url: "demo://local", api_key: "demo-key-1234",
       model: "demo", system_prompt: "回答要给出下一步待办。", context_chars: 6000,
@@ -1041,7 +1041,7 @@ async function main() {
   // 回归：agents.delete 会连带复位 slice_prefs，表名写错时这里会直接 500。
   const temp = await call("agents.create", {
     token: ana,
-    body: { name: "临时", role: "试删", api_base_url: "demo://local", api_key: "demo-key-9999", model: "demo" },
+    body: { name: "临时", role: "试删", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-9999", model: "demo" },
   });
   const tempId = temp.payload.agent?.id;
   const drop = await call("agents.delete", { token: ana, body: { id: tempId } });
@@ -1354,7 +1354,7 @@ async function main() {
   const mockAgent = await call("agents.create", {
     token: ana,
     body: {
-      name: "小M", role: "流式联调", api_base_url: `http://127.0.0.1:${mock.port}/v1`,
+      name: "小M", role: "流式联调", backend: "openai", api_base_url: `http://127.0.0.1:${mock.port}/v1`,
       api_key: "mock-key-1", model: "mock", context_chars: 8000,
     },
   });
@@ -2484,7 +2484,7 @@ async function main() {
   // 默认位是"建档时自动装"那一侧的开关，所以两个方向都要新建一个员工来看：只验会装、不验会不装，
   // 撤标记写错成 no-op 也照样全绿。
   const x18OnAgent = await call("agents.create", {
-    token: ana, body: { name: "默认在岗", role: "对照", api_base_url: "demo://local", api_key: "demo-key-18", model: "demo" },
+    token: ana, body: { name: "默认在岗", role: "对照", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-18", model: "demo" },
   });
   check("默认位开着：主人新建的员工自动装上它",
     (await call("skills.installed", { token: ana, method: "GET", body: { agent_id: x18OnAgent.payload.agent?.id } })).payload.items
@@ -2495,7 +2495,7 @@ async function main() {
   const x18DefaultUnset = await call("skills.setDefault", { token: ana, body: { skill_id: x18DefaultId, is_default: false } });
   check("skills.setDefault：主人能把默认取消掉", x18DefaultUnset.payload.skill?.is_default === false, x18DefaultUnset.payload);
   const x18OffAgent = await call("agents.create", {
-    token: ana, body: { name: "默认撤位", role: "对照", api_base_url: "demo://local", api_key: "demo-key-19", model: "demo" },
+    token: ana, body: { name: "默认撤位", role: "对照", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-19", model: "demo" },
   });
   check("对照：默认位撤掉后新建的员工不再自动装它（撤标记真的写进了那一行）",
     (await call("skills.installed", { token: ana, method: "GET", body: { agent_id: x18OffAgent.payload.agent?.id } })).payload.items
@@ -2632,7 +2632,7 @@ async function main() {
 
   const x19FreshAgent = await call("agents.create", {
     token: ana,
-    body: { name: "小N", role: "外接", api_base_url: "demo://local", api_key: "demo-key-n", model: "demo" },
+    body: { name: "小N", role: "外接", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-n", model: "demo" },
   });
   const x19FreshId = x19FreshAgent.payload.agent?.id;
   const x19Add = await toolSafe(x19Scope, "add_agent_to_stream", { agent_id: x19FreshId });
@@ -2647,7 +2647,7 @@ async function main() {
     (x19AddDir.payload.members ?? []).filter((m) => m.type === "agent").map((m) => m.agent?.name));
   const x19BoAgent = await call("agents.create", {
     token: bToken,
-    body: { name: "Bo的助理", role: "外接", api_base_url: "demo://local", api_key: "demo-key-bo", model: "demo" },
+    body: { name: "Bo的助理", role: "外接", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-bo", model: "demo" },
   });
   const x19Foreign = await toolSafe(x19Scope, "add_agent_to_stream", { agent_id: x19BoAgent.payload.agent?.id });
   check("add_agent_to_stream：不能拉别人的员工", x19Foreign.error === "agent_not_owned", x19Foreign);
@@ -3121,12 +3121,12 @@ async function main() {
   const x22Future = await call("skills.remoteInstall", { token: ana, body: { registry_id: regId, slug: "release-check", all_agents: true, include_future: true } });
   check("标成默认后，以后新建的员工也会带上它", x22Future.payload.future?.is_default === true, x22Future.payload);
   const x22NewAgent = await call("agents.create", {
-    token: ana, body: { name: "小远", role: "远端技能", api_base_url: "demo://local", api_key: "demo-key-9", model: "demo" },
+    token: ana, body: { name: "小远", role: "远端技能", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-9", model: "demo" },
   });
   check("主人新建员工自动装上他的默认技能", (await call("skills.installed", { token: ana, method: "GET", body: { agent_id: x22NewAgent.payload.agent?.id } })).payload.items
     ?.some((row) => row.id === snapId), x22NewAgent.payload);
   const x22BoAgent = await call("agents.create", {
-    token: bToken, body: { name: "Bo 的员工", role: "对照", api_base_url: "demo://local", api_key: "demo-key-8", model: "demo" },
+    token: bToken, body: { name: "Bo 的员工", role: "对照", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-8", model: "demo" },
   });
   const x22BoAgentId = x22BoAgent.payload.agent?.id;
   check("主人的私有默认不会装到别人的新员工", (await call("skills.installed", { token: bToken, method: "GET", body: { agent_id: x22BoAgentId } })).payload.items
@@ -3297,7 +3297,7 @@ async function main() {
     qcaAgent.payload.ok === true && qcaAgent.payload.agent?.backend === "qca", qcaAgent.payload.error);
   const demoStandIn = await call("agents.create", {
     token: ana,
-    body: { name: "演示换型", role: "x", api_base_url: "demo://local", api_key: "demo-key-pair", model: "demo" },
+    body: { name: "演示换型", role: "x", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-pair", model: "demo" },
   });
   const demoId = demoStandIn.payload.agent?.id;
   const demoModelSwap = await call("agents.update", { token: ana, body: { id: demoId, model: "gpt-4o" } });
@@ -3322,7 +3322,7 @@ async function main() {
   // 真给他换到云端会把"调度顺序不对"伪装成"产品缺陷"。
   const x23Swap = await call("agents.create", {
     token: ana,
-    body: { name: "换后端", role: "x", api_base_url: "demo://local", api_key: "demo-key-23", model: "demo" },
+    body: { name: "换后端", role: "x", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-23", model: "demo" },
   });
   const x23SwapId = x23Swap.payload.agent?.id;
   const switchBack = await call("agents.update", {
@@ -3431,7 +3431,7 @@ async function main() {
   const localAgent = await call("agents.create", {
     token: ana,
     body: {
-      name: "小L", role: "对照", api_base_url: `http://127.0.0.1:${local.port}/v1`,
+      name: "小L", role: "对照", backend: "openai", api_base_url: `http://127.0.0.1:${local.port}/v1`,
       api_key: "mock-key-2", model: "mock", context_chars: 8000,
     },
   });
@@ -3739,7 +3739,7 @@ async function main() {
   const hanToken = (await call("auth.login", { body: { email: "han@example.com", password: "passw0rd-26" } })).payload.token;
   const standIn = await call("agents.create", {
     token: linToken,
-    body: { name: "小L", role: "值班", api_base_url: "demo://local", api_key: "demo-key-25", model: "demo" },
+    body: { name: "小L", role: "值班", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-25", model: "demo" },
   });
   const standInId = standIn.payload.agent?.id;
   const dStream = await call("streams.create", { token: linToken, body: { name: "替身值班组", agent_ids: [standInId] } });
@@ -3883,7 +3883,7 @@ async function main() {
 
   const standIn2 = await call("agents.create", {
     token: linToken,
-    body: { name: "小M", role: "备份替身", api_base_url: "demo://local", api_key: "demo-key-26", model: "demo" },
+    body: { name: "小M", role: "备份替身", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-26", model: "demo" },
   });
   const standIn2Id = standIn2.payload.agent?.id;
   const notInRoom = await call("delegate.stream", { token: linToken, body: { stream_id: dStreamId, mode: "on", agent_id: standIn2Id } });
@@ -4000,7 +4000,7 @@ async function main() {
   const cronAgent = await call("agents.create", {
     token: ana,
     body: {
-      name: "小C", role: "值班巡检", api_base_url: `http://127.0.0.1:${cronMock.port}/v1`,
+      name: "小C", role: "值班巡检", backend: "openai", api_base_url: `http://127.0.0.1:${cronMock.port}/v1`,
       api_key: "mock-key-cron", model: "mock", context_chars: 8000,
     },
   });
@@ -4009,12 +4009,12 @@ async function main() {
   const cronStreamId = cronStream.payload.stream?.id;
   const loneAgent = await call("agents.create", {
     token: ana,
-    body: { name: "小N", role: "未入群", api_base_url: "demo://local", api_key: "demo-key-lone", model: "demo" },
+    body: { name: "小N", role: "未入群", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-lone", model: "demo" },
   });
   const loneAgentId = loneAgent.payload.agent?.id;
   const boAgent = await call("agents.create", {
     token: bToken,
-    body: { name: "小B", role: "Bo 的员工", api_base_url: "demo://local", api_key: "demo-key-bob", model: "demo" },
+    body: { name: "小B", role: "Bo 的员工", backend: "openai", api_base_url: "demo://local", api_key: "demo-key-bob", model: "demo" },
   });
   const boAgentId = boAgent.payload.agent?.id;
   const spec = (over = {}) => ({
@@ -4526,7 +4526,7 @@ async function main() {
   const x29Agent = await call("agents.create", {
     token: ana,
     body: {
-      name: "小D", role: "归并试验", api_base_url: `http://127.0.0.1:${x29Mock.port}/v1`,
+      name: "小D", role: "归并试验", backend: "openai", api_base_url: `http://127.0.0.1:${x29Mock.port}/v1`,
       api_key: "mock-key-dream", model: "mock", context_chars: 2000,
     },
   });
@@ -4767,7 +4767,7 @@ async function main() {
   const x29Peer = await call("agents.create", {
     token: ana,
     body: {
-      name: "小F", role: "归并同群", api_base_url: `http://127.0.0.1:${x29Mock.port}/v1`,
+      name: "小F", role: "归并同群", backend: "openai", api_base_url: `http://127.0.0.1:${x29Mock.port}/v1`,
       api_key: "mock-key-peer", model: "mock", context_chars: 2000,
     },
   });
@@ -4898,7 +4898,7 @@ async function main() {
   const x30Url = `http://127.0.0.1:${x30Mock.port}/v1`;
   const x30Make = (name) => call("agents.create", {
     token: ana,
-    body: { name, role: "接龙", api_base_url: x30Url, api_key: "mock-key-30", model: "mock", context_chars: 8000 },
+    body: { name, role: "接龙", backend: "openai", api_base_url: x30Url, api_key: "mock-key-30", model: "mock", context_chars: 8000 },
   });
   const x30JiaId = (await x30Make("甲一")).payload.agent?.id;
   const x30YiId = (await x30Make("乙二")).payload.agent?.id;
@@ -5019,7 +5019,7 @@ async function main() {
   const x31Mock = await startMockUpstream();
   const x31Url = `http://127.0.0.1:${x31Mock.port}/v1`;
   const x31AgentId = (await call("agents.create", {
-    token: ana, body: { name: "分布员工", role: "分布式执行", api_base_url: x31Url, api_key: "mock-key-31", model: "mock", context_chars: 8000 },
+    token: ana, body: { name: "分布员工", role: "分布式执行", backend: "openai", api_base_url: x31Url, api_key: "mock-key-31", model: "mock", context_chars: 8000 },
   })).payload.agent?.id;
   const x31RoomId = (await call("streams.create", { token: ana, body: { name: "分布式组", agent_ids: [x31AgentId] } })).payload.stream?.id;
   const x31Env = (name) => process.env[name];
@@ -5422,6 +5422,24 @@ async function main() {
   check("对照：真实 origin 上建档成功，发现结果落进档案（shared）",
     x32Agent.payload.ok === true && x32Agent.payload.agent?.backend === "stream"
       && x32Agent.payload.agent?.stream_profile === SHARED_PROFILE, x32Agent.payload);
+  // 新建档的默认后端就是规范入口：不传 backend 也走发现，不再静默落到 openai。
+  const x32Default = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小默", role: "默认入口", context_chars: 8000,
+      api_base_url: `${x32Srv.origin}/stream-server/v1`, api_key: x32Token, model: "smoke-shared-model",
+    },
+  });
+  const x32DefaultId = x32Default.payload.agent?.id;
+  check("不传 backend 默认走规范入口：发现照旧落档（新 agent 统一从 stream 进）",
+    x32Default.payload.ok === true && x32Default.payload.agent?.backend === "stream"
+      && x32Default.payload.agent?.stream_profile === SHARED_PROFILE, x32Default.payload);
+  const x32DefaultDemo = await call("agents.create", {
+    token: ana,
+    body: { name: "默认演示", role: "x", api_base_url: "demo://local", api_key: x32Token, model: "smoke-shared-model" },
+  });
+  check("对照：默认档 + 演示地址照样被拒——演示要显式选 openai，不靠默认猜一档",
+    x32DefaultDemo.status === 400 && x32DefaultDemo.payload.error === "stream_needs_real_origin", x32DefaultDemo.payload);
   check("建档只回令牌尾号：明文与密文都不在响应里",
     x32Agent.payload.agent?.api_key_tail === `••••${x32Token.slice(-4)}`
       && !JSON.stringify(x32Agent.payload).includes(x32Token)
@@ -5866,6 +5884,27 @@ async function main() {
   check("退回那一档真的打在对面的 /chat/completions 上（地址里那段路径没被 originOf 吃掉）",
     x32Plain.requests.some((r) => r.path === "/v1/chat/completions"),
     x32Plain.requests.map((r) => `${r.method} ${r.path}`));
+  // 自检跑通不等于干活跑通：整轮 @ 派发走的是引擎那条路（措辞、工具注入、落库都在里面），
+  // 退回档必须在这条路上也结得下来，不然「统一走 stream 入口」对这台 server 就是句空话。
+  const x32PlainRoom = await call("streams.create", { token: ana, body: { name: "退回档执行组", agent_ids: [x32PlainId] } });
+  const x32PlainRoomId = x32PlainRoom.payload.stream?.id;
+  const x32PlainDisc = () => x32Plain.requests.filter((r) => r.method === "GET" && r.path === "/stream-server/v1").length;
+  const x32PlainDiscBefore = x32PlainDisc();
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: x32PlainRoomId, content: "@小P 这一轮走退回档", mentions: [{ type: "agent", id: x32PlainId }] },
+  });
+  const x32PlainRan = await x32TickUntil(x32PlainRoomId, x32PlainId);
+  check("退回档的员工也能被 @ 派发并跑完一整轮（与自检共用同一个派发点）",
+    x32PlainRan.length === 1 && x32PlainRan[0].status === "done", x32PlainRan);
+  const x32PlainHistory = await call("messages.list", { token: ana, method: "GET", body: { stream_id: x32PlainRoomId } });
+  const x32PlainReply = (x32PlainHistory.payload.items ?? []).find((m) => m.sender_id === x32PlainId);
+  check("退回那一轮的正文落进群聊", String(x32PlainReply?.content ?? "").includes("_plain_endpoint_ok"),
+    x32PlainReply?.content ?? (x32PlainHistory.payload.items ?? []).map((m) => [m.sender_id, String(m.content).slice(0, 80)]));
+  check("退回档一轮任务也不重新发现：档位读档案，干活的那条路是 /chat/completions",
+    x32PlainDisc() === x32PlainDiscBefore
+      && x32Plain.requests.filter((r) => r.method === "POST" && r.path === "/v1/chat/completions").length >= 2,
+    x32Plain.requests.map((r) => `${r.method} ${r.path}`));
   await x32Plain.close();
 
   // J. 档位那一格空着或写着表外的值：两处都拒，不静默按某一档跑（那就是群里那次假执行）。
@@ -5902,7 +5941,7 @@ async function main() {
   await call("streams.members.remove", { token: ana, body: { stream_id: x32DedRoomId, membership_id: x32DedMembership?.membership_id } });
   check("员工被移出群时，他在对方那侧那条 session 缓存一起作废",
     (await db.stream_sessions.list([["agent_id", x32DedId]], { columns: "id,stream_id", limit: 20 })).length === 0);
-  for (const id of [x32Id, x32DedId, x32LieId, x32PlainId, x32SwapDedId]) {
+  for (const id of [x32Id, x32DefaultId, x32DedId, x32LieId, x32PlainId, x32SwapDedId]) {
     await call("agents.delete", { token: ana, body: { id } });
   }
   check("删掉的员工不再留在档案里", (await db.agents.byId(x32Id, { columns: "id" })) == null);

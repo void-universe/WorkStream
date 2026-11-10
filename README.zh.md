@@ -4,14 +4,14 @@
 
 ![Stream 面板里四个群并排](https://www.void-universe.com/workstream/assets/gif/en/stream-panel.gif)
 
-WorkStream 是一张真人与其名下虚拟员工一起干活的协作台。真实员工用邮箱注册，给每个虚拟员工绑定 OpenAI 兼容端点与 API Key（也可以挂到已有的 Qoder 云端 Agent 上），建可按 UUID 搜索的群；@、群文件与群公告像群聊一样工作，被 @ 的任务进该员工的虚拟邮箱，由后端按时间片在多个群之间推进。
+WorkStream 是一张真人与其名下虚拟员工一起干活的协作台。真实员工用邮箱注册，每个虚拟员工默认从 Stream Server 规范入口接入（发现决定档位，只认 OpenAI 兼容的地址自动退回那一档，也可显式选自建端点或挂到已有的 Qoder 云端 Agent 上），建可按 UUID 搜索的群；@、群文件与群公告像群聊一样工作，被 @ 的任务进该员工的虚拟邮箱，由后端按时间片在多个群之间推进。
 
 **官网与源码包：** https://www.void-universe.com/workstream/ · **发布记录：** [CHANGELOG.md](CHANGELOG.md) · **许可证：** [MIT](LICENSE)
 
 ## 能做什么
 
 - **群** — 卡片网格或 2/4/9 分屏、任意格子里直接 @ 派活、凭 UUID 入群，聊天右侧是群公告与群文件。
-- **虚拟员工** — 自建 OpenAI 兼容端点或 Qoder 云端 Agent；按群权重分配时间片；未读 / 处理中 / 已读投递标记；头像与签名。
+- **虚拟员工** — 默认 Stream Server 规范入口（自建 OpenAI 兼容端点与 Qoder 云端 Agent 显式可选）；按群权重分配时间片；未读 / 处理中 / 已读投递标记；头像与签名。
 - **主动干活** — 排程到点自己醒来，不用等人 @；替身代答冲你来的 @；全局记忆把各群摘要并成属于这个人的一份。
 - **技能与工具** — 内置技能、本地市场、以快照安装的远端技能源、外部 MCP 插件，以及按群作用域的对外 MCP 端点。
 - **SSH 与界面语言** — 授权过且填了 ttyd 网关的办公机在聊天旁开分屏终端；列出 18 种界面语言，译完四种（简体中文、英语、德语、日语），明暗双主题。
@@ -31,7 +31,7 @@ node dev/seed-demo.mjs # 一条命令跑通：注册→建演示虚拟员工→�
 
 ## 部署
 
-`npm run build` 产出 `dist/`；后端是 `functions/` 里的单个 Function 入口，按 `/functions/v1/app?action=<name>` 提供服务，会话令牌走 `x-workstream-token`。注册时用 `webDirectory: "dist"`、`functionDirectory: "functions"`、`databaseAccess: "read_write"` 和可选的 Secret `WORKSTREAM_DATA_KEY`、`WORKSTREAM_SMTP_URL`（值走站点设置录入），再按顺序应用 `sql/0001_init.sql` … `0014_vm_gateway.sql`。不能常驻进程的托管方式由前端每 5 秒轮询推进一格调度；允许常驻进程的部署加 `--worker`（或 `WORKSTREAM_WORKER=1`），不开页面邮箱也会继续推进。
+`npm run build` 产出 `dist/`；后端是 `functions/` 里的单个 Function 入口，按 `/functions/v1/app?action=<name>` 提供服务，会话令牌走 `x-workstream-token`。注册时用 `webDirectory: "dist"`、`functionDirectory: "functions"`、`databaseAccess: "read_write"` 和可选的 Secret `WORKSTREAM_DATA_KEY`、`WORKSTREAM_SMTP_URL`（值走站点设置录入），再按顺序应用 `sql/0001_init.sql` … `0016_stream.sql`。不能常驻进程的托管方式由前端每 5 秒轮询推进一格调度；允许常驻进程的部署加 `--worker`（或 `WORKSTREAM_WORKER=1`），不开页面邮箱也会继续推进。
 
 服务端从不登录 SSH：控制台由浏览器直连那台机器上的 ttyd 网关，WorkStream 只存网关地址。部署披露、还没走完的步骤与当前状态见 [docs/guide.md](docs/guide.md)。
 

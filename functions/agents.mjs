@@ -83,7 +83,9 @@ export const actions = {
   async "agents.create"({ db, user, body, env }) {
     const name = text(body.name, { max: 48, name: "name" });
     const role = text(body.role, { max: 400, name: "role" });
-    const backend = oneOf(body.backend ?? "openai", BACKEND_IDS, "backend");
+    // 新建档默认走规范入口：发现决定 shared/dedicated，只认 OpenAI 兼容的地址自动退回那一档。
+    // 演示端点与云端不是"默认猜一档"，要显式选 backend（demo://local 挂 stream 会被 assertBackendPair 拒）。
+    const backend = oneOf(body.backend ?? "stream", BACKEND_IDS, "backend");
     const target = safeApiBaseUrl(body.api_base_url, { allowPrivate: privateAllowed(env) });
     const apiKey = text(body.api_key, { max: 400, name: "api_key" });
     // 云端 Agent 的模型由云上那份定义决定，本地只留一个展示名。

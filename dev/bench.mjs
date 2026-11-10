@@ -229,7 +229,7 @@ async function newWorld({ budget = 2, upstream, tickMs = 50 }) {
       const payload = must(await call("agents.create", {
         token,
         body: {
-          name, role: "压测执行", api_base_url: upstream.baseUrl, api_key: "bench-key-0123456",
+          name, role: "压测执行", backend: "openai", api_base_url: upstream.baseUrl, api_key: "bench-key-0123456",
           model: "bench-model", context_chars: 200_000,
         },
       }), `agents.create ${name}`);
