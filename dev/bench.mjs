@@ -1,4 +1,4 @@
-// 调度压测：单员工多群突发、抢占延迟、吞吐、多员工接力、权重公平、并发驱动、僵尸回收。
+// 调度压测：单员工多群突发、抢占延迟、吞吐、多员工接力、权重公平、并发驱动、僵尸回收、规范 API 分段延迟。
 // 用法：npm run bench（每个场景一套全新本机数据库，互不干扰；上游是带时序记录的假 SSE 服务）
 // 不挂进 npm run qa：这里的断言带时序阈值，CI 机器抖动会误报；qa 只跑正确性自检（dev/smoke.mjs）。
 // 绝对值受本机 fixture 影响（每次写库都全量落盘 JSON），看相对比例与不变量更有意义。
@@ -6,11 +6,18 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
+import { randomBytes } from "node:crypto";
 import { makeHandler } from "../functions/handler.mjs";
 import { store } from "../functions/store.mjs";
 import { startWorker } from "../functions/worker.mjs";
 import { reapStale } from "../functions/engine.mjs";
+import { chatCompletion } from "../functions/agents.mjs";
+import { createStreamServer } from "../functions/streamserver.mjs";
+import { discoverStreamServer, askStreamServer } from "../functions/stream.mjs";
+import { SHARED_PROFILE, endpointPath } from "../functions/streamspec.mjs";
+import { newId } from "../functions/util.mjs";
 import { createFixtureClient } from "./fixture-supabase.mjs";
+import { listenStreamServer } from "./stream-server.mjs";
 
 process.env.WORKSTREAM_DEV = "1";
 
@@ -349,7 +356,7 @@ async function runBurst({ upstream, budget, streamCount, rounds, label }) {
   const receipts = mails.filter((mail) => mail.meta?.receipt);
 
   check(`${label}：队列排空且全部完成`, drained && real.length === total && real.every((mail) => mail.status === "done"), {
-    drained, 状态: byStatus(mails),
+    drained, 状态: byStatus(mails), 错误样例: mails.filter((mail) => mail.error).slice(0, 2).map((mail) => mail.error),
   });
   check(`${label}：没有失败/取消/卡住 running`, !mails.some((mail) => mail.status !== "done"), byStatus(mails));
   check(`${label}：突发没触发后台压缩（窗口按字符封顶，没截断）`, mails.length === total, { mails: mails.length, total });
@@ -364,12 +371,21 @@ async function runBurst({ upstream, budget, streamCount, rounds, label }) {
   const pairOverlaps = [];
   const leaks = [];
   const orderBreaks = [];
+  // 前缀复用口径与 smoke 8d 相同：相邻两轮 system 的公共前缀 ÷ 本轮长度。
+  // 这是按前缀缓存语义本地算出来的可复用比例，不是提供商回报的 cached_tokens。
+  const prefixRatios = [];
   for (let i = 0; i < streamCount; i += 1) {
     const name = `压测群${i}`;
     const mine = calls.filter((call) => call.stream === name).sort((a, b) => a.at - b.at);
     mine.forEach((call, k) => {
       if (k > 0 && !call.system.includes(`已处理 ${marker(i, k)}`)) fifoBreaks.push({ 群: i, 第几次: k + 1 });
       if (k > 0 && call.at < mine[k - 1].endAt) pairOverlaps.push({ 群: i, 第几次: k + 1 });
+      if (k > 0) {
+        const prev = mine[k - 1].system;
+        let shared = 0;
+        while (shared < prev.length && shared < call.system.length && prev[shared] === call.system[shared]) shared += 1;
+        prefixRatios.push(shared / call.system.length);
+      }
     });
     // 上下文里出现别的群的标记 = 串群（窗口取错群、或装配把两群混在一起）。
     const seen = new Set(mine.flatMap((call) => call.system.match(/S\d+T\d+/g) ?? [])
@@ -404,7 +420,124 @@ async function runBurst({ upstream, budget, streamCount, rounds, label }) {
   metric(`${label} 起跑延迟（自开跑起）p50/p95/max`, `${pct(wait, 50)}/${pct(wait, 95)}/${Math.max(...wait)}ms`);
   metric(`${label} 峰值并发（上游侧）`, `${peak}（上界 ${ceiling}）`);
   metric(`${label} 各群排空时点跨度`, `${Math.max(...perStreamEnd) - Math.min(...perStreamEnd)}ms`);
+  metric(`${label} 同群相邻两轮前缀复用率 p50/min（本地按前缀语义计算）`,
+    `${(pct(prefixRatios, 50) * 100).toFixed(1)}%/${(Math.min(...prefixRatios) * 100).toFixed(1)}%（${prefixRatios.length} 对）`);
   return { makespan, total, peak, execP50: pct(exec, 50), waitP95: pct(wait, 95) };
+}
+
+/** B7：Stream 规范 API 的分段延迟。loopback 参考执行器（shared 档）挂同一个假上游，
+ *  与 OpenAI 直连对照：量的是协议这一跳本身的开销，不含模型推理差异。 */
+async function streamApiScenario(upstream) {
+  step("B7 Stream 规范 API 分段延迟（loopback 参考执行器，shared 档，40 轮）");
+  const token = randomBytes(24).toString("hex");
+  const executor = await listenStreamServer({
+    server: createStreamServer({
+      upstreamUrl: upstream.baseUrl, upstreamKey: "bench-key-0123456", upstreamModel: "bench-model",
+      token, label: "bench-executor",
+    }),
+    port: 0,
+  });
+  const origin = executor.origin;
+  const expected = "已处理 S9T01";
+  const messages = [
+    { role: "system", content: "你是虚拟员工「小测」，正在 WorkStream 群「延迟群」里工作。\n\n上一条 @ 你的消息：安娜：请处理 S9T01" },
+    { role: "user", content: "请按上面的上下文回应这条任务。" },
+  ];
+  const rounds = 40;
+  const discovery = [];
+  const wireFirst = [];
+  const wireDone = [];
+  const clientRound = [];
+  const directFirst = [];
+  const directRound = [];
+  const overhead = [];
+  let profileOk = 0;
+  let wireOk = 0;
+  let clientOk = 0;
+  let directOk = 0;
+  try {
+    for (let i = 0; i < rounds; i += 1) {
+      let t0 = Date.now();
+      const found = await discoverStreamServer({ origin, token });
+      discovery.push(Date.now() - t0);
+      if (found.descriptor && found.profile === SHARED_PROFILE) profileOk += 1;
+
+      // 规范线上逐帧量：POST → 首个 turn.delta → 权威 turn.done。
+      t0 = Date.now();
+      const response = await fetch(`${origin}${endpointPath("createTurn")}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "text/event-stream", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ turn_id: newId(), model: "bench-model", messages }),
+      });
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let firstAt = 0;
+      let doneAt = 0;
+      let doneContent = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let cut;
+        while ((cut = buffer.indexOf("\n\n")) >= 0) {
+          const raw = buffer.slice(0, cut);
+          buffer = buffer.slice(cut + 2);
+          if (!raw.startsWith("data: ")) continue;
+          const data = raw.slice(6);
+          if (data === "[DONE]") continue;
+          const payload = JSON.parse(data);
+          if (payload.type === "turn.delta" && !firstAt) firstAt = Date.now();
+          if (payload.type === "turn.done") {
+            doneAt = Date.now();
+            doneContent = payload.content;
+          }
+        }
+      }
+      reader.releaseLock();
+      wireFirst.push(firstAt - t0);
+      wireDone.push(doneAt - t0);
+      if (doneContent === expected) wireOk += 1;
+
+      // 生产客户端整轮（askStreamServer 的 shared 档），与裸 fetch 的差就是客户端装配那一段。
+      t0 = Date.now();
+      const result = await askStreamServer({
+        db: null,
+        agent: { api_base_url: `${origin}/stream-server/v1`, model: "bench-model", stream_profile: SHARED_PROFILE },
+        streamId: "bench", key: token, messages,
+        openai: () => { throw new Error("B7 不该退回 OpenAI 档"); },
+      });
+      const clientMs = Date.now() - t0;
+      clientRound.push(clientMs);
+      if (result.content === expected) clientOk += 1;
+
+      // 对照：同一个假上游，OpenAI 直连。
+      t0 = Date.now();
+      let directFirstAt = 0;
+      const direct = await chatCompletion({
+        baseUrl: upstream.baseUrl, apiKey: "bench-key-0123456", model: "bench-model", messages,
+        onDelta: (delta) => { if (!directFirstAt && (delta.content || delta.reasoning)) directFirstAt = Date.now(); },
+      });
+      const directMs = Date.now() - t0;
+      directFirst.push(directFirstAt - t0);
+      directRound.push(directMs);
+      if (direct.content === expected) directOk += 1;
+      overhead.push(clientMs - directMs);
+    }
+  } finally {
+    await executor.close();
+  }
+  check("B7：发现 40 次都解析成功且判为 shared 档", profileOk === rounds, { profileOk });
+  check("B7：权威帧/客户端/直连三方正文一致（协议没改内容）",
+    wireOk === rounds && clientOk === rounds && directOk === rounds, { wireOk, clientOk, directOk });
+  check("B7：协议净开销 p95 ≤ 250ms（loopback，同一上游剧本）", pct(overhead, 95) <= 250, { p95: pct(overhead, 95) });
+  metric("B7 发现 GET p50/p95", `${pct(discovery, 50)}/${pct(discovery, 95)}ms`);
+  metric("B7 POST→首个增量帧 p50/p95", `${pct(wireFirst, 50)}/${pct(wireFirst, 95)}ms`);
+  metric("B7 POST→权威帧 p50/p95", `${pct(wireDone, 50)}/${pct(wireDone, 95)}ms`);
+  metric("B7 客户端整轮（askStreamServer）p50/p95", `${pct(clientRound, 50)}/${pct(clientRound, 95)}ms`);
+  metric("B7 直连对照 首字 p50/p95", `${pct(directFirst, 50)}/${pct(directFirst, 95)}ms`);
+  metric("B7 直连对照 整轮 p50/p95", `${pct(directRound, 50)}/${pct(directRound, 95)}ms`);
+  metric("B7 规范协议净开销（整轮差）p50/p95", `${pct(overhead, 50)}/${pct(overhead, 95)}ms`);
 }
 
 async function main() {
@@ -423,6 +556,7 @@ async function main() {
     await weightScenario(upstream);
     await concurrentDriversScenario(upstream);
     await zombieScenario(upstream);
+    await streamApiScenario(upstream);
   } finally {
     await Promise.all(liveWorkers.map((worker) => worker.stop()));
     await upstream.close();
