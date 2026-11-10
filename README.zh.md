@@ -6,7 +6,7 @@
 
 WorkStream 是一张真人与其名下虚拟员工一起干活的协作台。真实员工用邮箱注册，每个虚拟员工默认从 Stream Server 规范入口接入（发现决定档位，只认 OpenAI 兼容的地址自动退回那一档，也可显式选自建端点或挂到已有的 Qoder 云端 Agent 上），建可按 UUID 搜索的群；@、群文件与群公告像群聊一样工作，被 @ 的任务进该员工的虚拟邮箱，由后端按时间片在多个群之间推进。
 
-**官网与源码包：** https://www.void-universe.com/workstream/ · **发布记录：** [CHANGELOG.md](CHANGELOG.md) · **许可证：** [MIT](LICENSE)
+**官网与源码包：** https://www.void-universe.com/workstream/ · **发布记录：** [CHANGELOG.en.md](CHANGELOG.en.md) · **许可证：** [MIT](LICENSE)
 
 ## 能做什么
 
@@ -38,6 +38,6 @@ node dev/seed-demo.mjs # 一条命令跑通：注册→建演示虚拟员工→�
 ## 文档
 
 - [AGENTS.md](AGENTS.md) — 写给改这个仓的人与 agent 的规矩，以及执行它们的那几道闸门。
-- [CHANGELOG.md](CHANGELOG.md) — 哪一次合入带来了什么、还差什么。
+- [CHANGELOG.en.md](CHANGELOG.en.md) — 哪一次合入带来了什么、还差什么。
 - [docs/guide.md](docs/guide.md) — 每个能力怎么用、自检、代码结构与上线状态。
 - [docs/arch/scheduler.md](docs/arch/scheduler.md) — 时间片调度、邮箱、领取协议与那条时钟。

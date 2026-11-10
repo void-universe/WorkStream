@@ -654,7 +654,6 @@ for (const code of [...ERROR_CODES.client, ...ERROR_CODES.server]) {
 // README 的英文那份是仓库首页，中文那份才带语言后缀；其余文档仍是「中文主名 + .en 英文」。
 const DOC_PAIRS = [
   ["README.zh.md", "README.md"],
-  ["CHANGELOG.md", "CHANGELOG.en.md"],
   ["docs/guide.md", "docs/guide.en.md"],
   ["docs/arch/scheduler.md", "docs/arch/scheduler.en.md"],
   ["docs/arch/distributed.md", "docs/arch/distributed.en.md"],
@@ -663,6 +662,7 @@ const DOC_PAIRS = [
 const SINGLE_LANGUAGE_DOCS = {
   "AGENTS.md": "写给改这个仓的人与 agent 的规矩文件：同一份规矩摆成两种语言，就会变成两份会各自漂移的规矩",
   "PROVENANCE.md": "vendor/ 里 upstream 的来源与许可证记录，条目名与条款本来就是英文",
+  "CHANGELOG.en.md": "记「哪一次合入带来了什么」的流水账：摆成中英两份，改一处就漏改另一处，两份会自己越漂越远，所以只有英文这一份",
 };
 const walkDocs = (dir, relative) => {
   const found = [];
@@ -712,7 +712,10 @@ const docLines = (text) => text.split(/\r?\n/);
 const headingLevels = (lines) => lines.filter((line) => /^#{1,6} /.test(line)).map((line) => line.indexOf(" "));
 const tableShape = (lines) => lines.filter((line) => /^\s*\|/.test(line)).map((line) => line.split("|").length - 2);
 const codeSpans = (text) => new Set([...text.matchAll(/`([^`\n]+)`/g)].map((match) => stripEn(match[1])));
-const docLinks = (text) => [...text.matchAll(/\]\((?!https?:|#)([^)\s]+)\)/g)].map((match) => stripEn(match[1].split("#")[0]));
+// 链接存在性认「作者写下的那个目标真的存在」：英文那份常指 `.en.md` 对照件，单语文档（CHANGELOG.en.md）
+// 只有一份、没有中文孪生，所以这里不能先把 `.en.md` 归一化成基础名再查——那等于要求每个 `.en.md` 都有中文孪生。
+// 归一化只用于内联码集合的对账（事实要逐字一样），不用于「这条链接能不能点开」。
+const docLinks = (text) => [...text.matchAll(/\]\((?!https?:|#)([^)\s]+)\)/g)].map((match) => match[1].split("#")[0]);
 const diffSet = (left, right) => [...left].filter((value) => !right.has(value));
 const zhAliasSeen = new Set();
 const enAliasSeen = new Set();
