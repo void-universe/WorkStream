@@ -24,10 +24,11 @@ export const actions = {
   /**
    * 时间片推进：一次 tick 给每个有活儿的虚拟员工分配若干任务槽，
    * 槽位按该员工在各群里的权重（默认均分）用最大余数法分配，群内按 FIFO 取件。
-   * 站点 Function 不能常驻后台，因此由前端轮询驱动；任务一旦开始仍会被插话/叫停抢占：
-   * 同进程走 interrupt 总线即时点火，跨进程由 400ms 的邮箱轮询兜底。
+   * 两种驱动：内嵌模式由前端轮询/常驻 worker 调；远程模式（WORKSTREAM_EXECUTION=worker）下
+   * 控制面这次调用空转，认领与执行全在独立 worker 进程里（带 worker 上下文），控制面升级不中断在跑回合。
+   * 任务一旦开始仍会被插话/叫停抢占：同进程走 interrupt 总线即时点火，跨进程由 400ms 的邮箱轮询兜底。
    */
-  async "scheduler.tick"({ db, user, env, params }) {
+  async "scheduler.tick"({ db, user, env, params, worker }) {
     const since = Number(params.get("since") ?? 0);
     const mine = await db.members.list([
       ["principal_type", "human"], ["principal_id", user.id],
@@ -37,6 +38,12 @@ export const actions = {
     const myAgents = await db.agents.list([["owner_id", user.id]], { columns: "id,name", limit: 60 });
     const agentIds = myAgents.map((a) => a.id);
     if (!agentIds.length) return json({ ok: true, ran: [], queued: 0, since });
+
+    // 远程执行模式：控制面只读不认领，回合全归 worker 进程——这样控制面升级/重启才掐不断在跑的活。
+    // worker 自己调 tick 时带着 worker 上下文，不受这条限制；前端轮询（无 worker）在这模式下空转。
+    if (!worker && String(env?.("WORKSTREAM_EXECUTION") ?? "") === "worker") {
+      return json({ ok: true, ran: [], queued: 0, since, execution: "worker" });
+    }
 
     // 排程在这一轮醒来：先把这位主人名下到点的排程投成信，再按平时的方式取排队——
     // 同一个 tick 就能把新投的信跑掉，不用多等一轮。扫的是 (owner_id, next_run_at) 索引，
@@ -49,7 +56,7 @@ export const actions = {
       columns: "id,agent_id,stream_id,message_id,trigger_seq,priority,created_at,status,priority,slice_count,meta",
       order: ["created_at", { ascending: true }], limit: 200,
     });
-    await reapStale(db);
+    await reapStale(db, env);
     if (!queuedAll.length) return json({ ok: true, ran: [], queued: 0, since, cron: cronFired });
 
     // 同一个 (员工, 群) 一轮只放最早的一封：并发跑两封，后一封的上下文里就没有前一封的回复，落群顺序还会倒置。
@@ -112,15 +119,23 @@ export const actions = {
     await Promise.all(plan.slice(0, budget * Math.min(byAgent.size, 6)).map(async (mail) => {
       const claimed = await db.mail.claim([["id", mail.id], ["status", "queued"]], {
         status: "running", started_at: now(), slice_count: Number(mail.slice_count ?? 0) + 1,
+        // 认领即记下是哪台 worker 接的、心跳从此刻起算；内嵌模式没有 worker，两列为空回收退回 started_at。
+        worker_id: worker?.id ?? null, heartbeat_at: now(),
       });
       if (!claimed) return;
-      const outcome = await runTask({ db, env, mailId: mail.id }).catch(async (error) => {
+      worker?.track?.(mail.id);
+      let outcome;
+      try {
+        outcome = await runTask({ db, env, mailId: mail.id });
+      } catch (error) {
         const code = String(error?.error ?? "task_failed");
         // runTask 自己抛出来时邮箱还停在 running：不落 failed 并合上步骤，时间线会一直闪"处理中"，
-        // 这封信也要等 5 分钟才被 reapStale 回收。
+        // 这封信也要等回收阈值才被 reapStale 接手。
         await finish(db, mail.id, "failed", code);
-        return { status: "failed", error: code };
-      });
+        outcome = { status: "failed", error: code };
+      } finally {
+        worker?.untrack?.(mail.id);
+      }
       ran.push({ mail_id: mail.id, agent_id: mail.agent_id, stream_id: mail.stream_id, ...outcome });
     }));
     const left = await db.mail.list([
@@ -140,7 +155,7 @@ export const actions = {
       if (!ids.length) continue;
       const streams = await db.streams.list([["id", ids]], { columns: "id,name", limit: 60 });
       const mail = await db.mail.list([["agent_id", agent.id]], {
-        columns: "id,stream_id,status,priority,created_at,started_at,finished_at,error,slice_count",
+        columns: "id,stream_id,status,priority,created_at,started_at,finished_at,error,slice_count,worker_id",
         order: ["created_at", { ascending: false }], limit: 200,
       });
       const weights = await db.slice_prefs.list([["agent_id", agent.id]], {
@@ -164,11 +179,18 @@ export const actions = {
             failed: mine.filter((m) => m.status === "failed").length,
             slices: mine.reduce((sum, m) => sum + Number(m.slice_count ?? 0), 0),
             last_error: mine.find((m) => m.error)?.error ?? null,
+            // 这个群此刻在哪些 worker 上跑：只数 running 的信，内嵌模式 worker_id 为空就不列。
+            workers: [...new Set(mine.filter((m) => m.status === "running" && m.worker_id).map((m) => m.worker_id))],
           };
         }),
       });
     }
-    return json({ ok: true, boards: rows, budget: sliceBudget() });
+    // 全局 worker 心跳列表（基础设施状态，不含凭据）：调度台据此看"谁在干活/那台是不是死了"。
+    const workers = await db.workers.list([["status", ["active", "draining"]]], {
+      columns: "id,label,version,status,inflight,last_heartbeat_at",
+      order: ["last_heartbeat_at", { ascending: false }], limit: 50,
+    });
+    return json({ ok: true, boards: rows, budget: sliceBudget(), workers });
   },
 
   /** 领导（群主/管理员）确认某个虚拟员工在本群的优先级权重；默认不设置即均分。 */
@@ -256,6 +278,12 @@ function sliceBudget(env) {
   return Number.isSafeInteger(raw) && raw >= 1 && raw <= 8 ? raw : 2;
 }
 
+/** 回收阈值走配置：worker 心跳间隔必须远小于它，活着的长任务才不会被误杀。默认 5 分钟。 */
+export function reapThreshold(env) {
+  const raw = Number(env?.("WORKSTREAM_REAP_MS") ?? 300_000);
+  return Number.isSafeInteger(raw) && raw >= 10_000 && raw <= 3_600_000 ? raw : 300_000;
+}
+
 const itemWeight = (item) => {
   const value = Number(item?.priority ?? 1);
   return Number.isSafeInteger(value) && value >= 1 && value <= 20 ? value : 1;
@@ -284,15 +312,17 @@ export function allocate(budget, groups) {
   return result.filter((r) => r.slots > 0);
 }
 
-/** 超过 5 分钟仍处于 running 的任务视为上一次调用中断，回收为失败；期间收到的插话转成待办，不丢。
+/** running 的信超过回收阈值仍没心跳，视为上一次执行中断，回收为失败；期间收到的插话转成待办，不丢。
+ *  口径：worker 的心跳定时器替在跑的信刷新 heartbeat_at，活着的长任务不会被误杀；
+ *  旧行没有 heartbeat_at 就退回 started_at 的老口径。阈值走配置（reapThreshold）。
  *  导出给 worker：空闲（没有排队）时也要有人回收，否则崩溃留下的 running 会永远卡住那个员工。 */
-export async function reapStale(db) {
-  const cutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+export async function reapStale(db, env) {
+  const cutoff = new Date(Date.now() - reapThreshold(env)).toISOString();
   const stale = await db.mail.list([["status", "running"]], {
-    columns: "id,agent_id,stream_id,started_at,meta,priority", limit: 50,
+    columns: "id,agent_id,stream_id,started_at,heartbeat_at,meta,priority", limit: 50,
   });
   for (const row of stale) {
-    if (String(row.started_at ?? "") >= cutoff) continue;
+    if (String(row.heartbeat_at ?? row.started_at ?? "") >= cutoff) continue;
     const claimed = await db.mail.claim([["id", row.id], ["status", "running"]], {
       status: "failed", error: "slice_interrupted", finished_at: now(),
     });

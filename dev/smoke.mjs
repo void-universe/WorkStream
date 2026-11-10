@@ -17,11 +17,21 @@ import { LOCALE_IDS } from "../functions/locales.mjs";
 import { skillPrompt } from "../functions/skills.mjs";
 import { store } from "../functions/store.mjs";
 import { closeOrphanSteps, createStepWriter } from "../functions/steps.mjs";
-import { askCloudAgent, flattenPrompt, parseAgentId, QcaError } from "../functions/qca.mjs";
+import { askCloudAgent, dataOf, flattenPrompt, parseAgentId, QcaError } from "../functions/qca.mjs";
+import { askStreamServer, checkStreamAccess, isDurableDiscoveryFailure } from "../functions/stream.mjs";
+import { createCtsGate, payloadOf, runConformance } from "../functions/streamcts.mjs";
+import { createStreamServer } from "../functions/streamserver.mjs";
+import { listenStreamServer } from "./stream-server.mjs";
+import {
+  CAP_KEYS, DISCOVERY_REASONS, ENDPOINTS, SHARED_PROFILE, SPEC_ID, STREAM_PROFILE_VALUES, endpointPath,
+  matchEndpoint, parseDescriptor, pickProfile, specDescriptor, validateSpec,
+} from "../functions/streamspec.mjs";
 import { completeForAgent } from "../functions/agents.mjs";
+import { actions, reapStale, reapThreshold, runTask } from "../functions/engine.mjs";
+import { startWorker } from "../functions/worker.mjs";
 import { demoCopy, systemCopy } from "../functions/copy.mjs";
 import { parseTranscript, renderTranscript } from "../functions/transcript.mjs";
-import { Interrupted, newId } from "../functions/util.mjs";
+import { Interrupted, newId, now } from "../functions/util.mjs";
 import { createFixtureClient } from "./fixture-supabase.mjs";
 import { fileRenderers, registerFileRenderer, renderGroupFile } from "../src/lib/renderers/index.mjs";
 import { hitRateOf, newUsage, tallyUsage } from "../src/lib/usageStats.mjs";
@@ -681,6 +691,254 @@ function startMockQca() {
         requests,
         state,
         count: (method, match) => requests.filter((r) => r.method === method && match.test(r.path)).length,
+        close: () => new Promise((done) => { server.close(() => done()); }),
+      });
+    });
+  });
+}
+
+/**
+ * 假 dedicated 档执行器：帧词表借云端那一套（event_delta / agent.message），路由挂在规范前缀下。
+ * GET stream 先连上挂着，POST events 到了才往那条挂着的连接里写回复——runSessionTurn 的顺序是
+ * 「先连流再发问」，反过来写夹具会让自检永远等不到增量。
+ */
+function startMockDedicated(token) {
+  const requests = [];
+  const state = {
+    mode: "ok",
+    text: "专属正文：这台 server 跑它自己的工具集。",
+    reasoning: "专属思考链：我不进群。",
+    sessions: 0,
+    promptSeen: null,
+    held: null,
+    stallText: "静默前两句",
+  };
+  const frame = (obj) => `data: ${JSON.stringify(obj)}\n\n`;
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const path = new URL(req.url, "http://mock").pathname;
+      const method = req.method;
+      let body = null;
+      try { body = raw ? JSON.parse(raw) : null; } catch { body = { bad_json: true }; }
+      requests.push({ method, path, body });
+      res.on("error", () => {});
+      const send = (payload) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(payload)); };
+      const deny = (status, error) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify({ error })); };
+      if (req.headers.authorization !== `Bearer ${token}`) return deny(401, "stream_unauthorized");
+      if (method === "GET" && path === "/stream-server/v1") {
+        return send(specDescriptor({ profiles: ["dedicated"], models: ["ded-model"], label: "smoke dedicated" }));
+      }
+      if (method === "POST" && path === "/stream-server/v1/sessions") {
+        state.sessions += 1;
+        return send({ session_id: `sess_ded_${state.sessions}` });
+      }
+      if (method === "GET" && /^\/stream-server\/v1\/sessions\/sess_ded_[0-9]+\/events\/stream$/.test(path)) {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+        // node 只 writeHead 不发头：客户端要先看到响应头才会去 POST events，头卡在缓冲区里两边就互相等到超时。
+        // 真实的专属执行器同理——规范里这条是硬要求，不是实现细节。
+        res.flushHeaders();
+        state.held = res;
+        if (state.mode === "stall") {
+          res.write(frame({ type: "event_delta", delta: { content: { type: "text", text: state.stallText } } }));
+        }
+        return;
+      }
+      const eventsPath = path.match(/^\/stream-server\/v1\/sessions\/(sess_ded_[0-9]+)\/events$/);
+      if (method === "POST" && eventsPath) {
+        const prompt = body?.events?.[0]?.content?.[0]?.text;
+        if (typeof prompt !== "string") return deny(400, "stream_bad_request");
+        state.promptSeen = { prompt, hasTools: body?.tools !== undefined, sessionId: eventsPath[1] };
+        if (state.mode === "ok" && state.held && !state.held.writableEnded) {
+          const held = state.held;
+          state.held = null;
+          held.write(frame({ type: "event_delta", delta: { content: { type: "text", text: state.text.slice(0, 4) } } }));
+          held.write(frame({ type: "event_delta", delta: { content: { type: "text", text: state.text.slice(4) } } }));
+          // 思考链与正文混在同一个 content 数组：只有 text 块允许进群（与云端那一档同口径）。
+          held.write(frame({
+            type: "agent.message",
+            id: "evt_a_1",
+            content: [{ type: "thinking", thinking: state.reasoning }, { type: "text", text: state.text }],
+          }));
+          held.end();
+        }
+        return send({ data: [{ id: "evt_u_1", type: "user.message" }] });
+      }
+      if (method === "POST" && /^\/stream-server\/v1\/sessions\/sess_ded_[0-9]+\/interrupt$/.test(path)) return send({ ok: true });
+      // 路径在表里而方法不对：回 405 而不是 404。夹具要是把两者塌成一个码，考卷（dev/cts.mjs）量它时
+      // 就会把「夹具的偷懒」记成「规范允许 404」，而供应商照夹具写实现就在真实世界里丢这条区分。
+      const KNOWN_DEDICATED = [
+        "/stream-server/v1/sessions",
+        /^\/stream-server\/v1\/sessions\/sess_ded_[0-9]+\/events$/,
+        /^\/stream-server\/v1\/sessions\/sess_ded_[0-9]+\/events\/stream$/,
+        /^\/stream-server\/v1\/sessions\/sess_ded_[0-9]+\/interrupt$/,
+      ];
+      if (KNOWN_DEDICATED.some((entry) => (typeof entry === "string" ? path === entry : entry.test(path)))) {
+        return deny(405, "stream_method_not_allowed");
+      }
+      return deny(404, "stream_endpoint_missing");
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        port: server.address().port,
+        get origin() { return `http://127.0.0.1:${server.address().port}`; },
+        requests,
+        state,
+        count: (method, match) => requests.filter((r) => r.method === method && match.test(r.path)).length,
+        close: () => new Promise((done) => { server.close(() => done()); }),
+      });
+    });
+  });
+}
+
+/**
+ * 「断流」夹具：流只写一条增量就干净收尾——既没有 turn.done 也没有 [DONE]——但这一轮在服务器侧
+ * 其实已经写完，GET 能取回权威结果。客户端的恢复路径（fetchTurn）认的是这份契约，
+ * 不是我们参考实现的内部实现，所以这里单独造一台，不复用 functions/streamserver.mjs。
+ */
+function startCutServer(token, { withGet = true } = {}) {
+  const FULL = "断流之后才取回的权威正文。";
+  const turns = new Map();
+  const frame = (obj) => `data: ${JSON.stringify(obj)}\n\n`;
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const path = new URL(req.url, "http://mock").pathname;
+      const method = req.method;
+      let body = null;
+      try { body = raw ? JSON.parse(raw) : null; } catch { body = null; }
+      res.on("error", () => {});
+      const deny = (status, error, detail) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(detail === undefined ? { error } : { error, detail }));
+      };
+      if (req.headers.authorization !== `Bearer ${token}`) return deny(401, "stream_unauthorized");
+      if (method === "GET" && path === "/stream-server/v1") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(specDescriptor({ profiles: ["shared"], models: ["cut-model"] })));
+        return;
+      }
+      if (method === "POST" && path === "/stream-server/v1/turns") {
+        const id = String(body?.turn_id ?? "");
+        turns.set(id, {
+          turn_id: id, state: "done", content: FULL, reasoning: "", tool_calls: [],
+          usage: null, finish_reason: "stop", first_token_ms: 1,
+        });
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+        res.write(frame({ type: "turn.delta", content: "半截连接", reasoning: "" }));
+        res.end();
+        return;
+      }
+      const get = path.match(/^\/stream-server\/v1\/turns\/([^/]+)$/);
+      if (method === "GET" && get) {
+        const entry = withGet ? turns.get(get[1]) : null;
+        if (!entry) return deny(404, "stream_turn_not_found", get[1]);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(entry));
+        return;
+      }
+      return deny(404, "stream_endpoint_missing", path);
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        port: server.address().port,
+        get origin() { return `http://127.0.0.1:${server.address().port}`; },
+        close: () => new Promise((done) => { server.close(() => done()); }),
+      });
+    });
+  });
+}
+
+/** 只认 OpenAI 兼容的 server：发现那条路回 404，客户端该把这个事实记成退回那一档，而不是每轮重猜。 */
+function startPlainOpenai() {
+  const requests = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      const path = new URL(req.url, "http://mock").pathname;
+      let body = null;
+      try { body = raw ? JSON.parse(raw) : null; } catch { body = null; }
+      requests.push({ method: req.method, path, body });
+      res.on("error", () => {});
+      if (req.method === "POST" && path === "/v1/chat/completions") {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+        res.write(`data: ${JSON.stringify({ id: "plain", choices: [{ index: 0, delta: { content: "_plain_endpoint_ok" }, finish_reason: null }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "plain", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not_found" }));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        port: server.address().port,
+        get origin() { return `http://127.0.0.1:${server.address().port}`; },
+        requests,
+        close: () => new Promise((done) => { server.close(() => done()); }),
+      });
+    });
+  });
+}
+
+/**
+ * 上游收下请求、发了 SSE 响应头，然后一个字都不吐。用来钉「响应头必须立刻可见」：
+ * 客户端的 fetch 是在收到响应头时才 resolve 的，执行器把头攒着等第一个字，上游一慢，
+ * 客户端连读循环都进不去——叫停问不到，只能干等整轮超时。
+ */
+function startSilentUpstream() {
+  const requests = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      requests.push({ method: req.method, path: new URL(req.url, "http://mock").pathname });
+      res.on("error", () => {});
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+      res.flushHeaders();
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        port: server.address().port,
+        get origin() { return `http://127.0.0.1:${server.address().port}`; },
+        requests,
+        // 挂着的响应永不收尾：不先掐连接，close 会一直等下去。
+        close: () => new Promise((done) => { server.closeAllConnections?.(); server.close(() => done()); }),
+      });
+    });
+  });
+}
+
+/** 发现响应撒谎的 server：caps 与 profile 对不上，客户端该整条拒掉并按退回档记，而不是照谎言选路。 */
+function startLyingSpec(descriptor) {
+  const server = createServer((req, res) => {
+    res.on("error", () => {});
+    const path = new URL(req.url, "http://mock").pathname;
+    if (req.method === "GET" && path === "/stream-server/v1") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(descriptor));
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "stream_endpoint_missing", detail: path }));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        port: server.address().port,
+        get origin() { return `http://127.0.0.1:${server.address().port}`; },
         close: () => new Promise((done) => { server.close(() => done()); }),
       });
     });
@@ -1447,9 +1705,13 @@ async function main() {
     foldStop.status === 409 && foldStop.payload.error === "nothing_running", foldStop.payload);
   mock.scripts.compress = "ok";
   const foldInsertMailId = foldSteer.payload.queued?.[0]?.mail_id;
-  for (let round = 0; round < 10; round += 1) {
-    const status = (await db.mail.byId(foldInsertMailId, { columns: "id,status" }))?.status;
-    if (status === "done" || status === "failed" || status === "cancelled") break;
+  // 紧接着两条断言分别读插话那封和压缩那封，所以两封都得等到终态再 break。
+  // 只等插话那封：刚才故意放慢的压缩信可能还在跑，第二条断言就随机翻红（把时序抖动伪装成产品缺陷）。
+  const foldTerminal = (s) => s === "done" || s === "failed" || s === "cancelled";
+  for (let round = 0; round < 12; round += 1) {
+    const insertStatus = (await db.mail.byId(foldInsertMailId, { columns: "id,status" }))?.status;
+    const compressStatus = (await db.mail.byId(foldMail?.id, { columns: "id,status" }))?.status;
+    if (foldTerminal(insertStatus) && foldTerminal(compressStatus)) break;
     await call("scheduler.tick", { token: ana, method: "GET" });
   }
   const foldInsertMail = await db.mail.byId(foldInsertMailId, { columns: "id,status,error" });
@@ -1554,15 +1816,15 @@ async function main() {
     && composed.system.includes("需要时用 set_signature 更新")
     && !composed.system.includes("本次由云端 Agent 作答"), {});
   step("8d3. 后端清单：这条通道吃不吃工具是字段，不是注释");
-  check("三条通道的能力位都在表上，只有不吃工具的那条带措辞",
-    BACKENDS.map((entry) => entry.id).join(",") === "openai,demo,qca"
+  check("五条通道的能力位都在表上，只有不吃工具的那两条带措辞",
+    BACKENDS.map((entry) => entry.id).join(",") === "openai,demo,qca,stream,stream-dedicated"
     && BACKENDS.every((entry) => typeof entry.caps.tools === "boolean")
-    && BACKENDS.filter((entry) => !entry.caps.tools).map((entry) => entry.id).join(",") === "qca"
+    && BACKENDS.filter((entry) => !entry.caps.tools).map((entry) => entry.id).join(",") === "qca,stream-dedicated"
     && BACKENDS.every((entry) => entry.caps.tools || Boolean(entry.noToolsNotice)),
     BACKENDS.map((entry) => ({ id: entry.id, transport: entry.transport, tools: entry.caps.tools })));
   const badTables = [
     { 坏在哪: "id 重复（后一条会静默覆盖前一条）", entries: [...BACKENDS, { ...BACKENDS[0] }] },
-    { 坏在哪: "不吃工具却没给提示词措辞", entries: BACKENDS.map((entry) => (entry.id === "qca" ? { ...entry, noToolsNotice: "" } : entry)) },
+    { 坏在哪: "不吃工具却没给提示词措辞", entries: BACKENDS.map((entry) => (entry.caps.tools ? entry : { ...entry, noToolsNotice: "" })) },
     { 坏在哪: "没声明 caps.tools", entries: BACKENDS.map((entry) => (entry.id === "demo" ? { ...entry, caps: {} } : entry)) },
     { 坏在哪: "backend 列能写的 id 不在表里", entries: BACKENDS.filter((entry) => entry.id !== "openai") },
   ];
@@ -1583,14 +1845,36 @@ async function main() {
       return false;
     }
   })(), BACKEND_IDS);
-  check("员工档案 → 通道：列只分自建/云端，演示那条从地址认；空档按自建算",
+  // 规范对接那条通道有两副面孔，选哪一副由发现结果（agents.stream_profile）决定、不由地址决定：
+  // 分时档吃工具（我们的群工具整个发过去），专属档用它自己的工具集（措辞要说清调不到）。
+  const STREAM_ROWS = [
+    { backend: "stream", api_base_url: "https://worker.example.com", stream_profile: "shared", expect: "stream", tools: true },
+    { backend: "stream", api_base_url: "https://worker.example.com", stream_profile: "openai", expect: "stream", tools: true },
+    { backend: "stream", api_base_url: "https://worker.example.com", stream_profile: "dedicated", expect: "stream-dedicated", tools: false },
+    // 演示地址在这一档不认：建档/改档就拒了这种组合（stream_needs_real_origin）；
+    // 真出现了也按发现结果走，不悄悄退回内置演示模型。
+    { backend: "stream", api_base_url: DEMO_BASE_URL, stream_profile: "shared", expect: "stream", tools: true },
+  ];
+  check("员工档案 → 通道：列分自建/云端/规范对接，演示那条从地址认，规范对接那条再看发现结果；空档按自建算",
     backendFor({}).id === "openai"
     && backendFor({ backend: "openai", api_base_url: "https://api.example.com/v1" }).id === "openai"
     && backendFor({ backend: "openai", api_base_url: DEMO_BASE_URL }).id === "demo"
     && backendFor({ backend: "qca", api_base_url: DEMO_BASE_URL }).id === "qca"
-    && backendFor({ backend: "qca", api_base_url: "https://qoder.cn" }).transport === "cloud",
-    [{}, { backend: "openai", api_base_url: "https://api.example.com/v1" }, { backend: "openai", api_base_url: DEMO_BASE_URL }, { backend: "qca", api_base_url: DEMO_BASE_URL }]
-      .map((row) => backendFor(row).id));
+    && backendFor({ backend: "qca", api_base_url: "https://qoder.cn" }).transport === "cloud"
+    && STREAM_ROWS.every((row) => backendFor(row).id === row.expect && backendFor(row).caps.tools === row.tools),
+    [...[{}, { backend: "openai", api_base_url: "https://api.example.com/v1" }, { backend: "openai", api_base_url: DEMO_BASE_URL }, { backend: "qca", api_base_url: DEMO_BASE_URL }]
+      .map((row) => backendFor(row).id), ...STREAM_ROWS.map((row) => `${row.stream_profile}→${backendFor(row).id}`)]);
+  // 对照上面那四行放行：档位空着或写着表外的值就地抛。这一格决定提示词措辞与工具注入，
+  // 猜错的那一档会让专属员工得到一句"你有这些工具"的措辞，而工具一个也发不出去。
+  const profileless = [null, undefined, "shared ", "dedicate", "openai-compatible"].map((profile) => {
+    try {
+      return backendFor({ backend: "stream", api_base_url: "https://worker.example.com", stream_profile: profile }).id;
+    } catch (error) {
+      return error.code;
+    }
+  });
+  check("规范对接那一档没问过就上岗（或问出来一个表外的值）就地抛，不静默按某一档拼措辞",
+    profileless.every((code) => code === "stream_profile_unknown"), profileless);
   let unknownBackend = null;
   try {
     backendFor({ backend: "claude" });
@@ -3157,7 +3441,15 @@ async function main() {
     token: ana,
     body: { stream_id: qcaRoomId, content: "@小L 对照一句", mentions: [{ type: "agent", id: localId }] },
   });
-  await call("scheduler.tick", { token: ana, method: "GET" });
+  // 一次 tick 不一定排到这封新信：前面还压着这一节没排空的旧信，单次切片会把最新那封切掉，
+  // localSystem 就成了空串——把调度顺序的问题伪装成"通道被塞了云端须知"的产品缺陷。等到落终态为止。
+  for (let round = 0; round < 8; round += 1) {
+    await call("scheduler.tick", { token: ana, method: "GET" });
+    const localMail = (await db.mail.list([["agent_id", localId]], {
+      columns: "id,status", order: ["created_at", { ascending: false }], limit: 1,
+    }))[0];
+    if (localMail && ["done", "failed", "cancelled"].includes(localMail.status)) break;
+  }
   const localSystem = String(local.seen.at(-1)?.messages?.[0]?.content ?? "");
   check("对照：自建端点那条通道照旧带着工具说明，也没被塞云端须知",
     localSystem.includes("按需调用对应工具") && localSystem.includes("调用 search_history / read_window 工具")
@@ -4719,6 +5011,1005 @@ async function main() {
     await call("scheduler.tick", { token: ana, method: "GET" });
   }
   await x30Mock.close();
+
+  step("\n§31 分布式执行：多台 worker 对着同一个库认领，控制面升级不中断在跑的回合");
+  // 回合循环可以跑在独立 worker 进程里（分布在多台 server），控制面只读写库。这一节验五件事：
+  // 认领的 CAS 跨进程只放一个赢；worker 模式盖 worker_id、内嵌模式不盖；远程模式下控制面空转、
+  // worker 照常跑完且控制面"重启"掐不断在跑的回合；心跳停摆的信被回收并把插话转成待办；调度台透出 worker。
+  const x31Mock = await startMockUpstream();
+  const x31Url = `http://127.0.0.1:${x31Mock.port}/v1`;
+  const x31AgentId = (await call("agents.create", {
+    token: ana, body: { name: "分布员工", role: "分布式执行", api_base_url: x31Url, api_key: "mock-key-31", model: "mock", context_chars: 8000 },
+  })).payload.agent?.id;
+  const x31RoomId = (await call("streams.create", { token: ana, body: { name: "分布式组", agent_ids: [x31AgentId] } })).payload.stream?.id;
+  const x31Env = (name) => process.env[name];
+  // 直接调 action 带上 worker 上下文，正是 worker.mjs 驱动 tick 的形状；call() 那条不带 worker，模拟控制面/前端轮询。
+  const x31Tick = (worker) => actions["scheduler.tick"]({ db, env: x31Env, params: new URLSearchParams(), user: { id: anaId }, worker }).then((r) => r.json());
+  const x31Hook = (id) => ({ id, track() {}, untrack() {} });
+  const x31Replies = () => db.messages.list([["stream_id", x31RoomId], ["sender_type", "agent"]], { columns: "id,content", limit: 200 });
+  const x31Ask = async (content) => {
+    await call("messages.send", { token: ana, body: { stream_id: x31RoomId, content, mentions: [{ type: "agent", id: x31AgentId }] } });
+    return (await db.mail.first([["stream_id", x31RoomId], ["status", "queued"]], { columns: "id", order: ["created_at", { ascending: false }] }))?.id;
+  };
+
+  // A. 两台 worker 同时抢同一封：CAS 只放一个赢，群里只落一条回复（赢的跑完 / 输的跳过，本身就是一对）。
+  const x31Ha = x31Hook(newId());
+  const x31Hb = x31Hook(newId());
+  const x31MailA = await x31Ask("@分布员工 这一封谁来跑");
+  const [x31Ra, x31Rb] = await Promise.all([x31Tick(x31Ha), x31Tick(x31Hb)]);
+  const x31RanA = [...(x31Ra.ran ?? []), ...(x31Rb.ran ?? [])].filter((r) => r.stream_id === x31RoomId);
+  check("两台 worker 抢同一封：只有一台真的跑完", x31RanA.length === 1 && x31RanA[0].status === "done", x31RanA);
+  const x31MailAEnd = await db.mail.byId(x31MailA);
+  check("赢的那台把自己的 worker_id 盖在信上", x31MailAEnd.status === "done" && [x31Ha.id, x31Hb.id].includes(x31MailAEnd.worker_id), x31MailAEnd);
+  check("群里只落一条回复：认领的 CAS 挡住了重复执行", (await x31Replies()).length === 1, await x31Replies());
+
+  // B. 单行 CAS 原语本身并发安全：不靠 tick 的调度顺序，直接同时认领同一封，只返回一个 id。
+  const x31MailB = await x31Ask("@分布员工 直接验认领原语");
+  const [x31C1, x31C2] = await Promise.all([
+    db.mail.claim([["id", x31MailB], ["status", "queued"]], { status: "running", started_at: now(), worker_id: x31Ha.id, heartbeat_at: now() }),
+    db.mail.claim([["id", x31MailB], ["status", "queued"]], { status: "running", started_at: now(), worker_id: x31Hb.id, heartbeat_at: now() }),
+  ]);
+  check("同一封同时认领只返回一个 id（另一个被抢先拿 null）", Boolean(x31C1) !== Boolean(x31C2), { c1: x31C1, c2: x31C2 });
+  await db.mail.remove([["id", x31MailB]]);
+
+  // C. 内嵌模式不盖 worker_id（回收退回 started_at）；worker 模式盖上——一对放行/缺省对照。
+  const x31MailC1 = await x31Ask("@分布员工 内嵌模式跑一封");
+  await x31Tick(undefined);
+  const x31Embedded = await db.mail.byId(x31MailC1);
+  check("内嵌模式（无 worker）认领不写 worker_id", x31Embedded.status === "done" && x31Embedded.worker_id == null, x31Embedded);
+  const x31Hc = x31Hook(newId());
+  const x31MailC2 = await x31Ask("@分布员工 worker 模式跑一封");
+  await x31Tick(x31Hc);
+  const x31Stamped = await db.mail.byId(x31MailC2);
+  check("对照：worker 模式认领盖上自己的 worker_id", x31Stamped.status === "done" && x31Stamped.worker_id === x31Hc.id, x31Stamped);
+
+  // D. 远程模式：控制面空转不认领，worker 照常跑完；worker 正跑着时控制面"重启"再 tick，掐不断那封 running 信。
+  process.env.WORKSTREAM_EXECUTION = "worker";
+  try {
+    const x31MailD1 = await x31Ask("@分布员工 远程模式控制面别动手");
+    const x31Control = await call("scheduler.tick", { token: ana, method: "GET" });
+    check("远程模式控制面空转：只回报 execution=worker，不认领", x31Control.payload.execution === "worker" && (x31Control.payload.ran ?? []).length === 0, x31Control.payload);
+    const x31StillQueued = await db.mail.byId(x31MailD1);
+    check("控制面这次调用没动那封信：它还排队等 worker", x31StillQueued.status === "queued", x31StillQueued);
+    const x31Hw = x31Hook(newId());
+    const x31WorkerRan = await x31Tick(x31Hw);
+    check("远程模式 worker 照常跑完并落群（控制面空转不影响执行）", (x31WorkerRan.ran ?? []).some((r) => r.mail_id === x31MailD1 && r.status === "done"), x31WorkerRan.ran);
+
+    // 升级存活：worker 已认领、回合正跑着，控制面这时"重启"再 tick 一次——远程闸在 reapStale 之前就返回，碰都不碰它。
+    const x31MailD2 = await x31Ask("@分布员工 这封正跑着控制面重启");
+    const x31Hw2 = x31Hook(newId());
+    await db.mail.claim([["id", x31MailD2], ["status", "queued"]], { status: "running", started_at: now(), worker_id: x31Hw2.id, heartbeat_at: now() });
+    const x31Restart = await call("scheduler.tick", { token: ana, method: "GET" });
+    const x31Survived = await db.mail.byId(x31MailD2);
+    check("控制面重启掐不断在跑的回合：信仍 running、worker_id 不变", x31Restart.payload.execution === "worker" && x31Survived.status === "running" && x31Survived.worker_id === x31Hw2.id, x31Survived);
+    const x31Before = (await x31Replies()).length;
+    await runTask({ db, env: x31Env, mailId: x31MailD2 });
+    const x31Committed = await db.mail.byId(x31MailD2);
+    check("worker 把回合跑到提交点：控制面重启后回复照样落群", x31Committed.status === "done" && (await x31Replies()).length === x31Before + 1, x31Committed);
+  } finally {
+    delete process.env.WORKSTREAM_EXECUTION;
+  }
+
+  // E. 回收：心跳停摆的僵尸信回收成 failed 并把插话转成待办；心跳新鲜的长任务不误杀。
+  const x31Iso = (offsetMs) => new Date(Date.now() + offsetMs).toISOString();
+  const x31MailMsg = newId();
+  const x31RunningMail = async ({ heartbeatAt, meta = {}, workerId = newId() }) => {
+    const id = newId();
+    await db.mail.insert({
+      id, agent_id: x31AgentId, stream_id: x31RoomId, message_id: x31MailMsg,
+      trigger_seq: 1, priority: 1, status: "running", slice_count: 1, error: null,
+      created_at: x31Iso(-600000), started_at: x31Iso(-600000), finished_at: null,
+      updated_at: x31Iso(-600000), meta, worker_id: workerId, heartbeat_at: heartbeatAt,
+    }, { columns: "id" });
+    return id;
+  };
+  // E1. 精确边界：冻结时钟，心跳恰好等于 cutoff 的放过（>=），早 1ms 的回收——边界可重跑，不靠墙钟运气。
+  const x31RealNow = Date.now;
+  const x31Frozen = x31RealNow();
+  Date.now = () => x31Frozen;
+  try {
+    const x31Threshold = 60000;
+    const x31ReapEnv = (n) => (n === "WORKSTREAM_REAP_MS" ? String(x31Threshold) : undefined);
+    const x31AtId = await x31RunningMail({ heartbeatAt: new Date(x31Frozen - x31Threshold).toISOString() });
+    const x31OverId = await x31RunningMail({ heartbeatAt: new Date(x31Frozen - x31Threshold - 1).toISOString() });
+    await reapStale(db, x31ReapEnv);
+    const x31At = await db.mail.byId(x31AtId);
+    const x31Over = await db.mail.byId(x31OverId);
+    check("心跳恰好落在回收阈值上：放过（>= cutoff 不回收）", x31At.status === "running", x31At);
+    check("心跳比阈值早 1ms：回收成 failed slice_interrupted", x31Over.status === "failed" && x31Over.error === "slice_interrupted", x31Over);
+    await db.mail.remove([["id", x31AtId]]);
+    await db.mail.remove([["id", x31OverId]]);
+  } finally {
+    Date.now = x31RealNow;
+  }
+  // E2. 死 worker 的信被回收、插话转成待办；活 worker 的信 spared（一对回收/放行）。
+  const x31InterruptMsg = newId();
+  const x31DeadId = await x31RunningMail({ heartbeatAt: x31Iso(-600000), meta: { interrupt: { message_id: x31InterruptMsg, seq: 7 } } });
+  const x31LiveId = await x31RunningMail({ heartbeatAt: x31Iso(0) });
+  await reapStale(db, () => undefined);
+  const x31Dead = await db.mail.byId(x31DeadId);
+  const x31Live = await db.mail.byId(x31LiveId);
+  check("心跳停摆的僵尸信被回收成 failed slice_interrupted", x31Dead.status === "failed" && x31Dead.error === "slice_interrupted", x31Dead);
+  check("对照：心跳新鲜的长任务不被误杀（仍 running）", x31Live.status === "running", x31Live);
+  const x31Requeued = await db.mail.list([["stream_id", x31RoomId], ["status", "queued"], ["message_id", x31InterruptMsg]], { columns: "id,meta,message_id", limit: 10 });
+  check("回收时把待办插话转成一封新排队信，不丢", x31Requeued.length === 1 && x31Requeued[0].meta?.follow_up === "interrupt", x31Requeued);
+  await db.mail.remove([["id", x31DeadId]]);
+  await db.mail.remove([["id", x31LiveId]]);
+  for (const row of x31Requeued) await db.mail.remove([["id", row.id]]);
+
+  // F. 回收阈值走配置：默认 5 分钟，越界退回默认，上下限本身收得下。
+  check("回收阈值默认 5 分钟", reapThreshold(() => undefined) === 300000);
+  check("阈值低于下限退回默认", reapThreshold((n) => (n === "WORKSTREAM_REAP_MS" ? "9999" : undefined)) === 300000);
+  check("阈值高于上限退回默认", reapThreshold((n) => (n === "WORKSTREAM_REAP_MS" ? "3600001" : undefined)) === 300000);
+  check("合法阈值照配置生效", reapThreshold((n) => (n === "WORKSTREAM_REAP_MS" ? "60000" : undefined)) === 60000);
+  check("阈值上下限本身收得下", reapThreshold((n) => (n === "WORKSTREAM_REAP_MS" ? "10000" : undefined)) === 10000
+    && reapThreshold((n) => (n === "WORKSTREAM_REAP_MS" ? "3600000" : undefined)) === 3600000);
+
+  // G. startWorker 真实生命周期（隔离空库，不依赖有没有活儿）：上线注册 active、心跳持续刷新、优雅退出落 stopped。
+  const x31Sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  const x31LifeDb = store(createFixtureClient(join(dir, "x31-worker-lifecycle.json")));
+  const x31Worker = startWorker({ supabase: x31LifeDb.client, env: () => undefined, tickMs: 25, heartbeatMs: 25, label: "lifecycle-node", version: "test", log: () => {} });
+  let x31LifeRow = null;
+  for (let i = 0; i < 80 && !x31LifeRow; i += 1) { await x31Sleep(10); x31LifeRow = await x31LifeDb.workers.first([["label", "lifecycle-node"]]); }
+  check("worker 上线即注册一行 active 心跳（空库也注册）", x31LifeRow?.status === "active" && x31LifeRow?.label === "lifecycle-node", x31LifeRow);
+  const x31Beat0 = x31LifeRow?.last_heartbeat_at;
+  await x31Sleep(80);
+  const x31BeatRow = await x31LifeDb.workers.first([["label", "lifecycle-node"]]);
+  check("心跳定时器持续刷新 last_heartbeat_at", x31BeatRow?.last_heartbeat_at > x31Beat0, { before: x31Beat0, after: x31BeatRow?.last_heartbeat_at });
+  check("空闲 worker 的 inflight 如实报 0", x31BeatRow?.inflight === 0, x31BeatRow);
+  await x31Worker.stop();
+  const x31Stopped = await x31LifeDb.workers.first([["label", "lifecycle-node"]]);
+  check("优雅退出落 stopped、inflight 归零（先 draining 排空再停）", x31Stopped?.status === "stopped" && x31Stopped?.inflight === 0, x31Stopped);
+
+  // H. 调度台透出：全局 active worker 心跳列表 + 每个群此刻在哪些 worker 上跑（done 信的 worker_id 不冒充正在跑）。
+  const x31BoardNode = newId();
+  await db.workers.upsert({ id: x31BoardNode, label: "board-node", version: "v1", status: "active", inflight: 1, last_heartbeat_at: now(), created_at: now(), updated_at: now() }, { onConflict: "id" });
+  const x31Board0 = await call("scheduler.board", { token: ana, method: "GET" });
+  const x31Slice0 = x31Board0.payload.boards.flatMap((b) => b.streams).find((s) => s.stream_id === x31RoomId);
+  check("群里没有在跑的信时 workers 列为空（done 信的 worker_id 不冒充正在跑）", Array.isArray(x31Slice0?.workers) && x31Slice0.workers.length === 0, x31Slice0);
+  check("调度台透出全局 active worker 心跳列表", x31Board0.payload.workers.some((w) => w.id === x31BoardNode && w.status === "active" && w.inflight === 1), x31Board0.payload.workers);
+  const x31BoardMail = newId();
+  await db.mail.insert({
+    id: x31BoardMail, agent_id: x31AgentId, stream_id: x31RoomId, message_id: x31MailMsg,
+    trigger_seq: 1, priority: 1, status: "running", slice_count: 1, error: null,
+    created_at: now(), started_at: now(), finished_at: null, updated_at: now(), meta: {}, worker_id: x31BoardNode, heartbeat_at: now(),
+  }, { columns: "id" });
+  const x31Board1 = await call("scheduler.board", { token: ana, method: "GET" });
+  const x31Slice1 = x31Board1.payload.boards.flatMap((b) => b.streams).find((s) => s.stream_id === x31RoomId);
+  check("每个群透出此刻在哪些 worker 上跑", x31Slice1?.workers?.includes(x31BoardNode), x31Slice1);
+  await db.mail.remove([["id", x31BoardMail]]);
+  await db.workers.remove([["id", x31BoardNode]]);
+  await x31Mock.close();
+
+  step("\n§32 Stream Server 规范 v1.0.0：发现、两档与 worker HTTP 最小集");
+  const x32Sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  /** 规范表的错必须在加载时就炸，所以这里认的是"炸没炸"与那句理由，不是错误类型。 */
+  const x32Throw = (fn) => {
+    try { fn(); return null; } catch (error) { return String(error?.message ?? error); }
+  };
+  const x32Raw = (origin, token, method, path, body) => fetch(new URL(path, origin).href, {
+    method,
+    headers: {
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const x32Json = async (response) => ({ status: response.status, body: await response.json().catch(() => ({})) });
+  /** 读一条 SSE 流。`[DONE]` 也当一帧收进来（值就是那个字符串）：它是"对方干净收尾"的证据，
+   *  客户端正是靠有没有它分清 no_reply 与 turn_incomplete。 */
+  const x32Sse = (response) => {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const frames = [];
+    let buffer = "";
+    const found = (pred) => {
+      const at = frames.findIndex(pred);
+      return at < 0 ? null : frames.slice(0, at + 1);
+    };
+    return {
+      frames,
+      until: async (pred, deadlineMs = 15000) => {
+        const deadline = Date.now() + deadlineMs;
+        for (;;) {
+          const hit = found(pred);
+          if (hit) return hit;
+          const left = deadline - Date.now();
+          if (left <= 0) return null;
+          let timer;
+          const outcome = await Promise.race([
+            reader.read(),
+            new Promise((resolve) => { timer = setTimeout(() => resolve({ timeout: true }), left); }),
+          ]).finally(() => clearTimeout(timer));
+          if (outcome.timeout) return found(pred);
+          if (outcome.done) return found(pred);
+          buffer += decoder.decode(outcome.value, { stream: true });
+          const parts = buffer.split(/\r?\n\r?\n/);
+          buffer = parts.pop() ?? "";
+          for (const raw of parts) {
+            const data = raw.split(/\r?\n/).filter((line) => line.startsWith("data:"))
+              .map((line) => line.slice(5).trim()).join("\n");
+            if (!data) continue;
+            if (data === "[DONE]") { frames.push("[DONE]"); continue; }
+            try { frames.push(JSON.parse(data)); } catch { /* 解不开的帧丢掉，与客户端同口径 */ }
+          }
+        }
+      },
+      drop: async () => {
+        await reader.cancel().catch(() => {});
+        try { reader.releaseLock(); } catch { /* 已经放开 */ }
+      },
+    };
+  };
+
+  // A. 规范表本身：发现响应的正文由表算出来，表的错在加载时就炸（用一份坏表打这一枪，真表崩了会连累整套）。
+  const x32Descriptor = specDescriptor({ profiles: [SHARED_PROFILE], models: ["m"], label: "L" });
+  check("发现响应的正文由表算出来：spec、档位、这一档的 caps 默认值都在",
+    x32Descriptor.spec === SPEC_ID && x32Descriptor.profiles.length === 1
+      && x32Descriptor.profiles[0].id === SHARED_PROFILE && x32Descriptor.profiles[0].caps.tools === true
+      && x32Descriptor.profiles[0].caps.interrupt === true && x32Descriptor.models[0] === "m"
+      && x32Descriptor.label === "L", x32Descriptor);
+  const x32Bare = specDescriptor({ profiles: ["dedicated"] });
+  check("没给的可选格不出现在正文里（对方读到 undefined 会当成声明了一件事）",
+    !("models" in x32Bare) && !("label" in x32Bare)
+      && x32Bare.profiles[0].caps.tools === false && x32Bare.profiles[0].caps.interrupt === false, x32Bare);
+  check("空档位清单当场拒", Boolean(x32Throw(() => specDescriptor({ profiles: [] }))), x32Throw(() => specDescriptor({ profiles: [] })));
+  check("声明规范里没有的一档当场拒（客户端会照它选路，然后每轮都失败在调不到路由上）",
+    Boolean(x32Throw(() => specDescriptor({ profiles: ["quantum"] }))), x32Throw(() => specDescriptor({ profiles: ["quantum"] })));
+  check("同一档声明两次当场拒", Boolean(x32Throw(() => specDescriptor({ profiles: ["shared", "shared"] }))),
+    x32Throw(() => specDescriptor({ profiles: ["shared", "shared"] })));
+
+  const x32GoodProfiles = [
+    { id: "shared", stateless: true, caps: { tools: true, interrupt: true, usage: true, reasoning: true } },
+    { id: "dedicated", stateless: false, caps: { tools: false, interrupt: false, usage: false, reasoning: false } },
+  ];
+  const x32DiscoveryEntry = { name: "discovery", profile: "any", method: "GET", path: "/" };
+  const x32BothRequired = [
+    x32DiscoveryEntry,
+    { name: "createTurn", profile: "shared", method: "POST", path: "/turns" },
+    { name: "createSession", profile: "dedicated", method: "POST", path: "/sessions" },
+  ];
+  check("真表自洽：validateSpec 放行", validateSpec() === true);
+  check("profile id 重复当场拒（后一条会悄悄盖掉前一条）",
+    Boolean(x32Throw(() => validateSpec({ profiles: [x32GoodProfiles[0], { ...x32GoodProfiles[0], stateless: false }] }))),
+    x32Throw(() => validateSpec({ profiles: [x32GoodProfiles[0], { ...x32GoodProfiles[0], stateless: false }] })));
+  check("caps 里多一个规范没定义的键当场拒",
+    Boolean(x32Throw(() => validateSpec({ profiles: [{ ...x32GoodProfiles[0], caps: { tools: true, teleport: true } }, x32GoodProfiles[1]] }))),
+    x32Throw(() => validateSpec({ profiles: [{ ...x32GoodProfiles[0], caps: { tools: true, teleport: true } }, x32GoodProfiles[1]] })));
+  check("endpoint 名重复当场拒",
+    Boolean(x32Throw(() => validateSpec({ endpoints: [x32DiscoveryEntry, { ...x32DiscoveryEntry }] }))),
+    x32Throw(() => validateSpec({ endpoints: [x32DiscoveryEntry, { ...x32DiscoveryEntry }] })));
+  check("endpoint 挂在规范里没有的 profile 上当场拒",
+    Boolean(x32Throw(() => validateSpec({ endpoints: [x32DiscoveryEntry, { name: "ghost", profile: "quantum", method: "GET", path: "/ghost" }] }))),
+    x32Throw(() => validateSpec({ endpoints: [x32DiscoveryEntry, { name: "ghost", profile: "quantum", method: "GET", path: "/ghost" }] })));
+  check("方法不在白名单当场拒",
+    Boolean(x32Throw(() => validateSpec({ endpoints: [x32DiscoveryEntry, { name: "createTurn", profile: "shared", method: "DELETE", path: "/turns" }] }))),
+    x32Throw(() => validateSpec({ endpoints: [x32DiscoveryEntry, { name: "createTurn", profile: "shared", method: "DELETE", path: "/turns" }] })));
+  check("路径不以 / 开头当场拒",
+    Boolean(x32Throw(() => validateSpec({ endpoints: [x32DiscoveryEntry, { name: "createTurn", profile: "shared", method: "POST", path: "turns" }] }))),
+    x32Throw(() => validateSpec({ endpoints: [x32DiscoveryEntry, { name: "createTurn", profile: "shared", method: "POST", path: "turns" }] })));
+  check("路径参数没闭合当场拒（等于把用户输入直接拼进路由）",
+    Boolean(x32Throw(() => validateSpec({ endpoints: [x32DiscoveryEntry, { name: "createTurn", profile: "shared", method: "POST", path: "/turns/{turn_id" }] }))),
+    x32Throw(() => validateSpec({ endpoints: [x32DiscoveryEntry, { name: "createTurn", profile: "shared", method: "POST", path: "/turns/{turn_id" }] })));
+  check("某一档一条必需 endpoint 都没有当场拒（只剩 optional 的那条等于这一档没实现）",
+    Boolean(x32Throw(() => validateSpec({
+      endpoints: [x32DiscoveryEntry, { name: "createTurn", profile: "shared", method: "POST", path: "/turns" },
+        { name: "interruptSession", profile: "dedicated", method: "POST", path: "/sessions/{session_id}/interrupt", optional: true }],
+    }))),
+    x32Throw(() => validateSpec({
+      endpoints: [x32DiscoveryEntry, { name: "createTurn", profile: "shared", method: "POST", path: "/turns" },
+        { name: "interruptSession", profile: "dedicated", method: "POST", path: "/sessions/{session_id}/interrupt", optional: true }],
+    })));
+  check("没有发现 endpoint 当场拒（客户端就无从知道对方认哪一档）",
+    Boolean(x32Throw(() => validateSpec({ endpoints: x32BothRequired.slice(1) }))),
+    x32Throw(() => validateSpec({ endpoints: x32BothRequired.slice(1) })));
+  check("帧词表挂在规范里没有的 profile 上当场拒",
+    Boolean(x32Throw(() => validateSpec({ events: { quantum: ["turn.done"] } }))),
+    x32Throw(() => validateSpec({ events: { quantum: ["turn.done"] } })));
+  check("某一档没声明任何帧当场拒", Boolean(x32Throw(() => validateSpec({ events: { shared: [] } }))),
+    x32Throw(() => validateSpec({ events: { shared: [] } })));
+  check("错误码不成族当场拒（界面上就分不清是哪条通道坏了）",
+    Boolean(x32Throw(() => validateSpec({ codes: { client: ["upstream_failed"], server: [] } }))),
+    x32Throw(() => validateSpec({ codes: { client: ["upstream_failed"], server: [] } })));
+  check("同一侧错误码重复当场拒", Boolean(x32Throw(() => validateSpec({ codes: { client: ["stream_a", "stream_a"], server: [] } }))),
+    x32Throw(() => validateSpec({ codes: { client: ["stream_a", "stream_a"], server: [] } })));
+
+  // B. 路径的两种读法必须是同一张表：客户端拼出去与服务端认回来，表改了只改一边就变成运行时一句 404。
+  const x32TurnId = "turn:12_3-x.2";
+  const x32Built = endpointPath("getTurn", { turn_id: x32TurnId });
+  check("路径参数编码后才拼进路由：`:` 变成 %3A，对方发来的 id 决定不了我们请求哪条路",
+    x32Built === "/stream-server/v1/turns/turn%3A12_3-x.2", x32Built);
+  const x32Back = matchEndpoint(x32Built);
+  check("拼路径的逆运算认得回来，参数解码后逐字相同",
+    x32Back?.name === "getTurn" && x32Back.params.turn_id === x32TurnId, x32Back);
+  const x32Roundtrip = ENDPOINTS.map((entry) => {
+    const params = {};
+    for (const key of [...entry.path.matchAll(/\{([a-z_]+)\}/g)].map((m) => m[1])) params[key] = "id-1";
+    const back = matchEndpoint(endpointPath(entry.name, params));
+    return { name: entry.name, ok: back?.name === entry.name && JSON.stringify(back?.params) === JSON.stringify(params) };
+  });
+  check("表里每一条 endpoint 都能拼出去再认回来", x32Roundtrip.every((row) => row.ok), x32Roundtrip.filter((row) => !row.ok));
+  check("参数里带 `/` 当场拒", Boolean(x32Throw(() => endpointPath("getTurn", { turn_id: "a/b" }))),
+    x32Throw(() => endpointPath("getTurn", { turn_id: "a/b" })));
+  check("参数超出 1-128 的界当场拒", Boolean(x32Throw(() => endpointPath("getTurn", { turn_id: "a".repeat(129) }))),
+    x32Throw(() => endpointPath("getTurn", { turn_id: "a".repeat(129) })));
+  check("表里没有的 endpoint 名当场拒（名字打错是写代码的人的错，不进错误码文案那一套）",
+    Boolean(x32Throw(() => endpointPath("teleport", {}))), x32Throw(() => endpointPath("teleport", {})));
+  check("认不出的路径回 null，服务器据此回 stream_endpoint_missing",
+    matchEndpoint("/stream-server/v1/nope") === null && matchEndpoint("/v1/turns") === null,
+    [matchEndpoint("/stream-server/v1/nope"), matchEndpoint("/v1/turns")]);
+  check("编码绕过也认不出来：解回来含 `/` 的参数按不合规丢掉",
+    matchEndpoint("/stream-server/v1/turns/a%2Fb") === null, matchEndpoint("/stream-server/v1/turns/a%2Fb"));
+  check("带路径参数的那条认得出档位与方法",
+    matchEndpoint("/stream-server/v1/turns/t1/interrupt")?.name === "interruptTurn"
+      && matchEndpoint("/stream-server/v1/sessions/s1/events/stream")?.name === "streamEvents"
+      && matchEndpoint("/stream-server/v1/sessions/s1/events")?.name === "postEvents",
+    [matchEndpoint("/stream-server/v1/turns/t1/interrupt")?.name, matchEndpoint("/stream-server/v1/sessions/s1/events/stream")?.name]);
+
+  const x32BadBodies = [
+    ["not_json", null],
+    ["spec_missing", { profiles: [{ id: "shared" }] }],
+    ["spec_major_mismatch", { spec: "stream-server/2.0.0", profiles: [{ id: "shared" }] }],
+    ["no_profiles", { spec: SPEC_ID }],
+    ["unknown_profile", { spec: SPEC_ID, profiles: [{ id: "quantum" }] }],
+    ["duplicate_profile", { spec: SPEC_ID, profiles: [{ id: "shared" }, { id: "shared" }] }],
+    ["unknown_caps", { spec: SPEC_ID, profiles: [{ id: "shared", caps: { teleport: true } }] }],
+    ["caps_not_boolean", { spec: SPEC_ID, profiles: [{ id: "shared", caps: { interrupt: "yes" } }] }],
+    ["caps_tools_mismatch", { spec: SPEC_ID, profiles: [{ id: "shared", caps: { tools: false } }] }],
+  ];
+  for (const [code, body] of x32BadBodies) {
+    const parsed = parseDescriptor(body);
+    check(`不合规的发现响应整条退回：${code}`, parsed.descriptor === null && parsed.code === code, parsed);
+  }
+  check("退回理由码的取值域与表逐字一致（多一个少一个都说明客户端与规范页对不上）",
+    x32BadBodies.length === DISCOVERY_REASONS.length
+      && DISCOVERY_REASONS.every((code) => x32BadBodies.some(([own]) => own === code)),
+    { 表: DISCOVERY_REASONS, 打到的: x32BadBodies.map(([code]) => code) });
+  const x32Parsed = parseDescriptor(specDescriptor({ profiles: ["dedicated", "shared"], models: [7], label: "x" }));
+  check("合规响应：缺的 caps 按这一档默认补齐，tools 那格以规范为准（对方改不动）",
+    x32Parsed.descriptor?.profiles.every((entry) => Object.keys(entry.caps).length === CAP_KEYS.length)
+      && x32Parsed.descriptor?.profiles.find((entry) => entry.id === "shared").caps.tools === true
+      && x32Parsed.descriptor?.profiles.find((entry) => entry.id === "dedicated").caps.tools === false, x32Parsed.descriptor);
+  check("models 一律转成字符串：对方发数字也不该让我们后面拼出 NaN",
+    x32Parsed.descriptor?.models?.[0] === "7", x32Parsed.descriptor?.models);
+  check("两档都声明时优先 shared：只有它带得动我们的群工具",
+    pickProfile(x32Parsed.descriptor) === SHARED_PROFILE, pickProfile(x32Parsed.descriptor));
+  check("只声明专属档就选专属档（不硬凑 shared）",
+    pickProfile(parseDescriptor(specDescriptor({ profiles: ["dedicated"] })).descriptor) === "dedicated",
+    pickProfile(parseDescriptor(specDescriptor({ profiles: ["dedicated"] })).descriptor));
+
+  // C. 参考实现 + 建档：档位是发现出来的事实，写进档案；发现失败要分清持久型与临时型。
+  const x32Up = await startMockUpstream();
+  const x32Token = "st-smoke-shared-1";
+  const x32Hits = [];
+  const x32Core = createStreamServer({
+    upstreamUrl: `http://127.0.0.1:${x32Up.port}/v1`,
+    upstreamKey: "up-smoke-key-32",
+    upstreamModel: "smoke-shared-model",
+    token: x32Token,
+    label: "smoke shared",
+  });
+  // 记一份请求清单：「一轮任务不重新发现」这条断言要落在出网次数上，不能只看档案那一格没变。
+  const x32Server = {
+    ...x32Core,
+    handle: (request) => {
+      x32Hits.push(`${request.method} ${new URL(request.url).pathname}`);
+      return x32Core.handle(request);
+    },
+  };
+  const x32Srv = await listenStreamServer({ server: x32Server, port: 0 });
+  const x32Count = (re) => x32Hits.filter((line) => re.test(line)).length;
+  check("参考实现只声明自己真跑得起来的那一档",
+    x32Core.descriptor.profiles.map((entry) => entry.id).join() === SHARED_PROFILE
+      && x32Core.descriptor.spec === SPEC_ID, x32Core.descriptor);
+  check("不配令牌又不许匿名：冷启动就崩，不留一个谁都能调、拿我们的上游 Key 替任何人烧 token 的执行器",
+    Boolean(x32Throw(() => createStreamServer({}))), x32Throw(() => createStreamServer({})));
+
+  const x32DemoPair = await call("agents.create", {
+    token: ana,
+    body: { name: "分时演示", role: "x", backend: "stream", api_base_url: "demo://local", api_key: x32Token, model: "smoke-shared-model" },
+  });
+  check("规范对接那一档 + 演示地址在建档就被拒（发现请求根本发不出去）",
+    x32DemoPair.status === 400 && x32DemoPair.payload.error === "stream_needs_real_origin", x32DemoPair.payload);
+  const x32Agent = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小T", role: "分时执行", backend: "stream", context_chars: 8000,
+      api_base_url: `${x32Srv.origin}/stream-server/v1`, api_key: x32Token, model: "smoke-shared-model",
+    },
+  });
+  const x32Id = x32Agent.payload.agent?.id;
+  check("对照：真实 origin 上建档成功，发现结果落进档案（shared）",
+    x32Agent.payload.ok === true && x32Agent.payload.agent?.backend === "stream"
+      && x32Agent.payload.agent?.stream_profile === SHARED_PROFILE, x32Agent.payload);
+  check("建档只回令牌尾号：明文与密文都不在响应里",
+    x32Agent.payload.agent?.api_key_tail === `••••${x32Token.slice(-4)}`
+      && !JSON.stringify(x32Agent.payload).includes(x32Token)
+      && !JSON.stringify(x32Agent.payload).includes("api_key_cipher"), x32Agent.payload);
+  const x32BadKey = await call("agents.update", { token: ana, body: { id: x32Id, api_key: "st-wrong-token" } });
+  check("改令牌时对方拒了：整个改档失败，不把一次故障钉成对它的永久判决",
+    x32BadKey.status === 401 && x32BadKey.payload.error === "stream_unauthorized", x32BadKey.payload);
+  const x32AfterBad = await db.agents.byId(x32Id, { columns: "id,api_key_tail,stream_profile" });
+  check("改档失败后档案一个字没改（旧地址配旧档位仍然自洽）",
+    x32AfterBad.api_key_tail === `••••${x32Token.slice(-4)}` && x32AfterBad.stream_profile === SHARED_PROFILE, x32AfterBad);
+  const x32GoodKey = await call("agents.update", { token: ana, body: { id: x32Id, api_key: x32Token } });
+  check("对照：同一处改动带上对的令牌就放行，并重新问一次档位",
+    x32GoodKey.payload.ok === true && x32GoodKey.payload.agent?.stream_profile === SHARED_PROFILE, x32GoodKey.payload);
+
+  const x32Ping = await call("agents.test", { token: ana, body: { id: x32Id } });
+  const x32Facts = x32Ping.payload.result ?? {};
+  check("自检如实报出对方声明了什么：spec 版本、档位清单、展示名与模型名",
+    x32Facts.reachable === true && x32Facts.speaks_spec === true && x32Facts.profile === SHARED_PROFILE
+      && x32Facts.spec === SPEC_ID && String(x32Facts.profiles?.join()) === SHARED_PROFILE
+      && String(x32Facts.models?.join()) === "smoke-shared-model" && x32Facts.label === "smoke shared", x32Facts);
+  check("自检问出来的档位写回档案：界面报的那一档与员工实际跑的那一档必须是同一个值",
+    x32Facts.stored === true && x32Facts.mode === "stream", x32Facts);
+  check("shared 档自检照旧跑一轮真对话（专属档只问不跑，不替用户建会话、不动用量）",
+    typeof x32Facts.reply === "string" && x32Facts.reply.includes("收到，我按上下文回应。"), x32Facts.reply);
+
+  await call("streams.agents.add", { token: ana, body: { stream_id: streamId, agent_id: x32Id } });
+  /** 一次 tick 有片数上限，别的群排在前面的信会先跑：轮到这个员工这一封为止，不拿别的群的成功冒充。 */
+  const x32TickUntil = async (roomId, agentId, tries = 6) => {
+    let ran = [];
+    for (let index = 0; index < tries && ran.length === 0; index += 1) {
+      const tick = await call("scheduler.tick", { token: ana, method: "GET" });
+      ran = (tick.payload.ran ?? []).filter((row) => row.stream_id === roomId && row.agent_id === agentId);
+    }
+    return ran;
+  };
+  const x32DiscBefore = x32Count(/^GET \/stream-server\/v1$/);
+  const x32Send = await call("messages.send", {
+    token: ana,
+    body: { stream_id: streamId, content: "@小T 这一轮走分时执行", mentions: [{ type: "agent", id: x32Id }] },
+  });
+  check("分时执行器上的员工也能被 @ 派发", x32Send.payload.queued?.length === 1, x32Send.payload);
+  const x32Ran = await x32TickUntil(streamId, x32Id);
+  check("这一轮跑完（走的是规范那条通道）", x32Ran.length === 1 && x32Ran[0].status === "done", x32Ran);
+  const x32History = await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } });
+  const x32Reply = (x32History.payload.items ?? []).find((m) => m.sender_id === x32Id);
+  check("规范那一轮的权威正文落进群聊", String(x32Reply?.content).includes("查到 3 条历史记录"), x32Reply?.content);
+  check("shared 档把我们的群工具整个发过去（工具回路是员工干活的手）",
+    (x32Up.seen.at(-1)?.tools ?? []).some((tool) => tool?.function?.name === "search_history"),
+    (x32Up.seen.at(-1)?.tools ?? []).map((tool) => tool?.function?.name));
+  check("一轮任务不重新发现：档位只读档案里那一格（措辞与工具注入都发生在调用之前）",
+    x32Count(/^GET \/stream-server\/v1$/) === x32DiscBefore
+      && (await db.agents.byId(x32Id, { columns: "stream_profile" })).stream_profile === SHARED_PROFILE,
+    { 发现次数: x32Count(/^GET \/stream-server\/v1$/), 派发前: x32DiscBefore });
+
+  // D. 一轮的权威结果：帧序、增量与权威帧的关系、用量的两种形状（线上是上游形状，落库前才归一化）。
+  const x32Row = await db.agents.byId(x32Id, { columns: "id,name,backend,api_base_url,model,stream_profile,context_chars" });
+  const x32Direct = await askStreamServer({
+    db, agent: x32Row, streamId, key: x32Token,
+    messages: [{ role: "user", content: "直接调一轮" }], tools: null, maxTokens: null, timeoutMs: 20000,
+  });
+  check("直接调用回的形状与另外两条通道一致：正文、mode、profile、turn_id 都在",
+    x32Direct.mode === "stream" && x32Direct.profile === SHARED_PROFILE && typeof x32Direct.turn_id === "string"
+      && x32Direct.content === "收到，我按上下文回应。" && x32Direct.finish_reason === "stop", x32Direct);
+  check("用量按落库口径归一化：上游那套 prompt_tokens 不进我们的列",
+    x32Direct.usage?.input === 812 && x32Direct.usage?.output === 24
+      && x32Direct.usage?.cached === 640 && x32Direct.usage?.reasoning === 9, x32Direct.usage);
+  check("对方没回报首字延迟就用我们自己量到的那个（量不到才留 null，不编数字）",
+    Number.isFinite(x32Direct.first_token_ms) && x32Direct.first_token_ms >= 0, x32Direct.first_token_ms);
+  const x32Wire = await x32Json(await x32Raw(x32Srv.origin, x32Token, "GET", endpointPath("getTurn", { turn_id: x32Direct.turn_id })));
+  check("规范线上跑的是上游用量形状：归一化是客户端落库前的事，不写进协议",
+    x32Wire.status === 200 && x32Wire.body.state === "done" && x32Wire.body.usage?.prompt_tokens === 812
+      && x32Wire.body.usage?.prompt_tokens_details?.cached_tokens === 640
+      && x32Wire.body.content === "收到，我按上下文回应。", x32Wire.body);
+
+  const x32ManualId = `turn_${newId().slice(0, 12)}`;
+  const x32Manual = x32Sse(await x32Raw(x32Srv.origin, x32Token, "POST", endpointPath("createTurn"), {
+    turn_id: x32ManualId, model: "smoke-shared-model", messages: [{ role: "user", content: "手工一轮" }],
+  }));
+  const x32Frames = await x32Manual.until((frame) => frame === "[DONE]");
+  const { type: _x32FrameType, ...x32DoneBody } = (x32Frames ?? []).find((frame) => frame?.type === "turn.done") ?? {};
+  const x32Deltas = (x32Frames ?? []).filter((frame) => frame?.type === "turn.delta").map((frame) => frame.content).join("");
+  check("一轮的帧序：增量 → 权威帧 → [DONE]",
+    (x32Frames ?? []).some((frame) => frame?.type === "turn.delta") && Boolean(x32DoneBody.content)
+      && (x32Frames ?? []).at(-1) === "[DONE]", (x32Frames ?? []).map((frame) => (frame === "[DONE]" ? frame : frame?.type)));
+  check("增量累加起来就是权威正文（客户端据此在中断时交出半截）",
+    x32Deltas === x32DoneBody.content, { 增量: x32Deltas, 权威: x32DoneBody.content });
+  const x32ManualGet = await x32Json(await x32Raw(x32Srv.origin, x32Token, "GET", endpointPath("getTurn", { turn_id: x32ManualId })));
+  check("turn.done 与 GET 结果是同一个对象：客户端断流之后才敢拿 GET 的当权威帧用",
+    JSON.stringify(x32DoneBody) === JSON.stringify(x32ManualGet.body),
+    { 帧: x32DoneBody, 取回: x32ManualGet.body });
+  await x32Manual.drop();
+
+  // E. worker HTTP 纪律：鉴权在路由之前，方法与路径的失败各有各的码。
+  const x32NoAuth = await x32Json(await x32Raw(x32Srv.origin, null, "GET", "/stream-server/v1"));
+  check("没带令牌的调用方在路由之前就被挡下",
+    x32NoAuth.status === 401 && x32NoAuth.body.error === "stream_unauthorized", x32NoAuth);
+  const x32WrongAuth = await x32Json(await x32Raw(x32Srv.origin, "st-not-the-token", "GET", endpointPath("getTurn", { turn_id: x32ManualId })));
+  check("令牌不对时连存在的路也回 401：不许从 404/405 的差别里读出这台 server 实现了哪几条路",
+    x32WrongAuth.status === 401 && x32WrongAuth.body.error === "stream_unauthorized", x32WrongAuth);
+  const x32RightAuth = await x32Json(await x32Raw(x32Srv.origin, x32Token, "GET", endpointPath("getTurn", { turn_id: x32ManualId })));
+  check("对照：带对令牌同一条路就通（拦的是令牌，不是这条路）",
+    x32RightAuth.status === 200 && x32RightAuth.body.turn_id === x32ManualId, x32RightAuth);
+  const x32Method = await x32Json(await x32Raw(x32Srv.origin, x32Token, "GET", "/stream-server/v1/turns"));
+  check("路对方法不对回 405，不塌成 404", x32Method.status === 405 && x32Method.body.error === "stream_method_not_allowed", x32Method);
+  const x32GhostPath = await x32Json(await x32Raw(x32Srv.origin, x32Token, "GET", "/stream-server/v1/nope"));
+  check("表里没有的路回 stream_endpoint_missing（客户端正是据此退回 OpenAI 兼容那一档）",
+    x32GhostPath.status === 404 && x32GhostPath.body.error === "stream_endpoint_missing", x32GhostPath);
+  const x32BadTurnId = await x32Json(await x32Raw(x32Srv.origin, x32Token, "POST", "/stream-server/v1/turns", {
+    turn_id: "a/b", messages: [{ role: "user", content: "x" }],
+  }));
+  check("turn_id 不合规回 400 并指名哪一格", x32BadTurnId.status === 400 && x32BadTurnId.body.detail === "turn_id", x32BadTurnId);
+  const x32NoMessages = await x32Json(await x32Raw(x32Srv.origin, x32Token, "POST", "/stream-server/v1/turns", {
+    turn_id: "turn_no_messages", messages: [],
+  }));
+  check("没有 messages 的一轮当场拒", x32NoMessages.status === 400 && x32NoMessages.body.detail === "messages", x32NoMessages);
+  const x32Reused = await x32Json(await x32Raw(x32Srv.origin, x32Token, "POST", "/stream-server/v1/turns", {
+    turn_id: x32ManualId, model: "smoke-shared-model", messages: [{ role: "user", content: "重放" }],
+  }));
+  check("重放同一个 turn_id 被拒：再起一次上游等于替同一个请求烧两遍 token",
+    x32Reused.status === 400 && x32Reused.body.detail === "turn_id_reused", x32Reused);
+
+  // F. 叫停：turn_id 由客户端生成，所以断线也叫得停；被叫停是一轮的正当结局，不是失败。
+  const x32StallId = `turn_${newId().slice(0, 12)}`;
+  const x32Stall = x32Sse(await x32Raw(x32Srv.origin, x32Token, "POST", "/stream-server/v1/turns", {
+    turn_id: x32StallId, model: "smoke-shared-model", messages: [{ role: "user", content: "静默卡住" }],
+  }));
+  const x32BeforeStop = await x32Stall.until((frame) => frame?.type === "turn.delta" && frame.content === "半截");
+  check("上游静默之前先收到过正文增量（这一轮确实起来了；思考链的增量不算）",
+    (x32BeforeStop ?? []).some((frame) => frame.content === "半截"), x32BeforeStop);
+  const x32Stop = await x32Json(await x32Raw(x32Srv.origin, x32Token, "POST", endpointPath("interruptTurn", { turn_id: x32StallId })));
+  check("叫停在跑的那一轮回 200", x32Stop.status === 200 && x32Stop.body.ok === true, x32Stop);
+  const x32Stopped = await x32Stall.until((frame) => frame?.type === "turn.done");
+  const x32StoppedDone = (x32Stopped ?? []).find((frame) => frame?.type === "turn.done");
+  check("被叫停的那一轮交半截正文 + finish_reason=interrupted，不当错误帧发出去",
+    x32StoppedDone?.state === "done" && x32StoppedDone?.finish_reason === "interrupted"
+      && x32StoppedDone?.content === "半截", x32StoppedDone);
+  await x32Stall.drop();
+  const x32Restop = await x32Json(await x32Raw(x32Srv.origin, x32Token, "POST", endpointPath("interruptTurn", { turn_id: x32StallId })));
+  check("已结的那一轮再叫停不算错（客户端的叫停本来就尽力而为，回 404 会让主人叫停长得像服务器坏了）",
+    x32Restop.status === 200, x32Restop);
+  const x32GhostStop = await x32Json(await x32Raw(x32Srv.origin, x32Token, "POST", endpointPath("interruptTurn", { turn_id: "turn_ghost" })));
+  check("对照：叫停一个不存在的 turn 才回 404",
+    x32GhostStop.status === 404 && x32GhostStop.body.error === "stream_turn_not_found", x32GhostStop);
+
+  let x32Asked = 0;
+  let x32ClientStop = null;
+  try {
+    await askStreamServer({
+      db, agent: x32Row, streamId, key: x32Token,
+      messages: [{ role: "user", content: "静默卡住" }], tools: null, timeoutMs: 20000,
+      onInterrupt: async () => { x32Asked += 1; return x32Asked > 1 ? { stopped: true } : null; },
+    });
+  } catch (error) { x32ClientStop = error; }
+  check("上游静默期间客户端也问要不要停：就地放弃这一轮并交出半截，不等整轮超时",
+    x32ClientStop instanceof Interrupted && x32ClientStop.payload?.partial === "半截" && x32Asked >= 2,
+    { 问了: x32Asked, 半截: x32ClientStop?.payload?.partial, 错: String(x32ClientStop?.message ?? x32ClientStop) });
+
+  // 上游一个字都不吐时也要叫得停：这条钉的是执行器那头的响应头必须立刻发出去（dev/stream-server.mjs 的 flushHeaders）。
+  // 头攒着等第一个字节，客户端的 fetch 就一直不 resolve，读循环进不去，onInterrupt 再勤也问不到——只能等整轮超时。
+  const x32SilentUp = await startSilentUpstream();
+  const x32Silent = createStreamServer({
+    upstreamUrl: `http://127.0.0.1:${x32SilentUp.port}/v1`, upstreamKey: "up-smoke-key-32",
+    upstreamModel: "smoke-shared-model", token: x32Token, timeoutMs: 8000,
+  });
+  const x32SilentSrv = await listenStreamServer({ server: x32Silent, port: 0 });
+  let x32SilentAsked = 0;
+  let x32SilentStop = null;
+  const x32SilentStarted = Date.now();
+  try {
+    await askStreamServer({
+      db, agent: { ...x32Row, api_base_url: `${x32SilentSrv.origin}/stream-server/v1` }, streamId, key: x32Token,
+      messages: [{ role: "user", content: "一个字都不吐" }], tools: null, timeoutMs: 15000,
+      onInterrupt: async () => { x32SilentAsked += 1; return x32SilentAsked > 1 ? { stopped: true } : null; },
+    });
+  } catch (error) { x32SilentStop = error; }
+  const x32SilentMs = Date.now() - x32SilentStarted;
+  check("上游迟迟不吐第一个字也叫得停：客户端进得了读循环，不必等整轮 15s 超时",
+    x32SilentStop instanceof Interrupted && x32SilentAsked >= 2 && x32SilentMs < 8000,
+    { 问了: x32SilentAsked, 毫秒: x32SilentMs, 错: String(x32SilentStop?.streamCode ?? x32SilentStop?.message ?? x32SilentStop) });
+  await x32SilentUp.close();
+  await x32SilentSrv.close();
+
+  // G. 断流恢复与有界表：一轮结果的权威是客户端读到的 turn.done，这张表只为断线补救与叫停存在。
+  const x32CutToken = "st-smoke-cut-1";
+  const x32CutRow = {
+    id: "agent_x32_cut", name: "断流", backend: "stream", model: "cut-model",
+    stream_profile: SHARED_PROFILE, context_chars: 8000,
+  };
+  const x32Cut = await startCutServer(x32CutToken, { withGet: true });
+  const x32Recovered = await askStreamServer({
+    db, agent: { ...x32CutRow, api_base_url: `${x32Cut.origin}/stream-server/v1` }, streamId, key: x32CutToken,
+    messages: [{ role: "user", content: "断流一轮" }], tools: null, timeoutMs: 20000,
+  });
+  check("流断了没等到权威帧：先问一次服务器那一轮成没成，取回来就当权威",
+    x32Recovered.content === "断流之后才取回的权威正文。" && x32Recovered.finish_reason === "stop", x32Recovered);
+  await x32Cut.close();
+  const x32CutBlind = await startCutServer(x32CutToken, { withGet: false });
+  let x32BlindError = null;
+  try {
+    await askStreamServer({
+      db, agent: { ...x32CutRow, api_base_url: `${x32CutBlind.origin}/stream-server/v1` }, streamId, key: x32CutToken,
+      messages: [{ role: "user", content: "断流一轮" }], tools: null, timeoutMs: 20000,
+    });
+  } catch (error) { x32BlindError = error; }
+  check("补救那一发问不到就退回原来的失败：有半截增量叫「说到一半断了」，不拿它冒充回复",
+    x32BlindError?.streamCode === "stream_turn_incomplete" && x32BlindError?.status === 502,
+    { 码: x32BlindError?.streamCode, 状态: x32BlindError?.status });
+  await x32CutBlind.close();
+
+  const x32Small = createStreamServer({
+    upstreamUrl: `http://127.0.0.1:${x32Up.port}/v1`, upstreamKey: "up-smoke-key-32",
+    upstreamModel: "smoke-shared-model", token: x32Token, turnMax: 2,
+  });
+  const x32SmallSrv = await listenStreamServer({ server: x32Small, port: 0 });
+  const x32SmallIds = [];
+  for (let index = 0; index < 3; index += 1) {
+    const id = `turn_small_${index}`;
+    const stream = x32Sse(await x32Raw(x32SmallSrv.origin, x32Token, "POST", "/stream-server/v1/turns", {
+      turn_id: id, model: "smoke-shared-model", messages: [{ role: "user", content: `小表第 ${index} 轮` }],
+    }));
+    await stream.until((frame) => frame?.type === "turn.done");
+    await stream.drop();
+    x32SmallIds.push(id);
+  }
+  check("turn 表有条数上限：满了腾最老的已结条目，一台执行器不因跑得多就自爆",
+    x32Small.turnCount() === 2, x32Small.turnCount());
+  const x32Evicted = await x32Json(await x32Raw(x32SmallSrv.origin, x32Token, "GET", endpointPath("getTurn", { turn_id: x32SmallIds[0] })));
+  check("被腾掉的那条取结果回 404，不回一份空壳",
+    x32Evicted.status === 404 && x32Evicted.body.error === "stream_turn_not_found", x32Evicted);
+  const x32Kept = await x32Json(await x32Raw(x32SmallSrv.origin, x32Token, "GET", endpointPath("getTurn", { turn_id: x32SmallIds[2] })));
+  check("对照：最新那条还在，取结果照旧 200", x32Kept.status === 200 && x32Kept.body.state === "done", x32Kept);
+  await x32SmallSrv.close();
+
+  const x32Ttl = createStreamServer({
+    upstreamUrl: `http://127.0.0.1:${x32Up.port}/v1`, upstreamKey: "up-smoke-key-32",
+    upstreamModel: "smoke-shared-model", token: x32Token, turnTtlMs: 40,
+  });
+  const x32TtlSrv = await listenStreamServer({ server: x32Ttl, port: 0 });
+  const x32TtlStream = x32Sse(await x32Raw(x32TtlSrv.origin, x32Token, "POST", "/stream-server/v1/turns", {
+    turn_id: "turn_ttl_1", model: "smoke-shared-model", messages: [{ role: "user", content: "过期一轮" }],
+  }));
+  await x32TtlStream.until((frame) => frame?.type === "turn.done");
+  await x32TtlStream.drop();
+  check("刚结掉的那一轮还在表里（TTL 没到就不清）", x32Ttl.turnCount() === 1, x32Ttl.turnCount());
+  await x32Sleep(90);
+  check("过了 TTL 的已结条目清掉（进程重启即清空，这张表只是断线补救）", x32Ttl.turnCount() === 0, x32Ttl.turnCount());
+  const x32TtlGet = await x32Json(await x32Raw(x32TtlSrv.origin, x32Token, "GET", endpointPath("getTurn", { turn_id: "turn_ttl_1" })));
+  check("过期之后取结果回 404", x32TtlGet.status === 404, x32TtlGet);
+  await x32TtlSrv.close();
+
+  const x32One = createStreamServer({
+    upstreamUrl: `http://127.0.0.1:${x32Up.port}/v1`, upstreamKey: "up-smoke-key-32",
+    upstreamModel: "smoke-shared-model", token: x32Token, turnMax: 1,
+  });
+  const x32OneSrv = await listenStreamServer({ server: x32One, port: 0 });
+  const x32RunId = "turn_one_running";
+  const x32Run = x32Sse(await x32Raw(x32OneSrv.origin, x32Token, "POST", "/stream-server/v1/turns", {
+    turn_id: x32RunId, model: "smoke-shared-model", messages: [{ role: "user", content: "静默卡住" }],
+  }));
+  await x32Run.until((frame) => frame?.type === "turn.delta");
+  const x32Full = await x32Json(await x32Raw(x32OneSrv.origin, x32Token, "POST", "/stream-server/v1/turns", {
+    turn_id: "turn_one_extra", model: "smoke-shared-model", messages: [{ role: "user", content: "挤不进去" }],
+  }));
+  check("表满且腾不出已结条目时拒新的（503），不砍在跑的那一轮",
+    x32Full.status === 503 && x32Full.body.error === "stream_unavailable" && x32Full.body.detail === "turn_table_full", x32Full);
+  await x32Json(await x32Raw(x32OneSrv.origin, x32Token, "POST", endpointPath("interruptTurn", { turn_id: x32RunId })));
+  const x32RunDone = await x32Run.until((frame) => frame?.type === "turn.done");
+  check("对照：在跑的那一轮照旧结得下来（刚才那次拒绝没伤到它）",
+    (x32RunDone ?? []).some((frame) => frame?.finish_reason === "interrupted"), x32RunDone);
+  await x32Run.drop();
+  await x32OneSrv.close();
+
+  const x32Tiny = createStreamServer({
+    upstreamUrl: `http://127.0.0.1:${x32Up.port}/v1`, upstreamKey: "up-smoke-key-32",
+    upstreamModel: "smoke-shared-model", token: x32Token, maxRequestBytes: 64,
+  });
+  const x32TinySrv = await listenStreamServer({ server: x32Tiny, port: 0 });
+  const x32TooBig = await x32Json(await x32Raw(x32TinySrv.origin, x32Token, "POST", "/stream-server/v1/turns", {
+    turn_id: "turn_big", messages: [{ role: "user", content: "x".repeat(4096) }],
+  }));
+  check("请求体超限在读满之前就拒（413），不整份进内存",
+    x32TooBig.status === 413 && x32TooBig.body.error === "stream_payload_too_large", x32TooBig);
+  await x32TinySrv.close();
+  const x32NoUp = createStreamServer({ token: x32Token });
+  const x32NoUpSrv = await listenStreamServer({ server: x32NoUp, port: 0 });
+  const x32Unconfigured = await x32Json(await x32Raw(x32NoUpSrv.origin, x32Token, "POST", "/stream-server/v1/turns", {
+    turn_id: "turn_no_upstream", messages: [{ role: "user", content: "x" }],
+  }));
+  check("没配上游就明说 stream_upstream_unconfigured，不拿一句 500 糊过去",
+    x32Unconfigured.status === 503 && x32Unconfigured.body.error === "stream_upstream_unconfigured", x32Unconfigured);
+  const x32NoUpDiscovery = await x32Json(await x32Raw(x32NoUpSrv.origin, x32Token, "GET", "/stream-server/v1"));
+  check("对照：没配上游也照样回发现响应（声明的是自己认哪一档，不是上游通不通）",
+    x32NoUpDiscovery.status === 200 && x32NoUpDiscovery.body.spec === SPEC_ID, x32NoUpDiscovery.body);
+  await x32NoUpSrv.close();
+
+  // H. 专属档：会话在对方那侧，帧词表沿用云端那一套，我们的群工具不在这条通道里。
+  const x32DedToken = "st-smoke-ded-1";
+  const x32Ded = await startMockDedicated(x32DedToken);
+  const x32DedAgent = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小D", role: "专属员工", backend: "stream", context_chars: 8000,
+      api_base_url: `${x32Ded.origin}/stream-server/v1`, api_key: x32DedToken, model: "ded-model",
+    },
+  });
+  const x32DedId = x32DedAgent.payload.agent?.id;
+  check("同一张表的另一副面孔也认得出来：建档时问清是哪一档",
+    x32DedAgent.payload.ok === true && x32DedAgent.payload.agent?.stream_profile === "dedicated", x32DedAgent.payload.agent);
+  check("后端清单按档位分成两条目：吃不吃工具由对方声明的 profile 决定，不由地址猜",
+    backendFor({ backend: "stream", stream_profile: "dedicated" }).id === "stream-dedicated"
+      && backendFor({ backend: "stream", stream_profile: "dedicated" }).caps.tools === false
+      && backendFor({ backend: "stream", stream_profile: SHARED_PROFILE }).caps.tools === true
+      && backendFor({ backend: "stream", stream_profile: "openai" }).caps.tools === true,
+    BACKENDS.filter((entry) => entry.transport === "stream").map((entry) => [entry.id, entry.caps.tools]));
+  const x32DedPrompt = composeSystemPrompt({ ...slotCtx, backend: backendFor({ backend: "stream", stream_profile: "dedicated" }) });
+  const x32SharedPrompt = composeSystemPrompt({ ...slotCtx, backend: backendFor({ backend: "stream", stream_profile: SHARED_PROFILE }) });
+  check("专属档的措辞说清群工具调不到，不叫它照着技能说明假执行",
+    x32DedPrompt.system.includes("本次由这台 server 上的专属员工作答")
+      && x32DedPrompt.system.includes("请把结论直接写进正文")
+      && !x32DedPrompt.system.includes("按需调用对应工具")
+      && !x32DedPrompt.system.includes("调用 search_history / read_window 工具"), x32DedPrompt.system.slice(0, 220));
+  check("对照：分时那一档照旧带工具说明（抑制只写在不吃工具的那一档上）",
+    x32SharedPrompt.system.includes("按需调用对应工具")
+      && x32SharedPrompt.system.includes("调用 search_history / read_window 工具")
+      && !x32SharedPrompt.system.includes("本次由这台 server 上的专属员工作答"), x32SharedPrompt.system.slice(0, 220));
+
+  const x32DedRoom = await call("streams.create", { token: ana, body: { name: "专属隔离组", agent_ids: [x32DedId] } });
+  const x32DedRoomId = x32DedRoom.payload.stream?.id;
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: x32DedRoomId, content: "@小D 这一轮走专属档", mentions: [{ type: "agent", id: x32DedId }] },
+  });
+  const x32DedRan = await x32TickUntil(x32DedRoomId, x32DedId);
+  check("专属档这一轮跑完", x32DedRan.length === 1 && x32DedRan[0].status === "done", x32DedRan);
+  const x32DedHistory = await call("messages.list", { token: ana, method: "GET", body: { stream_id: x32DedRoomId } });
+  const x32DedReply = (x32DedHistory.payload.items ?? []).find((m) => m.sender_id === x32DedId);
+  check("专属档的规范正文落进群聊", String(x32DedReply?.content ?? "").includes("专属正文"),
+    x32DedReply?.content ?? (x32DedHistory.payload.items ?? []).map((m) => [m.sender_id, String(m.content).slice(0, 80)]));
+  check("专属档的思考链不进群聊（与云端那一档同一条红线）",
+    x32DedReply !== undefined && !JSON.stringify(x32DedReply).includes("专属思考链"), x32DedReply);
+  check("上下文压成一条正文递过去，我们的群工具不塞给它（它用它自己的工具集）",
+    x32Ded.state.promptSeen?.hasTools === false
+      && String(x32Ded.state.promptSeen?.prompt).includes("〔设定与技能说明〕")
+      && String(x32Ded.state.promptSeen?.prompt).includes("本次由这台 server 上的专属员工作答"),
+    String(x32Ded.state.promptSeen?.prompt ?? "").slice(0, 220));
+  const x32Sess1 = await db.stream_sessions.list([["agent_id", x32DedId]], { columns: "id,stream_id,session_id", limit: 20 });
+  await call("messages.send", {
+    token: ana,
+    body: { stream_id: x32DedRoomId, content: "@小D 再补一句", mentions: [{ type: "agent", id: x32DedId }] },
+  });
+  const x32DedRan2 = await x32TickUntil(x32DedRoomId, x32DedId);
+  check("专属档同群第二轮也跑完（不然下面那条“复用”是空转出来的假通过）",
+    x32DedRan2.length === 1 && x32DedRan2[0].status === "done", x32DedRan2);
+  const x32Sess2 = await db.stream_sessions.list([["agent_id", x32DedId]], { columns: "id,stream_id,session_id", limit: 20 });
+  check("同群第二轮复用对方那侧的同一条 session（转录每轮重发，session 只是它的对话缓存）",
+    x32Sess1.length === 1 && x32Sess2.length === 1 && x32Sess1[0].session_id === x32Sess2[0].session_id
+      && x32Ded.state.sessions === 1, { 落库: x32Sess2, 对方建了几次: x32Ded.state.sessions });
+
+  x32Ded.state.mode = "stall";
+  const x32DedRow = await db.agents.byId(x32DedId, { columns: "id,name,backend,api_base_url,model,stream_profile,context_chars" });
+  let x32DedAsked = 0;
+  let x32DedStop = null;
+  try {
+    await askStreamServer({
+      db, agent: x32DedRow, streamId: x32DedRoomId, key: x32DedToken,
+      messages: [{ role: "user", content: "静默卡住" }], tools: null, timeoutMs: 20000,
+      onInterrupt: async () => { x32DedAsked += 1; return x32DedAsked > 1 ? { stopped: true } : null; },
+    });
+  } catch (error) { x32DedStop = error; }
+  check("专属档静默时也问要不要停：就地放弃这一轮并交出半截",
+    x32DedStop instanceof Interrupted && x32DedStop.payload?.partial === x32Ded.state.stallText && x32DedAsked >= 2,
+    { 问了: x32DedAsked, 半截: x32DedStop?.payload?.partial, 错: String(x32DedStop?.message ?? x32DedStop) });
+  check("专属档 caps.interrupt 为假：客户端只掐自己的读循环，不打对方那条可选路",
+    x32Ded.count("POST", /\/interrupt$/) === 0, x32Ded.requests.map((r) => `${r.method} ${r.path}`));
+  x32Ded.state.mode = "ok";
+
+  const x32SwapDed = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小换", role: "换后端", backend: "stream", context_chars: 8000,
+      api_base_url: `${x32Ded.origin}/stream-server/v1`, api_key: x32DedToken, model: "ded-model",
+    },
+  });
+  const x32SwapDedId = x32SwapDed.payload.agent?.id;
+  await db.stream_sessions.insert({
+    id: newId(), agent_id: x32SwapDedId, stream_id: x32DedRoomId, session_id: "sess_ded_cached",
+    created_at: now(), updated_at: now(),
+  }, { columns: "id" });
+  const x32Swapped = await call("agents.update", {
+    token: ana,
+    body: {
+      id: x32SwapDedId, backend: "openai", api_base_url: `http://127.0.0.1:${x32Up.port}/v1`,
+      api_key: "up-smoke-key-32", model: "smoke-shared-model",
+    },
+  });
+  check("换到别的后端就把档位那一格清空（留着旧值等于按错的那一档拼措辞）",
+    x32Swapped.payload.ok === true && x32Swapped.payload.agent?.stream_profile === null, x32Swapped.payload.agent);
+  check("对方那侧的会话缓存跟着作废：它围着 (地址, 令牌, 档位) 建的",
+    (await db.stream_sessions.list([["agent_id", x32SwapDedId]], { columns: "id", limit: 20 })).length === 0);
+
+  // I. 撒谎的发现响应与退回档：退回不是猜，它是这台服务器的事实，可以当结论存下来。
+  const x32Lie = await startLyingSpec({ spec: SPEC_ID, profiles: [{ id: "shared", caps: { tools: false } }] });
+  const x32LieToken = "st-smoke-lie-1";
+  const x32LieAgent = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小谎", role: "撒谎的发现响应", backend: "stream", context_chars: 8000,
+      api_base_url: `${x32Lie.origin}/stream-server/v1`, api_key: x32LieToken, model: "lie-model",
+    },
+  });
+  const x32LieId = x32LieAgent.payload.agent?.id;
+  check("caps.tools 与档位说反了：整条退回，不照谎言选路",
+    x32LieAgent.payload.ok === true && x32LieAgent.payload.agent?.stream_profile === "openai", x32LieAgent.payload.agent);
+  const x32LieAccess = await checkStreamAccess({ baseUrl: `${x32Lie.origin}/stream-server/v1`, token: x32LieToken });
+  check("自检如实报出退回的理由码与当时读到的值（回码不回句子，数据原样带上）",
+    x32LieAccess.speaks_spec === false && x32LieAccess.code === "caps_tools_mismatch"
+      && String(x32LieAccess.detail).startsWith("shared") && x32LieAccess.storable === true
+      && x32LieAccess.profile === "openai", x32LieAccess);
+  const x32LiePing = await call("agents.test", { token: ana, body: { id: x32LieId } });
+  check("退回那一档之后自检就照那一档跑：这台 server 没有 /chat/completions，如实报 404",
+    x32LiePing.payload.result?.reachable === false && x32LiePing.payload.result?.error === "upstream_not_found",
+    x32LiePing.payload.result);
+  await x32Lie.close();
+
+  const x32Plain = await startPlainOpenai();
+  const x32PlainAgent = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "小P", role: "只认 OpenAI 兼容", backend: "stream", context_chars: 8000,
+      api_base_url: `${x32Plain.origin}/v1`, api_key: "st-smoke-plain-1", model: "plain-model",
+    },
+  });
+  const x32PlainId = x32PlainAgent.payload.agent?.id;
+  check("发现那条路回 404：把「这台 server 只认 OpenAI 兼容」存成结论，不每轮重猜",
+    x32PlainAgent.payload.ok === true && x32PlainAgent.payload.agent?.stream_profile === "openai", x32PlainAgent.payload.agent);
+  const x32PlainPing = await call("agents.test", { token: ana, body: { id: x32PlainId } });
+  check("退回档也能自检：报出理由码，并照 OpenAI 兼容跑通一轮",
+    x32PlainPing.payload.result?.reachable === true && x32PlainPing.payload.result?.speaks_spec === false
+      && x32PlainPing.payload.result?.code === "stream_endpoint_missing"
+      && x32PlainPing.payload.result?.stored === true
+      && String(x32PlainPing.payload.result?.reply).includes("_plain_endpoint_ok"), x32PlainPing.payload.result);
+  check("退回那一档真的打在对面的 /chat/completions 上（地址里那段路径没被 originOf 吃掉）",
+    x32Plain.requests.some((r) => r.path === "/v1/chat/completions"),
+    x32Plain.requests.map((r) => `${r.method} ${r.path}`));
+  await x32Plain.close();
+
+  // J. 档位那一格空着或写着表外的值：两处都拒，不静默按某一档跑（那就是群里那次假执行）。
+  const x32Unknown = (profile) => {
+    try { return backendFor({ backend: "stream", stream_profile: profile }) ? null : null; } catch (error) { return error?.code; }
+  };
+  check("档案里那一格空着或写着表外的值：backendFor 当场抛 stream_profile_unknown",
+    x32Unknown(null) === "stream_profile_unknown" && x32Unknown("quantum") === "stream_profile_unknown",
+    { 空: x32Unknown(null), 表外: x32Unknown("quantum") });
+  let x32RouteError = null;
+  try {
+    await askStreamServer({
+      db, agent: { id: "x32", name: "x", backend: "stream", api_base_url: x32Srv.origin, model: "m", stream_profile: null },
+      streamId, key: x32Token, messages: [{ role: "user", content: "x" }], tools: null, timeoutMs: 5000,
+    });
+  } catch (error) { x32RouteError = error; }
+  check("调用面同样拒：这一格决定措辞与工具注入，猜一档就是假执行",
+    x32RouteError?.streamCode === "stream_profile_unknown", x32RouteError?.streamCode);
+  check("档案列的取值域就是两档加退回档",
+    STREAM_PROFILE_VALUES.length === 3 && STREAM_PROFILE_VALUES.includes("openai")
+      && STREAM_PROFILE_VALUES.includes(SHARED_PROFILE) && STREAM_PROFILE_VALUES.includes("dedicated"), STREAM_PROFILE_VALUES);
+  check("发现失败分持久型与临时型：对方答了但答的不是规范才算结论",
+    ["stream_endpoint_missing", "stream_bad_response", "stream_response_too_large", "not_json", "spec_major_mismatch", "caps_tools_mismatch"]
+      .every((code) => isDurableDiscoveryFailure(code)),
+    ["stream_endpoint_missing", "not_json"].map((code) => [code, isDurableDiscoveryFailure(code)]));
+  check("对照：压根没答上的是临时型，存下来就是把一次故障钉成对它的永久判决",
+    ["stream_unreachable", "stream_timeout", "stream_unauthorized", "stream_redirect_blocked"]
+      .every((code) => !isDurableDiscoveryFailure(code)),
+    ["stream_unreachable", "stream_timeout"].map((code) => [code, isDurableDiscoveryFailure(code)]));
+
+  // 收尾：员工被移出群与删员工都要清掉对方那侧的会话缓存（只清云端那一条就是漏一段历史）。
+  const x32DedMembership = (await call("streams.get", { token: ana, method: "GET", body: { id: x32DedRoomId } })).payload.members
+    ?.find((m) => m.type === "agent" && m.agent?.id === x32DedId);
+  await call("streams.members.remove", { token: ana, body: { stream_id: x32DedRoomId, membership_id: x32DedMembership?.membership_id } });
+  check("员工被移出群时，他在对方那侧那条 session 缓存一起作废",
+    (await db.stream_sessions.list([["agent_id", x32DedId]], { columns: "id,stream_id", limit: 20 })).length === 0);
+  for (const id of [x32Id, x32DedId, x32LieId, x32PlainId, x32SwapDedId]) {
+    await call("agents.delete", { token: ana, body: { id } });
+  }
+  check("删掉的员工不再留在档案里", (await db.agents.byId(x32Id, { columns: "id" })) == null);
+  await x32Srv.close();
+  await x32Ded.close();
+  await x32Up.close();
+
+  step("\n§33 符合性测试套件（CTS）：考卷先考自己的参考实现与夹具");
+  // 考官不能是我们自己的客户端：runConformance 判分只认规范表，所以它也能替任何供应商跑（dev/cts.mjs、
+  // 官网在线自检页用的是同一份）。这里钉四件事：参考实现 shared 档满分、dedicated 夹具满分、
+  // 只认 OpenAI 兼容的那台在发现那条就 fail 且档内检查全 skip、考卷自带的分片器与客户端共用的 dataOf 同字节同结果。
+  const x33Up = await startMockUpstream();
+  const x33Srv = await listenStreamServer({
+    server: createStreamServer({
+      upstreamUrl: `http://127.0.0.1:${x33Up.port}/v1`, upstreamKey: "up-smoke-key-33",
+      upstreamModel: "cts-shared", token: "cts-smoke-token-33", label: "cts shared",
+    }),
+    port: 0,
+  });
+  const x33Shared = await runConformance({ origin: x33Srv.origin, token: "cts-smoke-token-33", timeoutMs: 10000 });
+  check("考卷考自己的参考实现（shared 档）：零 fail，且真考到了流与在跑的那一轮被叫停",
+    (x33Shared.counts.fail ?? 0) === 0 && x33Shared.profile === SHARED_PROFILE
+      && x33Shared.results.find((r) => r.id === "shared.turn.stream")?.verdict === "pass"
+      && x33Shared.results.find((r) => r.id === "shared.interrupt.accepted")?.verdict === "pass",
+    x33Shared.results.filter((r) => r.verdict !== "pass"));
+  check("对照：这一轮里 dedicated 档的检查一条都没跑（档选错就是整轮白考）",
+    x33Shared.results.every((r) => !r.id.startsWith("dedicated.")), x33Shared.results.map((r) => r.id));
+
+  const x33Ded = await startMockDedicated("cts-ded-token-33");
+  const x33Dedicated = await runConformance({
+    origin: x33Ded.origin, token: "cts-ded-token-33", profile: "dedicated", timeoutMs: 10000,
+  });
+  check("考卷考 dedicated 夹具：零 fail，两轮都读到权威正文",
+    (x33Dedicated.counts.fail ?? 0) === 0 && x33Dedicated.profile === "dedicated"
+      && x33Dedicated.results.find((r) => r.id === "dedicated.session.turn")?.verdict === "pass"
+      && x33Dedicated.results.find((r) => r.id === "dedicated.session.reuse")?.verdict === "pass",
+    x33Dedicated.results.filter((r) => r.verdict !== "pass"));
+  check("对照：考卷读的正文只是 text 块——字数与夹具的正文对得上，思考链那一段没被算进去",
+    x33Dedicated.results.find((r) => r.id === "dedicated.session.turn")?.detail
+      === `agent.message ${x33Ded.state.text.length} chars, 3 frames`,
+    x33Dedicated.results.find((r) => r.id === "dedicated.session.turn")?.detail);
+
+  const x33Plain = await startPlainOpenai();
+  const x33NoSpec = await runConformance({ origin: x33Plain.origin, token: "cts-plain-token-33", timeoutMs: 5000 });
+  check("只认 OpenAI 兼容的那台：发现那条 fail，档内检查全 skip（不拿猜测当考分）",
+    x33NoSpec.results.find((r) => r.id === "discovery.descriptor")?.verdict === "fail"
+      && x33NoSpec.results.filter((r) => r.id.startsWith("shared.")).every((r) => r.verdict === "skip")
+      && (x33NoSpec.counts.fail ?? 0) >= 1,
+    x33NoSpec.counts);
+
+  // 分片器那份重复的钉子：浏览器里跑的是 payloadOf 这份复制品，客户端跑的是 dataOf；同字节必须同结果。
+  const x33Corpus = [
+    'data: {"type":"turn.delta","content":"a"}',
+    "data: [DONE]",
+    ': comment\ndata: {"type":"agent.message"}',
+    "data: line1\ndata: line2",
+    "event: ping",
+    "",
+  ];
+  check("考卷的分片器与客户端共用的 dataOf 同字节同结果（含注释行、多行 data 与空块）",
+    x33Corpus.every((block) => payloadOf(block) === dataOf(block)),
+    x33Corpus.map((block) => [payloadOf(block), dataOf(block)]));
+
+  await x33Srv.close();
+  await x33Ded.close();
+  await x33Plain.close();
+  await x33Up.close();
+
+  step("\n§34 官网在线自检的入口闸：同一个地址两次起跑必须隔开，同一地址同时只跑一轮");
+  // 闸是公开入口的纪律，不是考卷的判分项：时钟注入进来，窗口边界才钉得死（「超过 10 秒」不是「满 10 秒」）。
+  let x34Clock = 1_000_000;
+  const x34Gate = createCtsGate({ now: () => x34Clock });
+  check("第一次起跑放行", x34Gate.admit("203.0.113.7").ok === true);
+  x34Gate.release("203.0.113.7");
+  const x34Soon = x34Gate.admit("203.0.113.7");
+  check("同一地址 10 秒内再点就被挡，并如实报出还要等多久（要等满 10.001 秒）",
+    x34Soon.ok === false && x34Soon.reason === "too_soon" && x34Soon.retryAfterMs === 10_001,
+    x34Soon);
+  check("对照：另一个发起方地址不受牵连（限的是来访地址，不是被考的那台）",
+    x34Gate.admit("203.0.113.8").ok === true);
+  x34Gate.release("203.0.113.8");
+  x34Clock += 10_000;
+  const x34Exact = x34Gate.admit("203.0.113.7");
+  check("恰好 10.000 秒仍挡：规则写的是「超过 10 秒」", x34Exact.ok === false && x34Exact.retryAfterMs === 1, x34Exact);
+  x34Clock += 1;
+  check("10.001 秒放行", x34Gate.admit("203.0.113.7").ok === true);
+  const x34Busy = x34Gate.admit("203.0.113.7");
+  check("上一轮还没回来：间隔已过也不许并发（同一个地址同时只跑一轮）",
+    x34Busy.ok === false && x34Busy.reason === "run_in_flight", x34Busy);
+  x34Gate.release("203.0.113.7");
+  const x34Settled = x34Gate.admit("203.0.113.7");
+  check("那一轮跑完了但仍在窗口里：照样挡（跑完不等于没跑过）",
+    x34Settled.ok === false && x34Settled.reason === "too_soon", x34Settled);
+
+  let x34Clock2 = 0;
+  const x34Gate2 = createCtsGate({ now: () => x34Clock2 });
+  x34Gate2.admit("198.51.100.4");
+  x34Gate2.release("198.51.100.4");
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    x34Clock2 += 2_000;
+    x34Gate2.admit("198.51.100.4");
+  }
+  const x34Spam = x34Gate2.admit("198.51.100.4");
+  check("被挡下的重试不续期：连点五次后窗口仍从第一次起跑算（10.000 秒时还挡，只剩 1ms）",
+    x34Spam.ok === false && x34Spam.retryAfterMs === 1, x34Spam);
+  x34Clock2 += 1;
+  check("……到 10.001 秒照常放行（连点没有把自己越锁越久）", x34Gate2.admit("198.51.100.4").ok === true);
 
   console.log(`\n结果：${passed} 项通过，${failures.length} 项失败`);
   if (failures.length) {

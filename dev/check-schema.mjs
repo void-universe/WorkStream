@@ -4,8 +4,9 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { BACKEND_IDS } from "../functions/backends.mjs";
+import { BACKEND_IDS, BACKENDS } from "../functions/backends.mjs";
 import { DEFAULT_LOCALE as SERVER_DEFAULT_LOCALE, LOCALE_IDS } from "../functions/locales.mjs";
+import { ENDPOINTS, ERROR_CODES, EVENTS, INTERRUPTED_REASON, STREAM_DONE } from "../functions/streamspec.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const columnName = /^[a-z_][a-z0-9_]*$/;
@@ -201,6 +202,83 @@ if (!optionIds.length) problems.push('src/views/Agents.tsx 的「模型来源」
 else if (!sameSet(optionIds, BACKEND_IDS)) problems.push(`「模型来源」下拉 [${optionIds.join(",")}] 与后端清单 [${BACKEND_IDS.join(",")}] 对不上`);
 if (!sameSet(unionIds, BACKEND_IDS)) problems.push(`type Backend [${unionIds.join(",")}] 与后端清单 [${BACKEND_IDS.join(",")}] 对不上`);
 
+/* ---------- 5b. 回合契约文档 ↔ 后端清单 ↔ 传输路由 三方对账 ---------- */
+// 分布式回合契约（docs/arch/distributed.md）声明了每条后端通道的 transport，它是 BACKENDS 与 TRANSPORT_ROUTES
+// 之外的第三份副本。冷启动那道（agents.mjs）只在 smoke 真 import 到 agents.mjs 时才炸，check-schema 跑在它前面，
+// 所以这里静态把三方钉在一起：文档漂移、清单加了通道没补文档、路由漏实现，都在这一道先报。
+const declaredTransports = [...new Set(BACKENDS.map((entry) => entry.transport))];
+// 不 import agents.mjs（它会拉起整条引擎依赖并触发冷启动抛），按源码形状取 TRANSPORT_ROUTES 的键：
+// 路由值都是箭头函数，键在两空格缩进上；嵌套实参的键缩进更深，不会被这条认成路由。
+const agentsSource = readFileSync(join(root, "functions", "agents.mjs"), "utf8");
+const routesBody = /const TRANSPORT_ROUTES = \{([\s\S]*?)\n\};/.exec(agentsSource)?.[1] ?? "";
+const implementedTransports = [...routesBody.matchAll(/^ {2}([a-z]+):/gm)].map((match) => match[1]);
+if (!implementedTransports.length) problems.push("functions/agents.mjs 的 TRANSPORT_ROUTES 没解析出路由键（改了行结构要同步改这道对账）");
+else if (!sameSet(implementedTransports, declaredTransports)) problems.push(`TRANSPORT_ROUTES 的实现 [${implementedTransports.join(",")}] 与后端清单声明 [${declaredTransports.join(",")}] 对不上（冷启动也会抛，这里静态先报一道）`);
+// 文档里那张通道表：找到表头里名为 transport 的那一列，跳过紧跟的分隔行，逐行取该列的内联码。
+const contractLines = readFileSync(join(root, "docs", "arch", "distributed.md"), "utf8").split(/\r?\n/);
+const cellText = (cell) => cell.replace(/`/g, "").trim();
+const headerIndex = contractLines.findIndex((line) => /^\s*\|/.test(line) && line.split("|").some((cell) => cellText(cell) === "transport"));
+if (headerIndex < 0) problems.push("docs/arch/distributed.md 没找到带 transport 列的通道表（改了表结构要同步改这道对账）");
+else {
+  const transportColumn = contractLines[headerIndex].split("|").findIndex((cell) => cellText(cell) === "transport");
+  const docTransports = [];
+  for (const line of contractLines.slice(headerIndex + 2)) {
+    if (!/^\s*\|/.test(line)) break;
+    const span = /`([^`\n]+)`/.exec(line.split("|")[transportColumn] ?? "")?.[1];
+    if (span) docTransports.push(span);
+  }
+  if (!docTransports.length) problems.push("docs/arch/distributed.md 的通道表没解析出 transport（表头与数据行之间应是分隔行，每行该列要有内联码）");
+  else if (!sameSet(docTransports, declaredTransports)) problems.push(`回合契约文档的 transport [${docTransports.join(",")}] 与后端清单 [${declaredTransports.join(",")}] 对不上：加/减通道要在文档与 BACKENDS 同一次改完`);
+}
+
+/* ---------- 5c. Stream Server 规范表 ↔ 客户端 ↔ 参考实现 ---------- */
+// 规范表（functions/streamspec.mjs）有三个消费者：客户端按它拼路径选档（functions/stream.mjs）、
+// 参考实现按它挂路由发帧（functions/streamserver.mjs）、官网那页规范照它写。表与实现各说各话时，
+// 运行时只表现为一句 404，或一帧发出去没人读的帧；而冒烟打的就是我们自己的参考实现——
+// 两边一起错，它永远绿。所以路由名与帧词表这两份副本在这里静态钉死。
+const streamClient = readFileSync(join(root, "functions", "stream.mjs"), "utf8");
+const streamServerImpl = readFileSync(join(root, "functions", "streamserver.mjs"), "utf8");
+const endpointNames = new Set(ENDPOINTS.map((entry) => entry.name));
+const clientRoutes = [...streamClient.matchAll(/endpointPath\("(\w+)"/g)].map((match) => match[1]);
+if (!clientRoutes.length) problems.push("functions/stream.mjs 里没扫出 endpointPath(\"名字\") 调用（改了写法要同步改这道对账）");
+for (const name of new Set(clientRoutes)) {
+  if (!endpointNames.has(name)) problems.push(`functions/stream.mjs 调了规范表里没有的 endpoint：${name}（运行时是一句「规范里没有这条 endpoint」）`);
+}
+const serverRoutes = [...(streamServerImpl.match(/const IMPLEMENTS = \[([^\]]*)\]/)?.[1] ?? "").matchAll(/"(\w+)"/g)].map((match) => match[1]);
+if (!serverRoutes.length) problems.push("functions/streamserver.mjs 的 IMPLEMENTS 没解析出条目（改了写法要同步改这道对账）");
+for (const name of serverRoutes) {
+  if (!endpointNames.has(name)) problems.push(`参考实现声明实现了规范表里没有的 endpoint：${name}`);
+}
+// 表里声明了、两边却都没人用：规范页会许诺一条没人 serve 的路。optional 的那条例外——
+// 它本来就允许不实现（dedicated 档的中断退化成客户端掐自己的读循环，caps.interrupt 为假）。
+const referencedRoutes = new Set([...clientRoutes, ...serverRoutes]);
+for (const entry of ENDPOINTS) {
+  if (!entry.optional && !referencedRoutes.has(entry.name)) {
+    problems.push(`规范表声明了 endpoint ${entry.name}，但客户端与参考实现都没用它：要么接上，要么从表里删掉`);
+  }
+}
+// shared 那一套帧词表是我们自己定的：两个实现里的字面量必须与表逐格相同。
+// 多一个字面量 = 发/读了规范没声明的帧（供应商照规范实现就会漏），少一个 = 表里那条没人认。
+const sharedFrames = new Set([
+  ...[...streamClient.matchAll(/"(turn\.[a-z_]+)"/g)].map((match) => match[1]),
+  ...[...streamServerImpl.matchAll(/"(turn\.[a-z_]+)"/g)].map((match) => match[1]),
+]);
+if (!sharedFrames.size) problems.push("两个实现里没扫出 turn.* 帧字面量（改了写法要同步改这道对账）");
+else if (!sameSet([...sharedFrames], EVENTS.shared)) problems.push(`实现里的 shared 帧 [${[...sharedFrames].sort().join(",")}] 与规范表 [${EVENTS.shared.join(",")}] 对不上`);
+// dedicated 那一套只要求「表里声明的帧读循环都认」，不要求相等：读循环是 functions/qca.mjs 那一份，
+// 它同时服务云端 Agent 那一档，词表是规范这套的超集（event_start 之类）；反向相等会逼着规范去声明
+// 专属档根本用不到的帧。「只发这三帧也能跑通一轮」由冒烟 §32 那台只发三帧的夹具证明，不靠这里。
+const qcaSource = readFileSync(join(root, "functions", "qca.mjs"), "utf8");
+for (const frame of EVENTS.dedicated) {
+  if (!qcaSource.includes(`"${frame}"`)) problems.push(`规范表声明了 dedicated 帧 ${frame}，但 functions/qca.mjs 的读循环里没有它：对方照规范发这一帧，我们会当没看见`);
+}
+// 两个哨兵只许有一个写法：常量的第二份拼写正是两边漂移的起点（一边改了另一边不会报错，只会行为分岔）。
+for (const [literal, name] of [[`"${STREAM_DONE}"`, "STREAM_DONE"], [`"${INTERRUPTED_REASON}"`, "INTERRUPTED_REASON"]]) {
+  for (const [file, text] of [["functions/stream.mjs", streamClient], ["functions/streamserver.mjs", streamServerImpl]]) {
+    if (text.includes(literal)) problems.push(`${file} 里写着字面量 ${literal}：${name} 由规范表导出，第二份拼写就是漂移的起点`);
+  }
+}
+
 /* ---------- 6. 界面语言：清单、字典与取词点对账 ---------- */
 // 服务端只要 id 白名单，前端还要自称、书写方向和「译完与否」，所以清单存了两份
 // （functions/ 打包不了 src/ 的 TS）。字典缺一个键不会报错，只会把界面渲染成 ⟦键名⟧；
@@ -305,11 +383,11 @@ for (const name of dictNames) {
 // 数字变小却没改表同样拒绝，否则这张表会变成一份越来越假的欠债清单。
 // 表里留着的每一处都应该是「数据/枚举/兜底」而不是界面文案，改的人得逐行确认才能把数字往下调。
 // - src/lib/i18n.ts：语言的自称（简体中文、日本語），换了界面语言也不该被翻译，否则用户认不出自己要选的那个。
-// - src/views/Agents.tsx：写进 model 列的哨兵值「云端 Agent」与它的回读比对，是数据不是文案（屏上那一行已走 agent.qcaModel）。
+// - src/views/Agents.tsx：写进 model 列的哨兵值「云端 Agent」（QCA_MODEL）与它的回读比对，是数据不是文案（屏上那一行已走 agent.qcaModel）。
 // - src/views/Skills.tsx：技能分类默认值「协作」入库、会被服务端原样存下，另有一行是「技能源示例 index」的 JSON 样例正文。
 const BARE_COPY_CEILING = {
   "src/lib/i18n.ts": 2,
-  "src/views/Agents.tsx": 2,
+  "src/views/Agents.tsx": 1,
   "src/views/Skills.tsx": 3,
 };
 const stripComments = (text) =>
@@ -536,6 +614,38 @@ for (const [code, where] of composed) {
   if (!codeToKey.has(code)) problems.push(`服务端会回 ${code}（${where}），前端没配这句文案：界面只会显示「出错了：${code}」`);
 }
 
+/* ---------- 8c. Stream Server 规范那一族错误码 ---------- */
+// 这一族在两个实现里都不走 fail()/new Halt()，而是 new StreamError(码) 与响应体里的 error: 码，
+// 第 8 节那道字面扫对它们是瞎的；规范表的 ERROR_CODES 又是它们的第三份副本。所以按
+// 「表 ↔ 两个实现 ↔ 文案」三方对账：raise 了却没声明，规范页与供应商的接入自检都看不见这个码；
+// 声明了却没人 raise，规范页就在许诺一件不会发生的事；声明了却没文案，用户看到的就是那串码本身。
+// 认「哪段代码在 raise」用的四种形状逐条写明：新增一种抛法要么登记进来，要么这道对账就地报扫不到。
+const RAISE_SHAPES = [
+  /new StreamError\(\s*"(stream_[a-z_]+)"/g,     // 客户端直接抛
+  /\[\s*"(stream_[a-z_]+)"\s*,\s*\d{3}\s*\]/g,   // RAISED 表：[码, 状态]
+  /[?:]\s*"(stream_[a-z_]+)"/g,                  // statusToCode 的三元分支
+  /error:\s*"(stream_[a-z_]+)"/g,                // 服务端响应体里的那一格
+];
+const raisedCodes = (text) => {
+  const found = new Set();
+  for (const shape of RAISE_SHAPES) for (const match of text.matchAll(shape)) found.add(match[1]);
+  return found;
+};
+for (const [side, file, text] of [["client", "functions/stream.mjs", streamClient], ["server", "functions/streamserver.mjs", streamServerImpl]]) {
+  const declared = ERROR_CODES[side];
+  const raised = raisedCodes(text);
+  if (!raised.size) problems.push(`${file} 里没扫出 stream_* 错误码：是抛法变了（这道对账只认 RAISE_SHAPES 那四种形状）还是文件没读到？`);
+  for (const code of raised) {
+    if (!declared.includes(code)) problems.push(`${file} 会回 ${code}，但规范表的 ${side} 侧没声明它：规范页与接入自检都看不见这个码`);
+  }
+  for (const code of declared) {
+    if (!raised.has(code)) problems.push(`规范表 ${side} 侧声明了 ${code}，但 ${file} 里没有一处会回它：删掉这条，或在实现里接上`);
+  }
+}
+for (const code of [...ERROR_CODES.client, ...ERROR_CODES.server]) {
+  if (!codeToKey.has(code)) problems.push(`规范表声明了 ${code}，但 src/api.ts 的 ERROR_KEYS 没配这句文案：界面上就是「出错了：${code}」`);
+}
+
 /* ---------- 9. 文档双语配对 ---------- */
 // 可浏览的文档中英各一份，顶部一行互相跳。两份之间没有第三处事实来源，所以漏改一处翻译，
 // 界面切换帮不上忙、冒烟也永远看不见——只能按形状对账：标题层级序列、表格行列、正文规模、
@@ -547,6 +657,7 @@ const DOC_PAIRS = [
   ["CHANGELOG.md", "CHANGELOG.en.md"],
   ["docs/guide.md", "docs/guide.en.md"],
   ["docs/arch/scheduler.md", "docs/arch/scheduler.en.md"],
+  ["docs/arch/distributed.md", "docs/arch/distributed.en.md"],
 ];
 // 单语文档必须在这里登记，并说得出为什么只有一份。
 const SINGLE_LANGUAGE_DOCS = {
@@ -675,11 +786,12 @@ console.log(`取词点（${usedKeys.size} 个键，扫 src/ 全量 .ts/.tsx）`)
 console.log(`界面文案裸奔（${[...bareCounts.values()].reduce((n, c) => n + c, 0)} 行，分布在 ${bareCounts.size} 个文件；表里记了 ${Object.keys(BARE_COPY_CEILING).length} 处欠债）`);
 console.log(`群内系统行（${systemLineSites} 处写入点，句子只出自 functions/copy.mjs 的中英两套模板）`);
 console.log(`服务端错误码（字面可扫 ${serverCodes.size} 个 + 拼出来 ${composed.size} 个）与前端文案（ERROR_KEYS ${codeToKey.size} 条）`);
+console.log(`Stream Server 规范（${ENDPOINTS.length} 条 endpoint、帧 shared ${EVENTS.shared.length}/dedicated ${EVENTS.dedicated.length}、错误码 client ${ERROR_CODES.client.length}/server ${ERROR_CODES.server.length}）↔ 客户端 ↔ 参考实现`);
 console.log(`文档双语配对（${DOC_PAIRS.length} 对：${DOC_PAIRS.map(([zh]) => zh.replace(/\.zh\.md$|\.md$/, "")).join(", ")}；速记别名 ${Object.keys(SPAN_ALIASES).length} 条；单语 ${Object.keys(SINGLE_LANGUAGE_DOCS).length} 份：${Object.keys(SINGLE_LANGUAGE_DOCS).join(", ")}）`);
 if (dynamicWrites.size) console.log(`按变量传参、无法静态展开写入列的表：${[...dynamicWrites].join(", ")}`);
 if (problems.length) {
   console.log(`发现 ${problems.length} 处不一致：\n- ${problems.join("\n- ")}`);
   process.exitCode = 1;
 } else {
-  console.log("结果：读写列、渲染器登记、后端清单、语言字典、错误码文案、界面文案裸奔棘轮与文档双语配对全部对账通过。");
+  console.log("结果：读写列、渲染器登记、后端清单、语言字典、错误码文案、Stream Server 规范表、界面文案裸奔棘轮与文档双语配对全部对账通过。");
 }

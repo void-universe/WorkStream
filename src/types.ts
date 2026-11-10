@@ -39,9 +39,12 @@ export type Agent = {
   key_source: "secret" | "database" | string;
   color: string;
   status: "active" | "paused";
-  backend?: "openai" | "qca";
+  backend?: "openai" | "qca" | "stream";
   qca_agent_id?: string | null;
   qca_environment_id?: string | null;
+  /** 规范对接那一档问出来的结果（shared / dedicated / openai）：提示词措辞与工具注入都按它走。
+   *  只有建档、改档、连接自检三个动作写它，一轮任务从不写。 */
+  stream_profile?: "shared" | "dedicated" | "openai" | null;
   created_at: string;
 };
 

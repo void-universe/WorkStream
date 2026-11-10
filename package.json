@@ -14,6 +14,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "dev:function": "node dev/local-function.mjs 8000",
     "dev:function:worker": "node dev/local-function.mjs 8000 --worker",
+    "dev:worker": "node dev/worker-main.mjs",
     "smoke": "node dev/smoke.mjs",
     "bench": "node dev/bench.mjs",
     "check:schema": "node dev/check-schema.mjs",

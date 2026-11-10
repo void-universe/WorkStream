@@ -519,9 +519,11 @@ export const actions = {
     }
     await db.members.remove([["id", membership.id]]);
     // 云端 session 是按 (员工,群) 缓存的对话上下文：员工被移出群就把缓存扔掉，
-    // 否则他再进群时会带着上一段的云端历史继续聊。
+    // 否则他再进群时会带着上一段的云端历史继续聊。规范对接的专属档缓存的是同一件事
+    // （对方那侧的会话），两条通道必须一起作废，只清一条就是漏一段历史。
     if (membership.principal_type === "agent") {
       await db.qca_sessions.removeAll([["agent_id", membership.principal_id], ["stream_id", streamId]]);
+      await db.stream_sessions.removeAll([["agent_id", membership.principal_id], ["stream_id", streamId]]);
     }
     const removed = systemCopy(langOf(user.prefs));
     await insertMessage(db, {
@@ -562,6 +564,8 @@ export const actions = {
     await db.members.removeAll([["stream_id", streamId]]);
     await db.slice_prefs.removeAll([["stream_id", streamId]]);
     await db.qca_sessions.removeAll([["stream_id", streamId]]);
+    // 专属档在对方那侧的会话缓存也是按群建的：群停了还留着，下次同 id 的群会接上这一段的上下文。
+    await db.stream_sessions.removeAll([["stream_id", streamId]]);
     await db.stream_vms.removeAll([["stream_id", streamId]]);
     // 排程也是挂在(员工,群)上的配置：群停用就把行删掉，否则到点判定还在为一个不存在的群投信。
     await db.schedules.removeAll([["stream_id", streamId]]);

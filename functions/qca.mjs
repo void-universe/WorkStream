@@ -5,25 +5,26 @@
 //    云端 session 只当云端侧的缓存，所以按 (员工, 群) 各存一条——共用一条会让不同群在云端串台。
 // 3) 工具回路在云端：QCA agent 用它自己的工具集，我们的群工具对它不可见，所以这条路径不注入 tools。
 //    思考链也不回群里：只取 agent.message 里 type=text 的块，thinking / 工具块一律丢掉。
-import { Interrupted, Halt, newId, now } from "./util.mjs";
+import { Interrupted, Halt, EGRESS_JSON_MAX_BYTES, EGRESS_JSON_TIMEOUT_MS, egressJson, newId, now } from "./util.mjs";
 
 const AGENT_ID_RE = /^agent_[A-Za-z0-9_-]{1,80}$/;
 const ENV_ID_RE = /^env_[A-Za-z0-9_-]{1,80}$/;
 const SESSION_ID_RE = /^sess_[A-Za-z0-9_-]{1,80}$/;
-const JSON_TIMEOUT_MS = 20000;
 const TURN_TIMEOUT_MS = 180000;
 // 与自建端点那条通道同口径：静默 800ms 也问一次要不要掐断。
 const IDLE_MS = 800;
-const JSON_MAX_BYTES = 2 * 1024 * 1024;
 const PROMPT_MAX_CHARS = 900_000;
 const ENV_SCAN_PAGES = 5;
 const API_PREFIX = "/api/v1/cloud";
 
-/** 云端回来的失败：带 code 给界面看是哪一个环节，带 status 让轨迹里能分清鉴权/限流/5xx。 */
+/** 云端回来的失败：带 code 给界面看是哪一个环节，带 status 让轨迹里能分清鉴权/限流/5xx。
+ *  channel 是「这条失败属于哪一族码」的标记：共用的出网工具（util.mjs 的 egressJson）与
+ *  共用的读循环（下面的 runSessionTurn）靠它认出"已经是本通道的错，别再翻一遍"。 */
 export class QcaError extends Error {
   constructor(code, status) {
     super(code);
     this.name = "QcaError";
+    this.channel = "qca";
     this.code = code;
     this.qcaCode = code;
     this.status = status;
@@ -38,66 +39,34 @@ const statusToCode = (status) =>
     : status >= 400 && status < 500 ? "qca_request_rejected"
     : "qca_unavailable";
 
-async function readCapped(body, maxBytes) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  let bytes = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      bytes += value?.byteLength ?? 0;
-      if (bytes > maxBytes) throw new QcaError("qca_response_too_large", 502);
-      text += decoder.decode(value, { stream: true });
-    }
-    text += decoder.decode();
-  } finally {
-    reader.releaseLock();
-  }
-  return text;
-}
+/**
+ * 出网失败的环节 → 云端这一族的码。stream 后端有一份同形状的表（functions/stream.mjs）：
+ * 两条通道共用一份出网纪律与一份读循环，但码必须各说各的，界面上才分得清是哪条通道坏了。
+ */
+const RAISED = {
+  origin: ["qca_origin_invalid", 400],
+  timeout: ["qca_timeout", 502],
+  unreachable: ["qca_unreachable", 502],
+  redirect: ["qca_redirect_blocked", 502],
+  bad_response: ["qca_bad_response", 502],
+  too_large: ["qca_response_too_large", 502],
+  session_error: ["qca_session_error", 502],
+  unfinished: ["qca_stream_ended_unfinished", 502],
+  no_reply: ["qca_no_reply", 502],
+};
 
-/** 一次 JSON 请求：限时、限字节、拒重定向、只认 application/json。 */
-async function call({ origin, pat, path, method = "GET", body, timeoutMs = JSON_TIMEOUT_MS }) {
-  let url;
-  try {
-    url = new URL(`${API_PREFIX}${path}`, origin);
-  } catch {
-    throw new QcaError("qca_origin_invalid", 400);
-  }
-  if (url.origin !== new URL(origin).origin) throw new QcaError("qca_origin_invalid", 400);
-  const headers = { authorization: `Bearer ${pat}`, accept: "application/json" };
-  let payload;
-  if (body !== undefined) {
-    payload = JSON.stringify(body);
-    headers["content-type"] = "application/json";
-  }
-  let response;
-  try {
-    response = await fetch(url.href, { method, headers, body: payload, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
-  } catch (error) {
-    throw new QcaError(error?.name === "TimeoutError" ? "qca_timeout" : "qca_unreachable", 502);
-  }
-  if ([301, 302, 303, 307, 308].includes(response.status)) {
-    await response.body?.cancel().catch(() => {});
-    throw new QcaError("qca_redirect_blocked", 502);
-  }
-  if (!response.ok) {
-    await response.text().catch(() => "");
-    throw new QcaError(statusToCode(response.status), response.status);
-  }
-  if (!response.body || !String(response.headers.get("content-type") ?? "").includes("application/json")) {
-    await response.body?.cancel().catch(() => {});
-    throw new QcaError("qca_bad_response", 502);
-  }
-  try {
-    return JSON.parse(await readCapped(response.body, JSON_MAX_BYTES));
-  } catch (error) {
-    if (error instanceof QcaError) throw error;
-    throw new QcaError("qca_bad_response", 502);
-  }
-}
+export const qcaRaise = (kind, status) => {
+  if (kind === "status") return new QcaError(statusToCode(status), status);
+  const [code, fallback] = RAISED[kind];
+  return new QcaError(code, status ?? fallback);
+};
+
+/** 一次 JSON 请求。path 是从 origin 起的绝对路径（含前缀），由调用方带：
+ *  stream 后端的 dedicated 档复用同一份读循环时带的是它自己的前缀。 */
+const call = ({ origin, pat, path, method = "GET", body, timeoutMs = EGRESS_JSON_TIMEOUT_MS, raise = qcaRaise }) =>
+  egressJson({
+    origin, path, method, body, token: pat, timeoutMs, maxBytes: EGRESS_JSON_MAX_BYTES, raise,
+  });
 
 /** 员工用的 environment：优先用建档时存下的那条；没有就先找可复用的，找不到才建。 */
 async function ensureEnvironment({ db, agent, origin, pat }) {
@@ -106,7 +75,7 @@ async function ensureEnvironment({ db, agent, origin, pat }) {
   for (let index = 0; index < ENV_SCAN_PAGES; index += 1) {
     const list = await call({
       origin, pat,
-      path: `/environments?limit=100${page ? `&page=${encodeURIComponent(page)}` : ""}`,
+      path: `${API_PREFIX}/environments?limit=100${page ? `&page=${encodeURIComponent(page)}` : ""}`,
     });
     if (!Array.isArray(list?.data)) throw new QcaError("qca_bad_response", 502);
     const usable = list.data.find((row) => !row?.archived_at && ENV_ID_RE.test(String(row?.id ?? "")));
@@ -119,7 +88,7 @@ async function ensureEnvironment({ db, agent, origin, pat }) {
     page = list.next_page;
   }
   const created = await call({
-    origin, pat, method: "POST", path: "/environments",
+    origin, pat, method: "POST", path: `${API_PREFIX}/environments`,
     body: { name: `workstream-${String(agent.name ?? agent.id).slice(0, 24)}`, config: { type: "cloud" } },
   });
   if (!ENV_ID_RE.test(String(created?.id ?? ""))) throw new QcaError("qca_bad_response", 502);
@@ -140,7 +109,7 @@ async function rememberEnvironment(db, agent, environmentId) {
 async function ensureSession({ db, agent, streamId, origin, pat, environmentId, persist = true }) {
   if (!persist) {
     const fresh = await call({
-      origin, pat, method: "POST", path: "/sessions",
+      origin, pat, method: "POST", path: `${API_PREFIX}/sessions`,
       body: { agent: { type: "agent", id: agent.qca_agent_id }, environment_id: environmentId },
     });
     if (!SESSION_ID_RE.test(String(fresh?.id ?? ""))) throw new QcaError("qca_bad_response", 502);
@@ -152,7 +121,7 @@ async function ensureSession({ db, agent, streamId, origin, pat, environmentId, 
   );
   if (existing && SESSION_ID_RE.test(String(existing.session_id ?? ""))) return existing.session_id;
   const created = await call({
-    origin, pat, method: "POST", path: "/sessions",
+    origin, pat, method: "POST", path: `${API_PREFIX}/sessions`,
     body: { agent: { type: "agent", id: agent.qca_agent_id }, environment_id: environmentId },
   });
   if (!SESSION_ID_RE.test(String(created?.id ?? ""))) throw new QcaError("qca_bad_response", 502);
@@ -181,18 +150,26 @@ export function flattenPrompt(messages) {
   return prompt;
 }
 
-/** 只认 text 块：云端把思考链与工具调用也塞在 content 里，进群聊的那一段必须是正文。 */
-function textOf(event) {
+/** 只认 text 块：云端把思考链与工具调用也塞在 content 里，进群聊的那一段必须是正文。
+ *  导出给 stream 后端的 dedicated 档复用（functions/stream.mjs）：那一档的帧词表与这里逐字相同。 */
+export function textOf(event) {
   const blocks = Array.isArray(event?.content) ? event.content : [];
   return blocks.filter((block) => block?.type === "text" && typeof block?.text === "string")
     .map((block) => block.text)
     .join("");
 }
 
-/** 一条 SSE 帧：取 data: 字段拼起来解析；注释行、event: 行与解析不了的丢掉。 */
-function parseFrame(raw) {
-  const data = raw.split(/\r?\n/).filter((line) => !line.startsWith(":"))
+/** 一条 SSE 帧里的 data: 字段拼起来（注释行与 event: 行丢掉）。没有 data 就回空串。
+ *  导出给 stream 后端复用：它那边要先认出 `[DONE]` 哨兵再决定解不解 JSON。 */
+export function dataOf(raw) {
+  return raw.split(/\r?\n/).filter((line) => !line.startsWith(":"))
     .filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+}
+
+/** 一条 SSE 帧 → JSON 对象；解析不了的丢掉。
+ *  导出给 stream 后端复用：两档的帧词表不同，但「只用 data: 行 + JSON」这一层是同一件事。 */
+export function parseFrame(raw) {
+  const data = dataOf(raw);
   if (!data) return null;
   try {
     return JSON.parse(data);
@@ -204,15 +181,25 @@ function parseFrame(raw) {
 /**
  * 一轮云端对话：先连流再发问（连晚了会错过增量），收到规范的 agent.message 就收工。
  * 增量只用来在中断时交出半截正文；权威文本以 buffered agent.message 为准。
+ * 路径与错误码由调用方给（默认是云端那一套）：stream 后端的 dedicated 档复用这一份读循环，
+ * 只换前缀与码族——静默也问 onInterrupt、半截上交这些语义不该在第二处重新实现一遍。
  */
-async function runTurn({ origin, pat, sessionId, prompt, timeoutMs = TURN_TIMEOUT_MS, onInterrupt }) {
+const CLOUD_PATHS = {
+  stream: (sessionId) => `${API_PREFIX}/sessions/${sessionId}/events/stream?event_deltas%5B%5D=agent.message`,
+  events: (sessionId) => `${API_PREFIX}/sessions/${sessionId}/events`,
+};
+
+export async function runSessionTurn({
+  origin, pat, sessionId, prompt, timeoutMs = TURN_TIMEOUT_MS, onInterrupt,
+  paths = CLOUD_PATHS, raise = qcaRaise, mode = "qca",
+}) {
   const controller = new AbortController();
   const lifetime = setTimeout(() => controller.abort(), timeoutMs);
   let draft = "";
   let replyId = "";
   try {
     const streamResponse = await fetch(
-      new URL(`${API_PREFIX}/sessions/${sessionId}/events/stream?event_deltas%5B%5D=agent.message`, origin).href,
+      new URL(paths.stream(sessionId), origin).href,
       {
         headers: { authorization: `Bearer ${pat}`, accept: "text/event-stream" },
         redirect: "manual",
@@ -221,12 +208,12 @@ async function runTurn({ origin, pat, sessionId, prompt, timeoutMs = TURN_TIMEOU
     );
     if (!streamResponse.ok || !streamResponse.body) {
       await streamResponse.body?.cancel().catch(() => {});
-      throw new QcaError(statusToCode(streamResponse.status), streamResponse.status);
+      throw raise("status", streamResponse.status);
     }
     const sent = await call({
-      origin, pat, method: "POST", path: `/sessions/${sessionId}/events`,
+      origin, pat, method: "POST", path: paths.events(sessionId),
       body: { events: [{ type: "user.message", content: [{ type: "text", text: prompt }] }] },
-      timeoutMs: JSON_TIMEOUT_MS,
+      raise,
     });
     const sentIds = new Set((Array.isArray(sent?.data) ? sent.data : [])
       .map((event) => String(event?.id ?? "")).filter(Boolean));
@@ -266,7 +253,7 @@ async function runTurn({ origin, pat, sessionId, prompt, timeoutMs = TURN_TIMEOU
           const frame = parseFrame(raw);
           if (!frame) continue;
           if (frame.type === "session.error" || frame?.event?.type === "session.error") {
-            throw new QcaError("qca_session_error", 502);
+            throw raise("session_error", 502);
           }
           if (frame.type === "event_delta" && frame?.delta?.content?.type === "text") {
             draft += String(frame.delta.content.text ?? "");
@@ -279,7 +266,7 @@ async function runTurn({ origin, pat, sessionId, prompt, timeoutMs = TURN_TIMEOU
               replyId = String(event.id ?? "");
               return {
                 content, reasoning: "", usage: null, finish_reason: "stop", first_token_ms: null,
-                mode: "qca", session_id: sessionId, reply_event_id: replyId,
+                mode, session_id: sessionId, reply_event_id: replyId,
               };
             }
           }
@@ -291,13 +278,13 @@ async function runTurn({ origin, pat, sessionId, prompt, timeoutMs = TURN_TIMEOU
       reader.releaseLock();
     }
     // 流走完还没拿到规范正文：不能拿半截增量冒充回复，如实报错让这轮标失败。
-    throw new QcaError(replyId || draft ? "qca_stream_ended_unfinished" : "qca_no_reply", 502);
+    throw raise(replyId || draft ? "unfinished" : "no_reply", 502);
   } catch (error) {
-    if (error instanceof QcaError || error instanceof Interrupted || error?.name === "AbortError") {
-      if (error?.name === "AbortError") throw new QcaError("qca_timeout", 504);
-      throw error;
-    }
-    throw new QcaError("qca_unreachable", 502);
+    // channel 标记认「这条失败已经是本通道的码」：共用读循环的两条通道各有各的族，
+    // 按 instanceof 认会把对方那一族的错再翻一遍，界面上就分不清是哪条通道坏了。
+    if (error instanceof Interrupted || error?.channel) throw error;
+    if (error?.name === "AbortError") throw raise("timeout", 504);
+    throw raise("unreachable", 502);
   } finally {
     clearTimeout(lifetime);
     controller.abort();
@@ -314,12 +301,12 @@ export async function askCloudAgent({
   const sessionId = await ensureSession({
     db, agent, streamId, origin, pat, environmentId, persist: streamId && persistSession,
   });
-  return runTurn({ origin, pat, sessionId, prompt: flattenPrompt(messages), timeoutMs, onInterrupt });
+  return runSessionTurn({ origin, pat, sessionId, prompt: flattenPrompt(messages), timeoutMs, onInterrupt });
 }
 
 /** 建档/自检用的轻量校验：拉一次模型清单，确认 PAT 与 origin 成对且云端可达。 */
 export async function checkCloudAccess({ origin, pat }) {
-  const list = await call({ origin, pat, path: "/models?limit=1" });
+  const list = await call({ origin, pat, path: `${API_PREFIX}/models?limit=1` });
   if (!Array.isArray(list?.data)) throw new QcaError("qca_bad_response", 502);
   return { reachable: true, models: list.data.length };
 }

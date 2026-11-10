@@ -34,7 +34,24 @@ type AgentDetail = {
   queue: MailItem[];
 };
 
-type Backend = "openai" | "qca";
+type Backend = "openai" | "qca" | "stream";
+
+/** agents.test 的回报。规范对接那一档多带一组发现事实：走哪一档是问出来的，不是猜的，
+ *  所以这一组要照原样上屏（`speaks_spec` 缺席即"这次不是规范对接那一档的自检"）。 */
+type TestResult = {
+  reachable: boolean;
+  ms: number;
+  reply?: string | null;
+  mode?: string;
+  error?: string;
+  speaks_spec?: boolean;
+  stored?: boolean;
+  profile?: string;
+  spec?: string | null;
+  profiles?: string[];
+  models?: string[] | null;
+  code?: string | null;
+};
 
 type Draft = {
   id?: string;
@@ -51,28 +68,31 @@ type Draft = {
   status: "active" | "paused";
   backend: Backend;
   qca_agent_id: string;
-  /** 切到云端之前那个自建端点地址，切回来时还给他，不用重新手打。 */
+  /** 切走之前那个自建端点地址，切回自建时还给他，不用重新手打。 */
   prev_openai_url: string;
 };
 
 /** 云端 Agent 的默认 API 地址（CN 区）；换区或私有部署就在字段里改成对应 origin。 */
 const QCA_ORIGIN = "https://api.qoder.com.cn";
 
+/** 云端 Agent 那一档不认模型名，档案里存这个占位值；切走时要认得它才敢覆盖用户真填的模型。 */
+const QCA_MODEL = "云端 Agent";
+
 /** 切后端只换该换的：演示地址与云端地址互相预置，令牌一律留空让用户重填——
- *  两种后端的凭据不是一类东西，服务端也会拦"换了后端却没给新凭据"。 */
+ *  三种后端的凭据不是一类东西，服务端也会拦"换了后端却没给新凭据"。 */
 function switchBackend(current: Draft, next: Backend): Draft {
   if (next === current.backend) return current;
-  const toQca = next === "qca";
+  const kept = current.model === QCA_MODEL || !current.model ? "demo" : current.model;
   return {
     ...current,
     backend: next,
     // 切到云端就填 Cloud Agents 的 origin：留着自建端点的地址只会让人拿 PAT 去打 deepseek。
     // 切回自建时把切走前那个地址还回去，没存过才回演示端点。
-    api_base_url: toQca ? QCA_ORIGIN : (current.prev_openai_url || "demo://local"),
-    prev_openai_url: toQca ? current.api_base_url : "",
-    model: toQca
-      ? "云端 Agent"
-      : current.model === "云端 Agent" || !current.model ? "demo" : current.model,
+    // 切到规范对接要清空：这一档保存前必须发一次真实的发现请求，预置演示端点只会换来一句
+    // stream_needs_real_origin——空字段比一个填好了却不能用的地址更容易看懂。
+    api_base_url: next === "qca" ? QCA_ORIGIN : next === "stream" ? "" : (current.prev_openai_url || "demo://local"),
+    prev_openai_url: next === "openai" ? "" : (current.backend === "openai" ? current.api_base_url : current.prev_openai_url),
+    model: next === "qca" ? QCA_MODEL : kept,
     api_key: "",
   };
 }
@@ -204,9 +224,9 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
       system_prompt: agent.system_prompt,
       context_chars: agent.context_chars,
       status: agent.status,
-      backend: agent.backend === "qca" ? "qca" : "openai",
+      backend: agent.backend === "qca" ? "qca" : agent.backend === "stream" ? "stream" : "openai",
       qca_agent_id: agent.qca_agent_id ?? "",
-      prev_openai_url: agent.backend === "qca" ? "" : agent.api_base_url,
+      prev_openai_url: (agent.backend ?? "openai") === "openai" ? agent.api_base_url : "",
     });
     void (async () => {
       try {
@@ -231,6 +251,49 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
 
   // 「自动写一条 summary」在句子里夹着 <code>，拆不成整句，所以按 {0} 切两段、中间自己塞。
   const memoryParts = i18n.tp("agent.memoryNotice");
+
+  // 三种后端各自一整套字段文案。取词必须写字面量键：改成变量取词，字典那道静态对账就看不见了。
+  const streamProfile = agents.find((item) => item.id === draft.id)?.stream_profile ?? null;
+  const copy = draft.backend === "qca"
+    ? {
+        urlLabel: i18n.t("agent.qcaUrlLabel"),
+        urlHint: i18n.t("agent.qcaUrlHint"),
+        modelLabel: i18n.t("agent.qcaModelLabel"),
+        modelHint: i18n.t("agent.qcaModelHint"),
+        keyLabel: i18n.t("agent.patLabel"),
+        keyHint: i18n.t("agent.patHint"),
+        keyPlaceholder: "pt-…",
+        notice: i18n.t("agent.qcaNotice"),
+        signatureHint: i18n.t("agent.signatureQcaHint"),
+        systemHint: i18n.t("agent.systemQcaHint"),
+      }
+    : draft.backend === "stream"
+      ? {
+          urlLabel: i18n.t("agent.streamUrlLabel"),
+          urlHint: i18n.t("agent.streamUrlHint"),
+          modelLabel: i18n.t("agent.streamModelLabel"),
+          modelHint: i18n.t("agent.streamModelHint"),
+          keyLabel: i18n.t("agent.streamKeyLabel"),
+          keyHint: i18n.t("agent.streamKeyHint"),
+          keyPlaceholder: draft.id ? i18n.t("agent.keyKeepPlaceholder") : "",
+          notice: i18n.t("agent.streamNotice"),
+          // 专属档的工具在对方那侧，我们的 set_signature 发不过去：这两句要按档案里那一格的结论换措辞，
+          // 不能一律照分时档说"员工自己也能改"。
+          signatureHint: streamProfile === "dedicated" ? i18n.t("agent.signatureStreamHint") : i18n.t("agent.signatureHint"),
+          systemHint: streamProfile === "dedicated" ? i18n.t("agent.systemStreamHint") : i18n.t("agent.systemHint"),
+        }
+      : {
+          urlLabel: i18n.t("agent.openaiUrlLabel"),
+          urlHint: i18n.t("agent.openaiUrlHint"),
+          modelLabel: i18n.t("agent.modelLabel"),
+          modelHint: i18n.t("agent.modelHint"),
+          keyLabel: "API Key",
+          keyHint: i18n.t("agent.keyHint"),
+          keyPlaceholder: draft.id ? i18n.t("agent.keyKeepPlaceholder") : "sk-…",
+          notice: "",
+          signatureHint: i18n.t("agent.signatureHint"),
+          systemHint: i18n.t("agent.systemHint"),
+        };
 
   // 技能区搜索：本地市场在内存里过滤，远端源要现拉，所以起词后才发请求。
   useEffect(() => {
@@ -378,7 +441,9 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         toast.success(i18n.t("agent.saved"));
       } else {
         if (!draft.api_key.trim()) {
-          toast.error(draft.backend === "qca" ? i18n.t("agent.needKeyQca") : i18n.t("agent.needKeyOpenai"));
+          toast.error(draft.backend === "qca"
+            ? i18n.t("agent.needKeyQca")
+            : draft.backend === "stream" ? i18n.t("agent.needKeyStream") : i18n.t("agent.needKeyOpenai"));
           return;
         }
         body.api_key = draft.api_key.trim();
@@ -402,12 +467,30 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
     }
     setBusy(true);
     try {
-      const result = await post<{ ok: true; result: { reachable: boolean; ms: number; reply?: string; mode?: string; error?: string } }>(
-        "agents.test",
-        { id: draft.id },
-      );
-      if (result.result.reachable) toast.success(i18n.tf("agent.testOk", { ms: result.result.ms, mode: result.result.mode ?? "", reply: result.result.reply ?? "" }));
-      else toast.error(i18n.tf("agent.testFail", { error: result.result.error ?? i18n.t("panel.unknown"), ms: result.result.ms }));
+      const result = await post<{ ok: true; result: TestResult }>("agents.test", { id: draft.id });
+      const facts = result.result;
+      if (!facts.reachable) {
+        // 自检失败那一格回的是错误码，不是句子：直接塞进 {error} 就是「出错了：stream_unauthorized」这种给用户看内部标识的界面。
+        toast.error(i18n.tf("agent.testFail", { error: facts.error ? describeCode(i18n, facts.error) : i18n.t("panel.unknown"), ms: facts.ms }));
+      } else if (facts.speaks_spec === undefined) {
+        toast.success(i18n.tf("agent.testOk", { ms: facts.ms, mode: facts.mode ?? "", reply: facts.reply ?? "" }));
+      } else {
+        // 档位是那台 server 自己答出来的事实，照原样报——尤其是「没答上描述符、退回 OpenAI 兼容」这一条：
+        // 界面只说"连通了"，用户会以为对方实现了规范，等到下一轮群工具一个也发不出去时找不到原因。
+        const lines = facts.speaks_spec
+          ? [
+              i18n.tf("agent.testStreamModels", { models: facts.models?.length ? facts.models.join(", ") : "—" }),
+              facts.stored ? i18n.t("agent.testStreamStored") : i18n.t("agent.testStreamUnstored"),
+            ]
+          : [i18n.tf("agent.testStreamFallback", { reason: facts.code ? describeCode(i18n, facts.code) : i18n.t("panel.unknown") })];
+        if (facts.reply) lines.push(facts.reply);
+        toast.success(i18n.tf("agent.testStreamSpec", {
+          spec: facts.speaks_spec ? (facts.spec ?? "—") : "—",
+          profiles: facts.profiles?.length ? facts.profiles.join(", ") : "—",
+          profile: facts.profile ?? "—",
+          ms: facts.ms,
+        }), { description: lines.join(" · ") });
+      }
     } catch (error) {
       toast.error(describeError(i18n, error));
     } finally {
@@ -591,6 +674,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                 >
                   <NativeSelectOption value="openai">{i18n.t("agent.backendOpenai")}</NativeSelectOption>
                   <NativeSelectOption value="qca">{i18n.t("agent.backendQca")}</NativeSelectOption>
+                  <NativeSelectOption value="stream">{i18n.t("agent.backendStream")}</NativeSelectOption>
                 </NativeSelect>
               </Field>
               {draft.backend === "qca" ? (
@@ -598,39 +682,23 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                   <TextInput id="agent-qca" value={draft.qca_agent_id} onChange={(event) => setDraft({ ...draft, qca_agent_id: event.target.value })} placeholder="agent_…" className="h-8 font-mono text-xs" />
                 </Field>
               ) : null}
-              <Field
-                label={draft.backend === "qca" ? i18n.t("agent.qcaUrlLabel") : i18n.t("agent.openaiUrlLabel")}
-                htmlFor="agent-base"
-                hint={draft.backend === "qca" ? i18n.t("agent.qcaUrlHint") : i18n.t("agent.openaiUrlHint")}
-              >
-                <TextInput id="agent-base" value={draft.api_base_url} onChange={(event) => setDraft({ ...draft, api_base_url: event.target.value })} className="h-8 font-mono text-xs" />
+              <Field label={copy.urlLabel} htmlFor="agent-base" hint={copy.urlHint}>
+                <TextInput id="agent-base" value={draft.api_base_url} onChange={(event) => setDraft({ ...draft, api_base_url: event.target.value })} placeholder={draft.backend === "stream" ? "https://" : undefined} className="h-8 font-mono text-xs" />
               </Field>
-              <Field
-                label={draft.backend === "qca" ? i18n.t("agent.qcaModelLabel") : i18n.t("agent.modelLabel")}
-                htmlFor="agent-model"
-                hint={draft.backend === "qca" ? i18n.t("agent.qcaModelHint") : i18n.t("agent.modelHint")}
-              >
+              <Field label={copy.modelLabel} htmlFor="agent-model" hint={copy.modelHint}>
                 <TextInput id="agent-model" value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} className="h-8 font-mono text-xs" />
               </Field>
-              <Field
-                label={draft.backend === "qca" ? i18n.t("agent.patLabel") : "API Key"}
-                htmlFor="agent-key"
-                hint={draft.backend === "qca" ? i18n.t("agent.patHint") : i18n.t("agent.keyHint")}
-              >
-                <Input id="agent-key" type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder={draft.backend === "qca" ? "pt-…" : draft.id ? i18n.t("agent.keyKeepPlaceholder") : "sk-…"} className="h-8 text-xs" />
+              <Field label={copy.keyLabel} htmlFor="agent-key" hint={copy.keyHint}>
+                <Input id="agent-key" type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder={copy.keyPlaceholder} className="h-8 text-xs" />
               </Field>
               <Field label={i18n.t("agent.contextLabel")} htmlFor="agent-context" hint={i18n.t("agent.contextHint")}>
                 <Input id="agent-context" type="number" min={2000} max={2000000} step={20000} value={draft.context_chars} onChange={(event) => setDraft({ ...draft, context_chars: Number(event.target.value) })} className="h-8 text-xs" />
               </Field>
             </div>
 
-            {draft.backend === "qca" ? (
-              <Notice tone="info">{i18n.t("agent.qcaNotice")}</Notice>
-            ) : null}
+            {copy.notice ? <Notice tone="info">{copy.notice}</Notice> : null}
 
-            <Field label={i18n.t("agent.signatureLabel")} htmlFor="agent-signature" hint={draft.backend === "qca"
-              ? i18n.t("agent.signatureQcaHint")
-              : i18n.t("agent.signatureHint")}>
+            <Field label={i18n.t("agent.signatureLabel")} htmlFor="agent-signature" hint={copy.signatureHint}>
               <TextInput
                 id="agent-signature"
                 value={draft.signature}
@@ -641,9 +709,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
               />
             </Field>
 
-            <Field label={i18n.t("agent.systemLabel")} htmlFor="agent-system" hint={draft.backend === "qca"
-              ? i18n.t("agent.systemQcaHint")
-              : i18n.t("agent.systemHint")}>
+            <Field label={i18n.t("agent.systemLabel")} htmlFor="agent-system" hint={copy.systemHint}>
               <Textarea id="agent-system" rows={3} value={draft.system_prompt} onChange={(event) => setDraft({ ...draft, system_prompt: event.target.value })} className="text-xs" />
             </Field>
 
@@ -655,7 +721,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                 </NativeSelect>
               </Field>
               <div className="flex items-end gap-2 pb-0.5">
-                {draft.backend === "qca" ? null : (
+                {draft.backend === "openai" ? (
                   <Button
                     size="sm"
                     variant="ghost"
@@ -664,7 +730,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                   >
                     {i18n.t("agent.useDemo")}
                   </Button>
-                )}
+                ) : null}
                 {draft.id ? <p className="text-xs text-muted-foreground">{draft.api_key ? i18n.t("agent.backendSwitchNote") : i18n.tf("agent.keyTail", { tail: draft.api_key_tail ?? "—" })}</p> : null}
               </div>
             </div>

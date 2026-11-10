@@ -27,9 +27,19 @@ type Slice = {
   failed: number;
   slices: number;
   last_error: string | null;
+  workers: string[];
 };
 
-type Board = { ok: true; boards: { agent: Agent; streams: Slice[] }[]; budget: number };
+type WorkerRow = {
+  id: string;
+  label: string;
+  version: string | null;
+  status: string;
+  inflight: number;
+  last_heartbeat_at: string;
+};
+
+type Board = { ok: true; boards: { agent: Agent; streams: Slice[] }[]; budget: number; workers: WorkerRow[] };
 
 /** scheduler.tick 逐条回报的排程观察：投了信、并进了旧信、还是因为员工不在群里自己停了。 */
 type CronOutcome = {
@@ -445,6 +455,34 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
         <StatRow label={i18n.t("scheduler.statDoneFailed")} value={`${totals.done} / ${totals.failed}`} tone="muted" />
       </div>
 
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm">{i18n.t("scheduler.workersTitle")}</CardTitle>
+          <CardDescription className="text-xs">{i18n.t("scheduler.workersHint")}</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-2">
+          {!(board?.workers ?? []).length ? (
+            <p className="text-xs text-muted-foreground">{i18n.t("scheduler.workersEmpty")}</p>
+          ) : (
+            <div className="grid gap-1.5">
+              {(board?.workers ?? []).map((worker) => (
+                <div key={worker.id} className="flex flex-wrap items-center gap-2 rounded-lg border px-2.5 py-2">
+                  <span className="truncate text-sm">{worker.label}</span>
+                  <span className="font-mono text-[11px] text-muted-foreground">{shortUuid(worker.id)}</span>
+                  <Badge variant={worker.status === "active" ? "outline" : "secondary"} className="rounded-sm text-[11px]">
+                    {worker.status === "active" ? i18n.t("scheduler.workerActive") : i18n.t("scheduler.workerDraining")}
+                  </Badge>
+                  <span className="ml-auto flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
+                    <span>{i18n.tf("scheduler.workerInflight", { n: worker.inflight })}</span>
+                    <span>{i18n.tf("scheduler.workerHeartbeat", { time: timeAgo(i18n, worker.last_heartbeat_at) })}</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       {!board?.boards.length ? (
         <Notice>{i18n.t("scheduler.noAgents")}</Notice>
       ) : null}
@@ -483,6 +521,7 @@ export function SchedulerView({ onBusyChanged }: { onBusyChanged?: (busy: boolea
                     <Progress value={slice.share} className="h-1.5" />
                     <span className="w-12 shrink-0 text-right font-mono text-[11px] tabular-nums text-muted-foreground">{slice.share}%</span>
                   </div>
+                  {slice.workers?.length ? <p className="font-mono text-[11px] text-muted-foreground">{i18n.tf("scheduler.sliceWorkers", { workers: slice.workers.map(shortUuid).join(", ") })}</p> : null}
                   {slice.last_error ? <p className="text-[11px] text-destructive">{i18n.tf("scheduler.lastError", { error: slice.last_error })}</p> : null}
                 </div>
               ))}

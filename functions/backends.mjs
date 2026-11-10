@@ -8,6 +8,8 @@
 // 为什么是声明式的表而不是注册表：没有运行时的贡献者，撤销就是改这个文件，不需要 disposer。
 // 能力位只留有消费者的那一个。usage/reasoning/流式/插话由上游这一轮实际回了什么决定，
 // 轨迹按证据标注"不回报"；拿静态能力位去冒充口径，会掩盖单条端点的失德。
+import { DEDICATED_PROFILE, FALLBACK_PROFILE, SHARED_PROFILE } from "./streamspec.mjs";
+
 export const DEMO_BASE_URL = "demo://local";
 
 /**
@@ -42,24 +44,53 @@ export const BACKENDS = [
       + "在这一通道里都调不到，也不要把工具名写进回复。请把结论直接写进正文，需要落地的动作列成待办交给同事。",
     testNote: "云端没接受这次自检；检查个人访问令牌是否有效、API 地址是否与你所在区域一致。",
   },
+  // 规范对接那一条通道有两副面孔，因为「吃不吃工具」由对方声明的 profile 决定（functions/streamspec.mjs）：
+  // shared 是无状态的分时执行器，我们的群工具整个发过去；dedicated 是专属云端员工，用它自己的工具集。
+  // 档案里存的是发现结果（agents.stream_profile），backendFor 按它返回其中一条——
+  // 建档时就必须问清楚：这一格决定提示词措辞与工具注入，两样都发生在调用之前。
+  {
+    id: "stream",
+    label: "Stream Server（分时执行）",
+    transport: "stream",
+    caps: { tools: true },
+    testNote: "这台 server 没按规范回发现响应；检查地址与令牌是否成对。",
+  },
+  {
+    id: "stream-dedicated",
+    label: "Stream Server（专属员工）",
+    transport: "stream",
+    caps: { tools: false },
+    noToolsNotice: "本次由这台 server 上的专属员工作答：下面提到的 WorkStream 工具（发消息、群文件、虚拟机、记忆写入等）"
+      + "在这一通道里都调不到，也不要把工具名写进回复。请把结论直接写进正文，需要落地的动作列成待办交给同事。",
+    testNote: "这台 server 没按规范回发现响应；检查地址与令牌是否成对。",
+  },
 ];
 
 /**
  * 能落进 `agents.backend` 列的值。演示端点不是档案上的一个选项：它是 api_base_url 等于
- * demo://local 时从地址认出来的那条通道，所以列里只有"自建/云端"两档。
+ * demo://local 时从地址认出来的那条通道；stream 的专属档也不是一个选项：它是发现结果，
+ * 存在 agents.stream_profile 里。所以列里只有"自建/云端/规范对接"三档。
  */
-export const BACKEND_IDS = ["openai", "qca"];
+export const BACKEND_IDS = ["openai", "qca", "stream"];
 
 const BY_ID = new Map(BACKENDS.map((entry) => [entry.id, entry]));
 
 /**
- * 员工档案 → 后端条目。列只分自建/云端，演示那条挂在地址上，所以这里三级判定；
- * 云端列优先，因为建档与改档都拦了"云端后端 + 演示地址"这种成不上的组合。
+ * 员工档案 → 后端条目。列只分自建/云端/规范对接，演示那条挂在地址上，规范对接那条还要再看发现结果，
+ * 所以这里分级判定；云端列优先，因为建档与改档都拦了"云端后端 + 演示地址"这种成不上的组合。
  * 列里出现表没有的值就地抛：静默按自建处理会让那条员工带着错凭据上岗、每轮都失败在鉴权上。
  */
 export function backendFor(agent) {
   const id = agent?.backend ?? "openai";
-  if (id !== "qca" && agent?.api_base_url === DEMO_BASE_URL) return BY_ID.get("demo");
+  if (id !== "qca" && id !== "stream" && agent?.api_base_url === DEMO_BASE_URL) return BY_ID.get("demo");
+  if (id === "stream") {
+    // 退回 OpenAI 兼容那一档也走这条通道（实现里再转手），它吃工具，所以与 shared 档同一条目。
+    const profile = agent?.stream_profile ?? null;
+    if (profile === DEDICATED_PROFILE) return BY_ID.get("stream-dedicated");
+    if (profile === SHARED_PROFILE || profile === FALLBACK_PROFILE) return BY_ID.get("stream");
+    // 没问过就上岗：这一格决定提示词措辞与工具注入，猜错了就是群里那次假执行。
+    throw Object.assign(new Error(`stream_profile_unknown：${profile ?? "空"}`), { code: "stream_profile_unknown" });
+  }
   const entry = BY_ID.get(id);
   if (!entry) throw Object.assign(new Error(`unknown_backend：${id}`), { code: "unknown_backend" });
   return entry;

@@ -5,10 +5,13 @@ import { askCloudAgent, checkCloudAccess, parseAgentId } from "./qca.mjs";
 import { BACKENDS, BACKEND_IDS, DEMO_BASE_URL, backendFor } from "./backends.mjs";
 import { demoCopy, demoLang, langOf } from "./copy.mjs";
 import { installDefaultSkillsFor, skillsForAgent } from "./skills.mjs";
+import { askStreamServer, checkStreamAccess, probeStreamProfile } from "./stream.mjs";
+import { DEDICATED_PROFILE } from "./streamspec.mjs";
+import { normalizeUsage } from "./usage.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, Interrupted, avatarData, int, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
 
 export const AGENT_COLUMNS =
-  "id,owner_id,name,role,signature,avatar,api_base_url,api_key_tail,model,system_prompt,context_chars,key_source,color,status,backend,qca_agent_id,qca_environment_id,created_at,updated_at";
+  "id,owner_id,name,role,signature,avatar,api_base_url,api_key_tail,model,system_prompt,context_chars,key_source,color,status,backend,qca_agent_id,qca_environment_id,stream_profile,created_at,updated_at";
 
 /** 只有服务端自用：密文列永不出现在任何响应里。 */
 export const AGENT_SECRET_COLUMNS = "id,owner_id,api_key_cipher";
@@ -95,6 +98,10 @@ export const actions = {
       min: 2000, max: CONTEXT_CHARS_MAX, name: "context_chars", fallback: CONTEXT_CHARS_DEFAULT,
     });
     assertBackendPair(backend, target.url, model);
+    // 规范对接那一档必须先问清楚再落库：这一格决定提示词措辞与工具注入，两样都发生在调用之前。
+    // 问不出结论（连不上/超时/令牌被拒）就整个建档失败——留着一个空档的员工，每轮任务都失败在
+    // backendFor 上，而群里那句「这次没能完成」说不清是地址不通还是令牌不对。
+    const streamProfile = backend === "stream" ? await probeProfile(target.url, apiKey) : null;
     const sealed = await seal(apiKey, { supabase: db.client, env });
     const id = newId();
     const created = await db.agents.insert({
@@ -114,6 +121,7 @@ export const actions = {
       backend,
       qca_agent_id: qcaAgentId,
       qca_environment_id: null,
+      stream_profile: streamProfile,
       color: COLORS[Math.floor(Math.random() * COLORS.length)],
       status: "active",
       created_at: now(),
@@ -139,6 +147,8 @@ export const actions = {
   async "agents.update"({ db, user, body, env }) {
     const agent = await ownedAgent(db, user, body.id);
     const values = { updated_at: now() };
+    // 这一轮请求里给过的明文令牌：改档要拿它去问对方认哪一档，不能再解一次密文。
+    let keyGiven = null;
     if (body.name !== undefined) values.name = text(body.name, { max: 48, name: "name" });
     if (body.role !== undefined) values.role = text(body.role, { max: 400, name: "role" });
     if (body.model !== undefined) values.model = text(body.model, { max: 120, name: "model" });
@@ -175,6 +185,7 @@ export const actions = {
     }
     if (body.api_key) {
       const apiKey = text(body.api_key, { max: 400, name: "api_key" });
+      keyGiven = apiKey;
       const sealed = await seal(apiKey, { supabase: db.client, env });
       values.api_key_cipher = sealed.cipher;
       values.api_key_tail = maskKey(apiKey);
@@ -183,14 +194,29 @@ export const actions = {
       if ((agent.backend ?? "openai") === "qca") values.qca_environment_id = null;
     }
     // 改档也要成对：只改地址或只改模型名都可能凑出"云端后端 + 演示地址"这种跑不通的组合。
-    assertBackendPair(values.backend ?? agent.backend ?? "openai",
-      values.api_base_url ?? agent.api_base_url, values.model ?? agent.model);
+    const nextBackend = values.backend ?? agent.backend ?? "openai";
+    assertBackendPair(nextBackend, values.api_base_url ?? agent.api_base_url, values.model ?? agent.model);
+    // 规范对接那一档：地址、令牌、后端任何一样变了都要重新问一次，问不出结论就整个改档失败，
+    // 档案一个字不改（旧地址配旧档位仍然自洽，比新地址配旧档位强）。换到别的后端就把这一格清空。
+    if (nextBackend === "stream") {
+      if (values.backend !== undefined || values.api_base_url !== undefined || values.api_key_cipher !== undefined) {
+        const secret = await db.agents.byId(agent.id, { columns: AGENT_SECRET_COLUMNS });
+        const apiKey = keyGiven ?? await open(secret?.api_key_cipher, { supabase: db.client, env });
+        values.stream_profile = await probeProfile(values.api_base_url ?? agent.api_base_url, apiKey);
+      }
+    } else if ((agent.backend ?? "openai") === "stream") {
+      values.stream_profile = null;
+    }
     const updated = await db.agents.claim([["id", agent.id], ["owner_id", user.id]], values);
     if (!updated) throw new Halt("agent_update_failed", 503);
     const cleared = values.backend === "openai" || values.qca_agent_id !== undefined
       || values.api_base_url !== undefined || values.api_key_cipher !== undefined;
     if ((agent.backend ?? "openai") === "qca" && cleared) {
       await db.qca_sessions.removeAll([["agent_id", agent.id]]);
+    }
+    // 对方那侧的会话缓存也是围着 (地址, 令牌, 档位) 建的：这三样任何一样变了都一起作废。
+    if ((agent.backend ?? "openai") === "stream" && (cleared || values.stream_profile !== undefined)) {
+      await db.stream_sessions.removeAll([["agent_id", agent.id]]);
     }
     const row = await db.agents.byId(agent.id, { columns: AGENT_COLUMNS });
     return json({ ok: true, agent: row });
@@ -207,6 +233,7 @@ export const actions = {
     for (const link of links) await db.agent_skills.remove([["id", link.id]]);
     // 云端 session 是按 (员工,群) 缓存的对话上下文：员工没了留着只会让下一个同 id 档案串台。
     await db.qca_sessions.removeAll([["agent_id", agent.id]]);
+    await db.stream_sessions.removeAll([["agent_id", agent.id]]);
     // 排程也是挂在"这个员工还会干活"这个前提上的：留着行，时钟照旧一格少走，每次到点投一封注定失败的信。
     await db.schedules.removeAll([["agent_id", agent.id]]);
     const removed = await db.agents.remove([["id", agent.id], ["owner_id", user.id]]);
@@ -214,7 +241,8 @@ export const actions = {
     return json({ ok: true, id: agent.id });
   },
 
-  /** 连接自检：云端 Agent 只验 PAT 与地址成对（不建 session，不动用量），其余通道走同一派发口发一条极短对话。 */
+  /** 连接自检：云端 Agent 只验 PAT 与地址成对（不建 session，不动用量），规范对接那一档先问档位再跑一轮，
+   *  其余通道走同一派发口发一条极短对话。 */
   async "agents.test"({ db, user, body, env }) {
     const agent = await ownedAgent(db, user, body.id);
     const secret = await db.agents.byId(agent.id, { columns: AGENT_SECRET_COLUMNS });
@@ -228,6 +256,48 @@ export const actions = {
           ok: true,
           result: { reachable: true, ms: Date.now() - started, mode: backend.id, note: `云端可达，可见模型 ${check.models} 个。` },
         });
+      }
+      if (backend.transport === "stream") {
+        const access = await checkStreamAccess({ baseUrl: agent.api_base_url, token: key });
+        // 压根没答上（连不上/超时/令牌被拒）就别再跑那一轮了：跑也是跑在旧档位上，
+        // 报出来的失败与真实原因无关。
+        if (!access.storable) {
+          return json({
+            ok: true,
+            result: {
+              reachable: false, ms: Date.now() - started,
+              error: access.code, detail: access.detail, note: backend.testNote,
+            },
+          });
+        }
+        // 问出来的档位要写回档案：自检报的那一档与员工实际跑的那一档必须是同一个值，
+        // 否则界面上写着"专属员工"、提示词却按分时那一档拼（工具一个也发不出去）。
+        const stored = Boolean(await db.agents.claim(
+          [["id", agent.id], ["owner_id", user.id]], { stream_profile: access.profile },
+        ));
+        const row = await db.agents.byId(agent.id, { columns: AGENT_COLUMNS });
+        const facts = {
+          reachable: true,
+          ms: Date.now() - started,
+          mode: backendFor(row).id,
+          stored,
+          speaks_spec: access.speaks_spec,
+          profile: access.profile,
+          spec: access.spec,
+          profiles: access.profiles,
+          label: access.label,
+          models: access.models,
+          code: access.code,
+          detail: access.detail,
+        };
+        // 专属档的会话建在对方那侧，自检不替用户建会话、不动用量——与云端 Agent 那一档同口径。
+        if (access.profile === DEDICATED_PROFILE) {
+          return json({ ok: true, result: { ...facts, reply: null } });
+        }
+        const result = await completeForAgent({
+          db, agent: row, key, messages: [{ role: "user", content: "ping" }], maxTokens: 8, timeoutMs: 20000,
+        });
+        return json({ ok: true, result: { ...facts, reply: truncate(result.content ?? "", 80) } });
       }
       const result = await completeForAgent({
         db,
@@ -309,11 +379,27 @@ const privateAllowed = (env) => env?.("WORKSTREAM_DEV") === "1";
  * 后端、地址与模型名三样要成对：demo://local 只在自建通道里有意义（它选中内置演示模型，
  * 模型名跟着固定成 demo）。挂到云端后端会让这一轮注定连不上——建档/改档就拒，
  * 别留到员工带着错组合上岗、每轮任务都失败在取不到地址上。
+ * 规范对接那一档同理，而且更早一步：发现请求要发到这个地址上，demo://local 根本不是一个能出网的地址。
  */
 function assertBackendPair(backendId, url, model) {
   if (url !== DEMO_BASE_URL) return;
   if (backendId === "qca") throw new Halt("qca_needs_real_origin", 400);
+  if (backendId === "stream") throw new Halt("stream_needs_real_origin", 400);
   if (model !== "demo") throw new Halt("demo_needs_demo_model", 400);
+}
+
+/** 问对方认哪一档，失败翻成 Halt。handler 的 respond 只认 Halt，StreamError 穿过去就只剩一句
+ *  server_error——用户分不清是地址不通、令牌被拒还是对方答了一份不合规范的描述符。 */
+async function probeProfile(baseUrl, apiKey) {
+  try {
+    return await probeStreamProfile({ baseUrl, token: apiKey });
+  } catch (error) {
+    const status = Number(error?.status);
+    throw new Halt(
+      error?.streamCode ?? "stream_unreachable",
+      status >= 400 && status < 600 ? status : 502,
+    );
+  }
 }
 
 /**
@@ -326,6 +412,8 @@ export function upstreamCode(error, fallback = "upstream_unreachable") {
   if (name) return name;
   // 云端 Agent 的失败自带环节（PAT 被拒 / 找不到 agent / 限流），比笼统的 upstream_* 有用。
   if (error?.qcaCode) return String(error.qcaCode);
+  // 规范对接那台 server 同理：一族 stream_* 的码在客户端抛出的那一刻就长好了（functions/stream.mjs）。
+  if (error?.streamCode) return String(error.streamCode);
   if (typeof error?.status === "number") {
     if (error.status === 401 || error.status === 403) return "upstream_unauthorized";
     if (error.status === 404) return "upstream_not_found";
@@ -341,9 +429,12 @@ export function upstreamCode(error, fallback = "upstream_unreachable") {
  * 请求走 SSE 流式：一边收增量一边在分片边界问上层“要不要停”，
  * 这样群里插话能在几百毫秒内掐断正在生成的回复，而不是等它写完。
  * 演示端点不走这里：地址等于 demo://local 的员工由清单解析成 demo 那条通道（见 functions/backends.mjs）。
+ * onDelta 是给规范的参考实现（functions/streamserver.mjs）留的口子：它要把这一路的增量原样转成
+ * turn.delta 帧发出去。入参是 { content, reasoning, usage }，usage 只在收到用量块的那一发上有值
+ * （那一发正文与思考链都是空的）。只往外交增量、不参与这一轮的结果，不传就与从前一模一样。
  */
 export async function chatCompletion({
-  baseUrl, apiKey, model, messages, tools, maxTokens, timeoutMs = 120000, onInterrupt,
+  baseUrl, apiKey, model, messages, tools, maxTokens, timeoutMs = 120000, onInterrupt, onDelta = null,
 }) {
   const started = Date.now();
   const body = { model, messages, stream: true, stream_options: { include_usage: true } };
@@ -376,7 +467,7 @@ export async function chatCompletion({
     error.code = "upstream_bad_json";
     throw error;
   }
-  return readUpstreamStream(response.body, { onInterrupt, started });
+  return readUpstreamStream(response.body, { onInterrupt, onDelta, started });
 }
 
 /** 内置演示模型：不联网，基于传入的 memory 与历史做抽取式回应，用来在没有任何真实 Key 时
@@ -399,6 +490,9 @@ const TRANSPORT_ROUTES = {
     demoRound({ messages, tools, summary, window, lang: await demoLang(db, agent) }),
   cloud: ({ db, agent, streamId, key, messages, timeoutMs, onInterrupt, persistSession }) =>
     askCloudAgent({ db, agent, streamId, pat: key, messages, timeoutMs, onInterrupt, persistSession }),
+  // 规范对接那条：走哪一档由档案里的发现结果决定（functions/stream.mjs）。退回 OpenAI 兼容那一档的
+  // 实现是递进去的，不是被它 import 的——本模块已经 import 了 stream.mjs，反过来就成了环。
+  stream: (args) => askStreamServer({ ...args, openai: (rest) => TRANSPORT_ROUTES.chat(rest) }),
 };
 
 {
@@ -424,28 +518,8 @@ export async function completeForAgent({ db, agent, streamId, key, messages, too
 
 const IDLE_MS = 800;
 
-/**
- * OpenAI 用量对象 → 我们要落库的四个数；缺字段就留 null，不拿 0 冒充"没用 token"。
- * total 不落：它等于 input + output，没有哪一列需要它。
- */
-function normalizeUsage(raw) {
-  if (!raw || typeof raw !== "object") return null;
-  const pick = (...values) => values.find((value) => Number.isFinite(Number(value))) ?? null;
-  const input = pick(raw.prompt_tokens);
-  const output = pick(raw.completion_tokens);
-  // cached/reasoning 是总数的子桶：自建端点各家口径不一，子桶比总数还大就是这份数不可信。
-  // 按"不回报"收成 null——界面上的命中率与思考占比才不会算出超过 100%，也不会把它投进分母。
-  const subset = (part, whole) => (part === null || whole === null || part > whole ? null : part);
-  return {
-    input,
-    output,
-    cached: subset(pick(raw.prompt_tokens_details?.cached_tokens), input),
-    reasoning: subset(pick(raw.completion_tokens_details?.reasoning_tokens), output),
-  };
-}
-
 /** 解析 `data:` 分片，累加正文与按 index 拼接的工具参数；每次拿到数据或上游静默时检查插话。 */
-async function readUpstreamStream(stream, { onInterrupt, started }) {
+async function readUpstreamStream(stream, { onInterrupt, onDelta = null, started }) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   const toolCalls = new Map();
@@ -489,10 +563,17 @@ async function readUpstreamStream(stream, { onInterrupt, started }) {
       : (typeof delta?.reasoning === "string" ? delta.reasoning : "");
     const token = (typeof delta?.content === "string" ? delta.content.length : 0) + thinking.length;
     if (firstTokenMs === null && token > 0) firstTokenMs = Date.now() - started;
-    if (typeof delta?.content === "string") content += delta.content;
+    const piece = typeof delta?.content === "string" ? delta.content : "";
+    content += piece;
     reasoning += thinking;
+    if (onDelta && token > 0) onDelta({ content: piece, reasoning: thinking, usage: null });
     if (choice?.finish_reason) finishReason = choice.finish_reason;
-    if (parsed?.usage) usage = normalizeUsage(parsed.usage);
+    if (parsed?.usage) {
+      usage = normalizeUsage(parsed.usage);
+      // 上游那份用量块原样交出去：规范认的是上游形状（prompt_tokens/...），客户端落库前自己再归一化一次。
+      // 归一化后的四个数是我们的内部口径，发出去字段名就没了，参考实现无从照规范填 turn.done 的 usage。
+      if (onDelta) onDelta({ content: "", reasoning: "", usage: parsed.usage });
+    }
     for (const call of delta?.tool_calls ?? []) {
       const index = Number(call?.index ?? 0);
       const slot = toolCalls.get(index) ?? { id: "", name: "", arguments: "" };

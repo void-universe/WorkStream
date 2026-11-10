@@ -47,7 +47,8 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 
 | 表 | 键 / 约束 | 在调度里的角色 |
 | --- | --- | --- |
-| `mail` | `(agent_id, stream_id, status)` 索引 | 邮箱即任务队列。`status`: queued → running → done / failed / cancelled；`trigger_seq` 指向触发消息；`meta.interrupt` 存未消化的插话；`meta.kind="compress"` 是后台压缩信；`meta.kind="cron"` 是排程到点投的信，`trigger_seq=0`（不挂在任何一条群消息上），`meta.cron` 里带着到点时刻、欠的对点数与要办的事。 |
+| `mail` | `(agent_id, stream_id, status)` 索引 | 邮箱即任务队列。`status`: queued → running → done / failed / cancelled；`trigger_seq` 指向触发消息；`meta.interrupt` 存未消化的插话；`meta.kind="compress"` 是后台压缩信；`meta.kind="cron"` 是排程到点投的信，`trigger_seq=0`（不挂在任何一条群消息上），`meta.cron` 里带着到点时刻、欠的对点数与要办的事。`worker_id` 记认领它的 worker、`heartbeat_at` 是回收判活的心跳（见 3.7）。 |
+| `workers` | `id` 主键、`(last_heartbeat_at)` 索引 | 分布式执行的观测行（不是注册表，无运行时贡献者，撤销就是改迁移）：`label` / `version` / `status`（active / draining / stopped）/ `inflight` / `last_heartbeat_at`。worker 上线即注册、心跳定时器刷新；调度台据此看谁在干活、那台是不是死了（见 3.7）。 |
 | `slice_prefs` | `UNIQUE(agent_id, stream_id)` | 该员工在该群的时间片权重 1–20（默认 1）。群主/管理员才能改。 |
 | `memories` | `(agent_id, scope)`、`(agent_id, stream_id)` | `scope=common` 跨群长期记忆；`scope=stream` 本群记忆；`kind=summary` + `covers_through_seq` 是本群压缩摘要的水位线。 |
 | `messages` | `(stream_id, seq)` | 群转录的唯一权威。上下文窗口、插话判定、审计回执全部以它为准。`on_behalf_of` 非空表示这条正文是替身代某位真人说的。 |
@@ -67,7 +68,7 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 - **群内 FIFO**：查询按 `created_at asc`，同一员工在同一群里严格按投递顺序处理。
 - **跨群加权**：`allocate(budget, groups)`（最大余数法）把 `WORKSTREAM_SLICE_BUDGET`（默认 2，上限 8）个槽按 `slice_prefs.weight` 切给各群，且不超过该群实际排队数。
 - **总并发上限**：`budget × min(员工数, 6)`，防止一轮 tick 打爆上游配额。
-- **僵尸回收**：`reapStale` 把 running 超过 5 分钟的任务判 `failed: slice_interrupted`，并把期间收到的插话转成新 queued——插话不会因为进程死掉而丢。worker 在没有排队信时也跑这一步，否则崩溃留下的 running 会永远卡住那个员工。
+- **僵尸回收按心跳判活**：`reapStale` 把 running 超过回收阈值仍没心跳的任务判 `failed: slice_interrupted`，并把期间收到的插话转成新 queued——插话不会因为进程死掉而丢。判活读 `heartbeat_at`，旧行没有这一列就退回 `started_at`；阈值走 `WORKSTREAM_REAP_MS`（默认 5 分钟，`reapThreshold` 夹在 10s–1h、越界回默认）。worker 的心跳定时器替在跑的信刷新 `heartbeat_at`，活着的长任务不会被误杀；worker 在没有排队信时也跑这一步，否则崩溃留下的 running 会永远卡住那个员工（见 3.7）。
 
 ### 3.2 一个（员工, 群）同时只跑一封
 
@@ -112,6 +113,16 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 - **上限 3 跳，撞顶那封结为 `failed: hop_limit` 且不回帖**。两个模型互相 @ 可以永远说下去，而每一跳都付一次真实调用；上限判在 `runTask` 里装配之后、出网之前，所以撞顶那一封连上游都不连。真人重新 @ 一次从 `hops=0` 起——上限拦的是这条链，不是这个员工。
 - **三种 @ 各有归宿**：@ 别的员工 → 投任务；@ 真人 → 进 ta 的虚拟邮箱（替身照常另算）；@ 自己 → 记进 `mentions` 让群里看得见，但不投任务，否则替身或自我追问会自己给自己派活。名字对不上本群成员、或那位员工是 `paused`，同样不投——投出去只会得到一封必定失败的信。
 - 这一节的地板在 smoke **§30**：一跳的 `hops`/`from_agent`、三跳触顶、群里只留 3 条回复、@ 自己/不在本群/已停用各自的「不投」，每一条都配一条同位置的放行断言（换成群内在岗的乙二就接得住、拨回 active 照样接得出去）。压测 `dev/bench.mjs` 里的 B3 量的是这条链的端到端耗时，与 §30 是两件事：一个证德性，一个证快慢。
+
+### 3.7 分布式执行：worker 进程承载回合，控制面升级不中断
+
+执行面可以拆出去：`functions/worker.mjs` 的 `startWorker` 是一个能独立部署在多台 server 上的常驻进程，对着同一个库认领与提交，控制面只读写库、不承载回合。统一回合接口与拓扑的完整契约写在 [distributed.md](distributed.md)，这一节只讲它落到调度循环里的四处改动。
+
+- **远程模式控制面空转**：`WORKSTREAM_EXECUTION=worker` 时，不带 worker 上下文的 `scheduler.tick`（前端轮询、控制面自己）在 `reapStale` 之前就返回 `execution:"worker"`、`ran:[]`，一个任务都不认领。worker 自己调 tick 时带着 worker 上下文，不受这条限制。于是控制面升级/重启掐不断在跑的活——回合活在 worker 进程里，不在控制面进程里。
+- **认领即记 worker 与心跳**：`mail.claim` 把 `queued→running` 的那一行同时写上 `worker_id`（哪台接的）与 `heartbeat_at`（从认领起算）。内嵌模式没有 worker，两列为空，回收退回 `started_at` 的老口径。
+- **心跳是回收的正确性信号**：worker 的心跳定时器替它在跑的信刷新 `mail.heartbeat_at`，`reapStale` 据此判活（3.1）。这条信号不依赖 workers 观测行写没写成——观测短暂缺位不影响回收的正确性。
+- **workers 是观测表不是注册表**：它没有运行时贡献者，撤销就是改迁移 `sql/0015_workers.sql`，不需要 disposer。`scheduler.board` 透出全局心跳列表（只列 active / draining）与每个群此刻在哪些 worker 上跑，调度台据此看「谁在干活、那台是不是死了」。
+- **地板在 smoke §31**：分布并发认领只有一个赢、心跳让活着的长任务不被误杀而僵尸照收、远程模式下控制面空转 worker 照跑，每条都配一条同位置的对照断言。
 
 ---
 
@@ -222,7 +233,7 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 
 老库里 `covers_through_seq` 为空的历史回声不参与过滤（无法判断序号），会随「最近 30 条」的滑动自然退场；非回声类 note（压缩失败留痕、用户显式记下的事）序号为空，一律保留。
 
-套件健康度：smoke 的当前地板写在 [AGENTS.md](../../AGENTS.md)（一处事实只有一个家，这里不重复数字）；突发压测 bench **73 通过 / 0 失败**（6.3）；`tsc --noEmit` 干净；`check:schema` 干净（23 张表，列一致）。
+套件健康度：smoke 的当前地板写在 [AGENTS.md](../../AGENTS.md)（一处事实只有一个家，这里不重复数字）；突发压测 bench **73 通过 / 0 失败**（6.3）；`tsc --noEmit` 干净；`check:schema` 干净（24 张表，列一致）。
 
 ### 6.1 对话变长会不会延迟高
 
@@ -299,3 +310,5 @@ interruptWatcher（engine.mjs）+ bus（functions/bus.mjs）
 - **代答不另开一条路**：替身任务与普通任务同表同队列，普通轮提示词逐字节不变（smoke **25**：非替身轮不落 `delegate` 块）；一条 @ 最多派一封（回环两处 guard 各配一条放行断言），真人侧通知不因代答而少（**代答≠代收**）。
 - **排程不另开一条路**：到点的排程只多投一封普通 `mail`，同表同队列，非排程轮的提示词与请求体逐字节不变（smoke **26**：不是排程的那一轮不落 `cron` 块）。一个对点只能有一封信——CAS 推进时钟，多驱动同时扫只有一个赢；投信失败要回拨时钟，下一轮重新判到点（同节）。欠几个对点只投一封，多出来的记进 `merged_runs` 与信里的 `cron.merged`，界面上的「累计合并」和「下一次」都从服务端算出来的值来（暂停时「下一次」是空，不装作还在跑）。人 > 排程：这一轮有真人 @ 就先答人，排程留在下一轮按时钟追上来。
 - 每个模型轮在 `run_steps.detail.prompt_slots` 落下这轮的 `[槽位 id, 字符数, volatile]` 清单，轨迹检视器「上下文」标签按原序显示并标出断点；prompt 字符数与上一轮 LCP 的自动采集仍待 R3/trace 表落地。
+- **分布式执行不另开一条路**：远程模式下控制面 `scheduler.tick` 在 `reapStale` 之前空转（`execution:"worker"`、`ran:[]`），回合全归 worker 进程；worker 自己带上下文调同一个 tick，认领仍是 `queued→running` 的单行 CAS，多驱动并发只有一个赢（smoke **§31**）。控制面升级/重启掐不断在跑的活。
+- **回收按心跳判活**：worker 心跳定时器刷新 `mail.heartbeat_at`，`reapStale` 只收超过 `WORKSTREAM_REAP_MS` 仍没心跳的 running——活着的长任务不被误杀，崩溃留下的僵尸照收（同节，配一条「心跳在跑就不收」的对照）。

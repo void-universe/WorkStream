@@ -197,6 +197,95 @@ function isPrivateHost(host) {
 export const maskKey = (value) =>
   value ? `••••${String(value).slice(-4)}` : "";
 
+/** 出网 JSON 请求的口径上限。两条通道（云端 Agent、Stream Server）用同一份，别各写一个数。 */
+export const EGRESS_JSON_TIMEOUT_MS = 20_000;
+export const EGRESS_JSON_MAX_BYTES = 2 * 1024 * 1024;
+const REDIRECT_STATUSES = [301, 302, 303, 307, 308];
+
+/** 有界读取响应体：不信任对方声明的 Content-Length，超限就地抛，不把整份读进内存。 */
+export async function readCapped(body, maxBytes, tooLarge) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value?.byteLength ?? 0;
+      if (bytes > maxBytes) throw tooLarge();
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+  return text;
+}
+
+/**
+ * 一次出网 JSON 请求：限时、限字节、拒重定向、只认 application/json。
+ * 失败一律交给调用方的 raise(kind, status, bodyCode) 变成本通道的错误码——界面上要能分清
+ * 「云端 Agent 坏了」（qca_*）和「这台执行 server 坏了」（stream_*），所以码不许在这里统一。
+ * kind 只有这几种：origin / timeout / unreachable / redirect / status / bad_response / too_large。
+ * bodyCode 是对方错误正文里的 error 字段（可能为空）：认不认它由调用方决定，
+ * 认下来就等于把对方造的标识贴到用户眼前，所以只认规范里那一族。
+ */
+export async function egressJson({
+  origin, path, method = "GET", body, token,
+  timeoutMs = EGRESS_JSON_TIMEOUT_MS, maxBytes = EGRESS_JSON_MAX_BYTES, raise,
+}) {
+  let url;
+  try {
+    url = new URL(path, origin);
+  } catch {
+    throw raise("origin", 400);
+  }
+  // 路径参数里的 `../` 或 `//host` 会把请求送到别的源上去，带着凭据。
+  if (url.origin !== new URL(origin).origin) throw raise("origin", 400);
+  const headers = { authorization: `Bearer ${token}`, accept: "application/json" };
+  let payload;
+  if (body !== undefined) {
+    payload = JSON.stringify(body);
+    headers["content-type"] = "application/json";
+  }
+  let response;
+  try {
+    response = await fetch(url.href, {
+      method, headers, body: payload, redirect: "manual", signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    throw raise(error?.name === "TimeoutError" ? "timeout" : "unreachable", 502);
+  }
+  if (REDIRECT_STATUSES.includes(response.status)) {
+    await response.body?.cancel().catch(() => {});
+    throw raise("redirect", 502);
+  }
+  if (!response.ok) {
+    const raw = await response.text().catch(() => "");
+    let bodyCode = null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.error === "string") bodyCode = parsed.error;
+    } catch {
+      // 错误正文不是 JSON 就只剩状态码可依据，不用报——这一路的码本来就由状态码翻出来。
+    }
+    throw raise("status", response.status, bodyCode);
+  }
+  if (!response.body || !String(response.headers.get("content-type") ?? "").includes("application/json")) {
+    await response.body?.cancel().catch(() => {});
+    throw raise("bad_response", 502);
+  }
+  try {
+    return JSON.parse(await readCapped(response.body, maxBytes, () => raise("too_large", 502)));
+  } catch (error) {
+    // readCapped 抛的那个已经是本通道的错（带 channel 标记），原样上抛；解析失败才翻成 bad_response。
+    // 不按 error.code 认：网络层的错也带 code，认下来会把 ECONNRESET 之类的原样贴到界面上。
+    if (error?.channel) throw error;
+    throw raise("bad_response", 502);
+  }
+}
+
 /** 生成中途被群里插话掐断：带上打断者、新消息序号和已经输出的半截内容。
  *  放在 util 是因为两条出网路径（自建 OpenAI 兼容端点、云端 Agent）都要抛同一个类，
  *  引擎按 `instanceof` 判定是掐断还是失败。 */
