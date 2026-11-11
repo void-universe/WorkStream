@@ -1,6 +1,7 @@
 // 迁移自检：把 sql/*.sql 的列定义和 functions/*.mjs 里真实读写的列对账。
 // 本机假数据库是 JSON 存储，不会拒绝多余列，所以列名写错在本地跑不出来——这里静态拦一道。
 // 用法：node dev/check-schema.mjs
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -187,6 +188,48 @@ const sheet = readFileSync(join(root, "src", "globals.css"), "utf8");
 const drawioTextRule = /\.ws-drawio\s+text\s*\{[^}]*\}/g.exec(sheet)?.[0] ?? "";
 if (/fill\s*:/.test(drawioTextRule)) {
   problems.push("src/globals.css 的 .ws-drawio text 规则里设了 fill：会盖掉渲染器按底色算出的标签颜色");
+}
+
+/* ---------- 4b. 渲染插件清单对账 ---------- */
+// 插件随站点发布，清单（plugins/bundled/<id>/manifest.json）是它对外的合同：
+// 目录少一条，市场里就凭空多出或少了插件；integrity 对不上，清单描述的就不是正在跑的那份代码。
+const bundledDir = join(root, "plugins", "bundled");
+const catalogFile = join(root, "src", "lib", "pluginCatalog.ts");
+const bundledPlugins = existsSync(bundledDir)
+  ? readdirSync(bundledDir, { withFileTypes: true }).filter((item) => item.isDirectory()).map((item) => item.name).sort()
+  : [];
+if (!bundledPlugins.length) problems.push("plugins/bundled/ 下没有任何渲染插件：Market 插件区会是一张空目录页");
+const catalogSource = existsSync(catalogFile) ? readFileSync(catalogFile, "utf8") : "";
+for (const id of bundledPlugins) {
+  const manifestPath = join(bundledDir, id, "manifest.json");
+  if (!existsSync(manifestPath)) {
+    problems.push(`渲染插件 ${id} 没有 manifest.json：清单是它唯一对外的合同`);
+    continue;
+  }
+  const pluginManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  if (pluginManifest.schema !== 1) problems.push(`渲染插件 ${id} 的 manifest.schema 必须是 1`);
+  if (pluginManifest.id !== id) problems.push(`渲染插件 ${id} 的 manifest.id 写成了 ${pluginManifest.id}`);
+  if (!["message-renderer", "file-renderer"].includes(pluginManifest.kind)) {
+    problems.push(`渲染插件 ${id} 的 kind 只认 message-renderer / file-renderer`);
+  }
+  if (!/^\d+\.\d+\.\d+/.test(String(pluginManifest.version ?? ""))) {
+    problems.push(`渲染插件 ${id} 的 version 要写成点分三段：${pluginManifest.version}`);
+  }
+  const entryPath = join(root, String(pluginManifest.entry ?? ""));
+  if (!pluginManifest.entry || !existsSync(entryPath)) {
+    problems.push(`渲染插件 ${id} 的 entry 指向一个不存在的文件：${pluginManifest.entry}`);
+  } else {
+    const digest = `sha256-${createHash("sha256").update(readFileSync(entryPath)).digest("base64")}`;
+    if (digest !== pluginManifest.integrity) {
+      problems.push(`渲染插件 ${id} 的 integrity 与入口文件不符：清单写 ${pluginManifest.integrity}，实际 ${digest}`);
+    }
+  }
+  if (!catalogSource.includes(`plugins/bundled/${id}/manifest.json`)) {
+    problems.push(`渲染插件 ${id} 没被 src/lib/pluginCatalog.ts 引用：Market 里看不见它`);
+  }
+}
+for (const match of catalogSource.matchAll(/plugins\/bundled\/([\w.-]+)\/manifest\.json/g)) {
+  if (!bundledPlugins.includes(match[1])) problems.push(`pluginCatalog.ts 引了不存在的渲染插件：${match[1]}`);
 }
 
 /* ---------- 5. 后端清单与界面「模型来源」对账 ---------- */
@@ -783,6 +826,7 @@ for (const [from, to] of Object.entries(SPAN_ALIASES)) {
 
 console.log(`迁移里的表（${tables.size}）：${[...tables.keys()].join(", ")}`);
 console.log(`群文件渲染器（${rendererFiles.length}）：${rendererFiles.join(", ") || "（无）"}`);
+console.log(`渲染插件（${bundledPlugins.length}）：${bundledPlugins.join(", ") || "（无）"}`);
 console.log(`后端清单（${BACKEND_IDS.length}）：${BACKEND_IDS.join(", ")}`);
 console.log(`界面语言（${clientIds.length}，已译完 ${completeIds.length}）：字典 ${dictNames.join(", ")}`);
 console.log(`取词点（${usedKeys.size} 个键，扫 src/ 全量 .ts/.tsx）`);

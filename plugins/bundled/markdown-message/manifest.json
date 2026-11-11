@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "id": "markdown-message",
+  "kind": "message-renderer",
+  "version": "1.0.0",
+  "entry": "src/lib/renderers/markdown-message.tsx",
+  "integrity": "sha256-YUNLksWR7ctt+dRtKtiVqdWbdsbe3cMh1OwE4J+x4p4="
+}

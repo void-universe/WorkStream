@@ -8,7 +8,8 @@ import { cn } from "@/lib/utils";
 import { describeCode, describeError, get, post } from "../api";
 import type { Plugin } from "../types";
 import { timeAgo } from "../lib/format";
-import { Field, Notice, TextInput } from "../lib/ui";
+import { BUNDLED_PLUGINS, manifestDownloadUrl, manifestText } from "../lib/pluginCatalog";
+import { CopyChip, Field, Notice, TextInput } from "../lib/ui";
 import { useI18n, type MsgKey } from "../lib/i18n";
 
 const STATUS_LABEL: Record<string, MsgKey> = {
@@ -133,6 +134,8 @@ export function PluginsPanel() {
 
   return (
     <div className="grid gap-3">
+      <BundledPlugins />
+      <h2 className="text-sm font-medium">{i18n.t("plugin.connectorsTitle")}</h2>
       <div className="flex flex-wrap items-end justify-between gap-2">
         <p className="max-w-[620px] text-xs leading-relaxed text-muted-foreground">
           {introParts[0]}
@@ -305,5 +308,62 @@ export function PluginsPanel() {
         </p>
       </section>
     </div>
+  );
+}
+
+/** 随站点一起发布的渲染插件：清单能下载、能整份复制，指南说明怎么写、往哪提。 */
+function BundledPlugins() {
+  const i18n = useI18n();
+  const steps: MsgKey[] = ["plugin.guideStep1", "plugin.guideStep2", "plugin.guideStep3", "plugin.guideStep4"];
+  return (
+    <section className="grid gap-2">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h2 className="text-sm font-medium">{i18n.t("plugin.bundledTitle")}</h2>
+        <span className="text-[11px] text-muted-foreground">{i18n.tf("plugin.bundledCount", { n: BUNDLED_PLUGINS.length })}</span>
+      </div>
+      <p className="max-w-[620px] text-xs leading-relaxed text-muted-foreground">{i18n.t("plugin.bundledHint")}</p>
+      <details className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
+        <summary className="cursor-pointer text-xs font-medium">{i18n.t("plugin.guideTitle")}</summary>
+        <ol className="mt-2 grid list-decimal gap-1 pl-5 text-[11px] leading-relaxed text-muted-foreground">
+          {steps.map((key) => (
+            <li key={key}>{i18n.t(key)}</li>
+          ))}
+        </ol>
+      </details>
+      <ul className="grid gap-2 md:grid-cols-2">
+        {BUNDLED_PLUGINS.map((plugin) => (
+          <li key={plugin.manifest.id} className="ws-surface grid gap-1.5 rounded-xl bg-card p-3">
+            <div className="flex flex-wrap items-baseline gap-2">
+              <span className="text-sm font-medium">{i18n.t(plugin.nameKey)}</span>
+              <Badge variant="outline" className="rounded-full px-1.5 py-0 font-mono text-[10px] font-normal">
+                v{plugin.manifest.version}
+              </Badge>
+              <span className="text-[11px] text-muted-foreground">
+                {plugin.manifest.kind === "file-renderer" ? i18n.t("plugin.kindFile") : i18n.t("plugin.kindMessage")}
+              </span>
+            </div>
+            <p className="text-xs leading-relaxed text-muted-foreground">{i18n.t(plugin.summaryKey)}</p>
+            <p className="truncate font-mono text-[10px] text-muted-foreground" title={plugin.manifest.entry}>
+              {plugin.manifest.entry}
+            </p>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="font-mono text-[10px] text-muted-foreground">{plugin.manifest.integrity.slice(0, 22)}…</span>
+              <a
+                href={manifestDownloadUrl(plugin.manifest)}
+                download={`${plugin.manifest.id}.manifest.json`}
+                className="ml-auto inline-flex h-7 items-center rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              >
+                {i18n.t("plugin.downloadManifest")}
+              </a>
+              <CopyChip
+                value={manifestText(plugin.manifest)}
+                display={i18n.t("plugin.copyManifest")}
+                title={i18n.t("plugin.copyManifestTitle")}
+              />
+            </div>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
