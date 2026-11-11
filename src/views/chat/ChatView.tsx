@@ -185,7 +185,9 @@ export function ChatView({
   }, [messages]);
 
   const mentionables = useMemo(() => mentionablesOf(detail?.members ?? []), [detail]);
-  const names = useMemo(() => mentionables.map((entry) => entry.name), [mentionables]);
+  // @所有人 的正文标记也要着色：它是正文里的 @，不是某个成员的名字。
+  const everyoneName = i18n.t("composer.everyone");
+  const names = useMemo(() => [...mentionables.map((entry) => entry.name), everyoneName], [mentionables, everyoneName]);
   const presenceMap = useMemo(
     () => new Map(presence.map((entry) => [entry.agent_id, entry])),
     [presence],
@@ -490,6 +492,11 @@ function MessageRow({
         {/* 只交了文件、正文空着的回合：气泡不渲染，交付卡片就是这条消息的全部内容。 */}
         <PresentedCards items={message.presented} onOpen={onOpenFile} />
         <div className="flex min-w-0 flex-wrap items-center gap-1.5 px-1">
+          {message.mentions.some((entry) => entry.type === "all") ? (
+            <Badge variant="outline" className="rounded-full px-1.5 py-0 text-[10px] font-normal">
+              @{i18n.t("chat.everyoneChip")}
+            </Badge>
+          ) : null}
           <DeliveryChips deliveries={message.deliveries} dense />
           <span className="font-mono text-[10px] text-muted-foreground opacity-0 transition-opacity group-hover:opacity-70">
             #{message.seq}

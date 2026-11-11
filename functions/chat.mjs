@@ -75,6 +75,13 @@ function parseMentions(raw) {
   const out = [];
   for (const item of raw.slice(0, 20)) {
     if (!item || typeof item !== "object") continue;
+    // @所有人 不带 id：展开在发送那一刻做，群里后来进了谁不会让这条老消息对不上人。
+    if (item.type === "all") {
+      if (seen.has("all")) continue;
+      seen.add("all");
+      out.push({ type: "all" });
+      continue;
+    }
     const type = item.type === "agent" ? "agent" : item.type === "human" ? "human" : null;
     if (!type || !isUuid(item.id)) continue;
     const key = `${type}:${item.id}`;
@@ -147,10 +154,10 @@ export const actions = {
 
     const agentIds = mentions.filter((m) => m.type === "agent").map((m) => m.id);
     const humanIds = mentions.filter((m) => m.type === "human").map((m) => m.id);
-    const agents = agentIds.length
+    const named = agentIds.length
       ? await db.agents.list([["id", agentIds]], { columns: AGENT_COLUMNS, limit: 20 })
       : [];
-    if (agents.length !== agentIds.length) throw new Halt("mention_agent_missing", 400);
+    if (named.length !== agentIds.length) throw new Halt("mention_agent_missing", 400);
     const humans = humanIds.length
       ? await db.users.list([["id", humanIds]], {
         columns: "id,display_name,email,at_channel,delegate_agent_id,delegate_start_at,delegate_end_at", limit: 20,
@@ -163,7 +170,27 @@ export const actions = {
     });
     const members = new Set(inStream.map((m) => `${m.principal_type}:${m.principal_id}`));
     for (const mention of mentions) {
+      if (mention.type === "all") continue;
       if (!members.has(`${mention.type}:${mention.id}`)) throw new Halt("mention_not_in_stream", 400);
+    }
+
+    // @所有人 收在这一刻展开成群里的员工成员。替身是主人的影子，广播不是冲 ta 主人来的：
+    // 让它在广播里代主人答一次，等于替真人说了 ta 没说的话；暂停中的员工也不接广播，
+    // 与员工之间互相 @ 的派发口径一致。
+    const recipients = [...named];
+    if (mentions.some((m) => m.type === "all")) {
+      const crew = inStream
+        .filter((row) => row.principal_type === "agent")
+        .map((row) => row.principal_id);
+      const rows = crew.length
+        ? await db.agents.list([["id", crew]], { columns: "id,name,status,owner_id,kind", limit: 300 })
+        : [];
+      const have = new Set(recipients.map((agent) => agent.id));
+      for (const row of rows) {
+        if (row.status !== "active" || row.kind === "standin" || have.has(row.id)) continue;
+        have.add(row.id);
+        recipients.push(row);
+      }
     }
 
     const message = await insertMessage(db, {
@@ -177,10 +204,10 @@ export const actions = {
       attachments,
     });
 
-    const interrupted = await registerInterrupts(db, { user, streamId, message, agents });
+    const interrupted = await registerInterrupts(db, { user, streamId, message, agents: recipients });
     const merged = new Set(interrupted.map((row) => row.agent_id));
     const queued = [];
-    for (const agent of agents) {
+    for (const agent of recipients) {
       // 该员工正在本群跑任务且这次 @ 已被登记成插话：不再另起一条任务，避免回两遍。
       if (merged.has(agent.id)) continue;
       const mail = await db.mail.insert({

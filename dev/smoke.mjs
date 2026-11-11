@@ -6196,7 +6196,7 @@ async function main() {
 
     // AI 替身：一键开、隐藏、覆盖你在的群、一键关。
     const standinGroup = await call("streams.create", {
-      token: owner, body: { name: "替身验收群", join_policy: "request", agent_ids: [], vm_ids: [] },
+      token: owner, body: { name: "替身验收群", join_policy: "request", agent_ids: [agent.payload.agent.id], vm_ids: [] },
     });
     const standinOn = await call("standin.enable", { token: owner, body: { server_id: serverId } });
     check("一键开替身：建隐藏员工并加入你在的群",
@@ -6208,6 +6208,36 @@ async function main() {
       (listedAfter.payload.items ?? []).map((row) => row.kind ?? null));
     const standinState = await call("standin.get", { token: owner });
     check("替身状态指向那条隐藏员工", standinState.payload.enabled === true && Boolean(standinState.payload.agent?.id), standinState.payload);
+
+    // @所有人：收件人靠每人的派发记录体现，替身不在广播范围——它不是群里的员工，是主人的影子。
+    const broadcast = await call("messages.send", {
+      token: owner,
+      body: { stream_id: standinGroup.payload.stream.id, content: "@所有人 下午三点前把进度贴回来", mentions: [{ type: "all" }] },
+    });
+    check("@所有人 展开成群里每位员工各接一封任务",
+      (broadcast.payload.queued ?? []).length === 1 && broadcast.payload.queued[0].agent_id === agent.payload.agent.id,
+      broadcast.payload.queued);
+    const broadcastMail = await db.mail.list([["message_id", broadcast.payload.message?.id]], { columns: "agent_id", limit: 10 });
+    check("@所有人 不惊动替身：替身只替主人接 @，广播不是冲 ta 主人来的",
+      broadcastMail.length === 1 && broadcastMail[0].agent_id === agent.payload.agent.id, broadcastMail);
+    const broadcastView = await call("messages.list", { token: owner, method: "GET", body: { stream_id: standinGroup.payload.stream.id } });
+    const broadcastMsg = (broadcastView.payload.items ?? []).find((m) => m.id === broadcast.payload.message?.id);
+    check("广播消息只记一条 {type:all}：气泡凭结构化数据标出 @所有人，不用猜正文",
+      (broadcastMsg?.mentions ?? []).length === 1 && broadcastMsg.mentions[0].type === "all", broadcastMsg?.mentions);
+    check("广播不点名真人：不往每位真人邮箱各发一封",
+      (broadcast.payload.notified ?? []).length === 0 && (broadcast.payload.delegated ?? []).length === 0,
+      { notified: broadcast.payload.notified, delegated: broadcast.payload.delegated });
+    const broadcastExplicit = await call("messages.send", {
+      token: owner,
+      body: {
+        stream_id: standinGroup.payload.stream.id,
+        content: "@所有人 复核这版，@部署审 先看一眼",
+        mentions: [{ type: "all" }, { type: "agent", id: agent.payload.agent.id }],
+      },
+    });
+    const explicitMail = await db.mail.list([["message_id", broadcastExplicit.payload.message?.id]], { columns: "agent_id", limit: 10 });
+    check("既 @所有人 又点名同一位员工：只落一封任务，不叠两封",
+      explicitMail.length === 1 && explicitMail[0].agent_id === agent.payload.agent.id, explicitMail);
     const standinOff = await call("standin.disable", { token: owner });
     check("一键关：替身停用", standinOff.payload.enabled === false
       && (await call("standin.get", { token: owner })).payload.enabled === false, standinOff.payload);

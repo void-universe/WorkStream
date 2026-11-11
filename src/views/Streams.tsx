@@ -740,7 +740,11 @@ function StreamPane({
     }
   }, [messages]);
 
-  const names = useMemo(() => mentionablesOf(detail?.members ?? []).map((entry) => entry.name), [detail]);
+  const everyoneName = i18n.t("composer.everyone");
+  const names = useMemo(
+    () => [...mentionablesOf(detail?.members ?? []).map((entry) => entry.name), everyoneName],
+    [detail, everyoneName],
+  );
   const colors = useMemo(() => {
     const map = new Map<string, string>();
     for (const member of detail?.members ?? []) {
@@ -916,6 +920,9 @@ function PaneMessage({
         ) : null}
         {/* 监控位没有群文件抽屉可开，卡片只用来认出交付物，整块不可点。 */}
         <PresentedCards items={message.presented} dense />
+        {message.mentions.some((entry) => entry.type === "all") ? (
+          <span className="px-0.5 text-[10px] text-muted-foreground">@{i18n.t("chat.everyoneChip")}</span>
+        ) : null}
         <DeliveryChips deliveries={message.deliveries} dense />
         {message.error ? <p className="px-0.5 text-[11px] text-destructive">{i18n.tf("stream.receiptError", { error: message.error })}</p> : null}
       </div>

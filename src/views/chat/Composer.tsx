@@ -1,7 +1,7 @@
 // 群聊输入框：@ 自动补全、待发送提及、贴图、Ctrl/⌘+Enter 发送。完整群聊和分屏面板共用。
 import { useMemo, useRef, useState, type ClipboardEvent } from "react";
 import { toast } from "sonner";
-import { PaperclipIcon } from "lucide-react";
+import { AtSign, PaperclipIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -12,6 +12,8 @@ import { PersonAvatar } from "../../lib/ui";
 import type { AgentPresence, Member, Message } from "../../types";
 
 export type Mentionable = { type: "human" | "agent"; id: string; name: string; color?: string; avatar?: string | null };
+/** 补全列表与待发送 chip 共用的一种形状；@所有人 没有 id，收件人在服务端发送时展开。 */
+export type MentionRow = Mentionable | { type: "all"; id: "all"; name: string };
 
 export function mentionablesOf(members: Member[]): Mentionable[] {
   return members
@@ -74,6 +76,10 @@ export function Composer({
     () => (presence ?? []).filter((entry) => entry.working && entry.owned_by_caller),
     [presence],
   );
+  // @所有人 也是打出来的：认正文，不要求先点按钮；只有群里有员工时才摆出来，空群广播没有收件人。
+  const everyone: MentionRow = { type: "all", id: "all", name: i18n.t("composer.everyone") };
+  const canBroadcast = useMemo(() => mentionables.some((entry) => entry.type === "agent"), [mentionables]);
+  const broadcastOn = mentionRe(everyone.name).test(draft);
   // @ 是打出来的，不要求必须先点过补全按钮：直接从正文里认人。
   const mentioned = useMemo(() => mentionables.filter((entry) => mentionRe(entry.name).test(draft)), [mentionables, draft]);
 
@@ -86,17 +92,18 @@ export function Composer({
   const suggestions = useMemo(() => {
     if (token === null) return [];
     const needle = token.toLowerCase();
-    return mentionables
-      .filter((entry) => !needle || entry.name.toLowerCase().startsWith(needle))
-      .slice(0, compact ? 4 : 6);
-  }, [token, mentionables, compact]);
+    const crew: MentionRow[] = mentionables
+      .filter((entry) => !needle || entry.name.toLowerCase().startsWith(needle));
+    const everyoneMatches = canBroadcast && (!needle || everyone.name.toLowerCase().startsWith(needle));
+    return [...(everyoneMatches ? [everyone] : []), ...crew].slice(0, compact ? 4 : 6);
+  }, [token, mentionables, compact, canBroadcast, everyone.name]);
 
   function rememberCaret() {
     const element = textareaRef.current;
     if (element) setCaret(element.selectionStart);
   }
 
-  function chooseSuggestion(entry: Mentionable) {
+  function chooseSuggestion(entry: MentionRow) {
     const element = textareaRef.current;
     const position = element ? element.selectionStart : draft.length;
     const before = draft.slice(0, position).replace(/@([\p{L}\p{N}_-]{0,16})$/u, `@${entry.name} `);
@@ -107,8 +114,20 @@ export function Composer({
     });
   }
 
-  function dropMention(entry: Mentionable) {
+  function dropMention(entry: MentionRow) {
     setDraft((current) => current.replace(mentionRe(entry.name), "").replace(/ {2,}/g, " "));
+  }
+
+  /** 工具栏按钮跟"打 @ 再选人"走同一个落点：插入的仍是正文，发送时再从正文认一遍。 */
+  function insertEveryone() {
+    const element = textareaRef.current;
+    const position = element ? element.selectionStart : draft.length;
+    const token = `@${everyone.name} `;
+    setDraft(draft.slice(0, position) + token + draft.slice(position));
+    requestAnimationFrame(() => {
+      element?.focus();
+      element?.setSelectionRange(position + token.length, position + token.length);
+    });
   }
 
   async function addFiles(fileList: FileList | File[]) {
@@ -138,7 +157,9 @@ export function Composer({
   async function send() {
     const content = draft.trim();
     if (!content && !images.length) return;
-    const mentions = mentioned.map(({ type, id }) => ({ type, id }));
+    const mentions = broadcastOn
+      ? [{ type: "all" as const }]
+      : mentioned.map(({ type, id }) => ({ type, id }));
     setSending(true);
     try {
       const result = await post<{ ok: true } & SendResult>("messages.send", {
@@ -198,6 +219,22 @@ export function Composer({
     </>
   );
 
+  // 这个按钮只往正文里写一句 @所有人；待发送 chip 和发送时的展开都从正文认，不另存一份状态。
+  const broadcastButton = canBroadcast ? (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      className={compact ? "size-8 shrink-0 p-0" : "size-9 shrink-0 p-0"}
+      title={i18n.t("composer.everyoneTitle")}
+      aria-label={i18n.t("composer.everyoneLabel")}
+      disabled={broadcastOn}
+      onClick={insertEveryone}
+    >
+      <AtSign className="size-4" />
+    </Button>
+  ) : null;
+
   const tray = images.length ? (
     <div className="flex flex-wrap items-center gap-1.5">
       {images.map((image, index) => (
@@ -224,9 +261,12 @@ export function Composer({
 
   const canSend = sending || reading || (!draft.trim() && !images.length);
 
-  const chips = mentioned.map((entry) => (
-    <PendingBadge key={`${entry.type}:${entry.id}`} entry={entry} onRemove={() => dropMention(entry)} />
-  ));
+  const chips = [
+    ...(broadcastOn ? [<PendingBadge key="all" entry={everyone} onRemove={() => dropMention(everyone)} />] : []),
+    ...mentioned.map((entry) => (
+      <PendingBadge key={`${entry.type}:${entry.id}`} entry={entry} onRemove={() => dropMention(entry)} />
+    )),
+  ];
 
   return (
     <div className="grid gap-2">
@@ -242,17 +282,25 @@ export function Composer({
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => chooseSuggestion(entry)}
               >
-                <PersonAvatar
-                  name={entry.name}
-                  kind={entry.type}
-                  color={entry.color}
-                  avatar={entry.avatar}
-                  className="size-5 text-[10px]"
-                  href={entry.type === "agent" ? `#/agents/${entry.id}` : undefined}
-                  busy={entry.type === "agent" ? presenceOf.get(entry.id)?.working : false}
-                />
-                {entry.name}
-                <span className="text-muted-foreground">{entry.type === "agent" ? i18n.t("ui.kindAgentShort") : i18n.t("ui.kindHumanShort")}</span>
+                {entry.type === "all" ? (
+                  <span className="grid size-5 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground">
+                    <AtSign className="size-3" />
+                  </span>
+                ) : (
+                  <PersonAvatar
+                    name={entry.name}
+                    kind={entry.type}
+                    color={entry.color}
+                    avatar={entry.avatar}
+                    className="size-5 text-[10px]"
+                    href={entry.type === "agent" ? `#/agents/${entry.id}` : undefined}
+                    busy={entry.type === "agent" ? presenceOf.get(entry.id)?.working : false}
+                  />
+                )}
+                @{entry.name}
+                {entry.type === "all" ? null : (
+                  <span className="text-muted-foreground">{entry.type === "agent" ? i18n.t("ui.kindAgentShort") : i18n.t("ui.kindHumanShort")}</span>
+                )}
               </Button>
             </li>
           ))}
@@ -263,6 +311,7 @@ export function Composer({
           {chips.length ? <div className="flex flex-wrap items-center gap-1.5">{chips}</div> : null}
           {tray}
           <div className="flex items-end gap-1.5">
+            {broadcastButton}
             {attach}
             <Textarea
               ref={textareaRef}
@@ -308,6 +357,7 @@ export function Composer({
             }}
           />
           <div className="flex flex-wrap items-center gap-2">
+            {broadcastButton}
             {attach}
             <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">{chips}</div>
             <span className="hidden font-mono text-[11px] text-muted-foreground sm:inline">{i18n.t("composer.hotkeyHint")}</span>
@@ -321,9 +371,12 @@ export function Composer({
   );
 }
 
-function PendingBadge({ entry, onRemove }: { entry: Mentionable; onRemove: () => void }) {
+function PendingBadge({ entry, onRemove }: { entry: MentionRow; onRemove: () => void }) {
   return (
-    <Badge variant={entry.type === "agent" ? "secondary" : "outline"} className="rounded-sm font-normal">
+    <Badge
+      variant={entry.type === "agent" ? "secondary" : entry.type === "all" ? "default" : "outline"}
+      className="rounded-sm font-normal"
+    >
       @{entry.name}
       <button type="button" className="ml-1 text-muted-foreground" onClick={onRemove}>
         ×

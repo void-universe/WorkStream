@@ -286,7 +286,8 @@ export type Message = {
   sender_id: string;
   sender_name: string;
   content: string;
-  mentions: { type: "human" | "agent"; id: string }[];
+  /** @ 对象：真人/员工带 id；{type:"all"} 是 @所有人，收件人在发送时展开，消息里只留这个标记。 */
+  mentions: ({ type: "human" | "agent"; id: string } | { type: "all" })[];
   attachments?: Attachment[];
   deliveries?: Delivery[];
   /** 这一轮交出的群文件；卡片只给客户端看，不进模型上下文。 */
