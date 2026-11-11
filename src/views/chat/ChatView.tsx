@@ -403,7 +403,7 @@ export function ChatView({
               </TabsList>
               <div className="min-h-0 flex-1 overflow-y-auto p-3 scrollbar-thin">
                 <TabsContent value="members" className="mt-0">
-                  <MembersPanel detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} presence={presence} />
+                  <MembersPanel detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} presence={presence} meId={user.id} />
                 </TabsContent>
                 <TabsContent value="files" className="mt-0">
                   <FilesSection detail={detail} myAgents={myAgents} myVms={myVms} reload={reload} focus={fileFocus} />

@@ -92,7 +92,7 @@ function Row({ label, hint, children }: { label: string; hint?: ReactNode; child
   );
 }
 
-export function MembersPanel({ detail, myAgents, reload, presence }: Props & { presence?: AgentPresence[] }) {
+export function MembersPanel({ detail, myAgents, reload, presence, meId }: Props & { presence?: AgentPresence[]; meId?: string }) {
   const i18n = useI18n();
   const role = detail.my_role;
   const members = detail.members;
@@ -103,6 +103,35 @@ export function MembersPanel({ detail, myAgents, reload, presence }: Props & { p
   const pending = detail.requests.filter((request) => request.status === "pending").length;
   const [inviteEmail, setInviteEmail] = useState("");
   const [pickAgent, setPickAgent] = useState("");
+  const [standinBusy, setStandinBusy] = useState(false);
+  const standinOn = detail.my_delegate?.mode === "on";
+
+  // 本群替身开关：绿=本群开着，灰=关。账户里还没有替身时先告诉他去哪开，而不是静默失败。
+  async function toggleStandin() {
+    if (standinBusy) return;
+    setStandinBusy(true);
+    try {
+      if (standinOn) {
+        await post("delegate.stream", { stream_id: detail.stream.id, mode: "off" });
+      } else {
+        let agentId = detail.my_delegate?.agent_id ?? null;
+        if (!agentId) {
+          const state = await get<{ ok: true; agent: { id: string } | null }>("standin.get");
+          agentId = state.agent?.id ?? null;
+        }
+        if (!agentId) {
+          toast.error(i18n.t("panel.standinNeedSetup"));
+          return;
+        }
+        await post("delegate.stream", { stream_id: detail.stream.id, mode: "on", agent_id: agentId });
+      }
+      await reload();
+    } catch (error) {
+      toast.error(describeError(i18n, error));
+    } finally {
+      setStandinBusy(false);
+    }
+  }
 
   return (
     <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4 [&>*]:min-w-0">
@@ -116,6 +145,10 @@ export function MembersPanel({ detail, myAgents, reload, presence }: Props & { p
               member={member}
               presence={member.agent ? presenceOf.get(member.agent.id) : undefined}
               reload={reload}
+              mine={member.type === "human" && member.id === meId}
+              standinOn={standinOn}
+              standinBusy={standinBusy}
+              onToggleStandin={toggleStandin}
             />
           ))}
         </div>
@@ -184,11 +217,19 @@ function MemberTile({
   member,
   presence,
   reload,
+  mine = false,
+  standinOn = false,
+  standinBusy = false,
+  onToggleStandin,
 }: {
   detail: StreamDetail;
   member: Member;
   presence?: AgentPresence;
   reload: () => Promise<void>;
+  mine?: boolean;
+  standinOn?: boolean;
+  standinBusy?: boolean;
+  onToggleStandin?: () => void;
 }) {
   const i18n = useI18n();
   const agent = member.agent;
@@ -197,16 +238,31 @@ function MemberTile({
   const canRemove = member.role !== "owner" && (agent ? detail.my_role === "owner" : leader);
   return (
     <div className="group/tile relative flex min-w-0 flex-col items-center gap-1 rounded-lg px-1 py-2 hover:bg-muted/60">
-      <PersonAvatar
-        name={name}
-        kind={agent ? "agent" : "human"}
-        color={agent?.color}
-        avatar={presence?.avatar ?? agent?.avatar ?? member.avatar}
-        href={agent ? `#/agents/${agent.id}` : undefined}
-        busy={presence?.working}
-        className="size-11 text-sm"
-        title={agent ? `${agent.name} · ${agent.model}` : `${name} · ${member.email}`}
-      />
+      <div className="relative">
+        <PersonAvatar
+          name={name}
+          kind={agent ? "agent" : "human"}
+          color={agent?.color}
+          avatar={presence?.avatar ?? agent?.avatar ?? member.avatar}
+          href={agent ? `#/agents/${agent.id}` : undefined}
+          busy={presence?.working}
+          className="size-11 text-sm"
+          title={agent ? `${agent.name} · ${agent.model}` : `${name} · ${member.email}`}
+        />
+        {/* 本群替身开关：自己头像角上一颗灯，灰=关、绿=本群开启；点击走 delegate.stream，只动自己这条成员行。 */}
+        {mine ? (
+          <button
+            type="button"
+            onClick={onToggleStandin}
+            disabled={standinBusy}
+            title={i18n.t(standinOn ? "panel.standinDotOn" : "panel.standinDotOff")}
+            aria-label={i18n.t(standinOn ? "panel.standinDotOn" : "panel.standinDotOff")}
+            aria-pressed={standinOn}
+            className="absolute -right-1 -top-1 size-3.5 rounded-full border-2 border-background shadow-sm transition-colors disabled:opacity-50"
+            style={{ backgroundColor: standinOn ? "var(--flash-live)" : "var(--muted-foreground)" }}
+          />
+        ) : null}
+      </div>
       <p className="flex w-full min-w-0 items-center justify-center gap-1">
         <span className="min-w-0 truncate text-[11px]">{name}</span>
         <span
