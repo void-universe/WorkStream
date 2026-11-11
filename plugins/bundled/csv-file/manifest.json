@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "id": "csv-file",
+  "kind": "file-renderer",
+  "version": "1.0.0",
+  "entry": "src/lib/renderers/csv-file.mjs",
+  "integrity": "sha256-SxL2K6zVqtp0rztFi+s3vGtVhSlPqVQlRv1zDngWhXw="
+}

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "id": "image-file",
+  "kind": "file-renderer",
+  "version": "1.0.0",
+  "entry": "src/lib/renderers/image-file.mjs",
+  "integrity": "sha256-8QPo5p0sUOYrmWFjFc7atJO4gxNUPwPXpQ3J7RFcCBM="
+}

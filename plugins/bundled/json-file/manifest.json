@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "id": "json-file",
+  "kind": "file-renderer",
+  "version": "1.0.0",
+  "entry": "src/lib/renderers/json-file.mjs",
+  "integrity": "sha256-zIPp7i6VRq7a0hXWmd8m2ZpQ2HYtfpUmexTknW/IzuA="
+}

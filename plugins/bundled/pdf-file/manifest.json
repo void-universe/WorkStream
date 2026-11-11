@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "id": "pdf-file",
+  "kind": "file-renderer",
+  "version": "1.0.0",
+  "entry": "src/lib/renderers/pdf-file.mjs",
+  "integrity": "sha256-Tk65K5ildRlNTvIfVpQ/ekpkv6Jnbscr56TWOX74KyA="
+}

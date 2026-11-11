@@ -26,6 +26,7 @@ import { defaultFlashColors, readStreamFlash, saveFlashColors, type FlashColors,
 import { CopyButton, CopyChip, Notice, PersonAvatar, RoleBadge, SectionTitle, TextInput } from "../../lib/ui";
 // 只 import 清单文件：内置渲染器是在那里被登记进注册表的，直接 import fileRenderers 会拿到一张空表。
 import { renderGroupFile } from "../../lib/renderers/index.mjs";
+import { renderMarkdown } from "../../lib/renderers/markdown-message";
 import type { AgentPresence, DelegateStatus, GroupFile, Member, Presented, Request, StreamDetail, Vm } from "../../types";
 import { useI18n, type I18n, type MsgKey } from "../../lib/i18n";
 
@@ -545,10 +546,11 @@ export function FilesSection({ detail, reload, focus }: Props & { focus?: Presen
       const content = result.content ?? "";
       const remote = result.signed_url ?? result.url;
       // 怎么显示交给渲染器注册表：没人接住就是 null，下面照旧落回纯文本，不在这张表里加扩展名判断。
-      const rendered = remote ? null : await renderGroupFile({
+      const rendered = await renderGroupFile({
         name: result.name,
         content_type: result.content_type,
         content,
+        url: remote,
       });
       setPreview((current) =>
         current && current.file.id === file.id
@@ -756,6 +758,12 @@ export function FilesSection({ detail, reload, focus }: Props & { focus?: Presen
             <p className="text-sm text-muted-foreground">{i18n.t("panel.loadingPreview")}</p>
           ) : preview?.error ? (
             <Notice>{preview.error}</Notice>
+          ) : preview?.rendered?.view.kind === "pdf" ? (
+            <iframe
+              src={preview.rendered.view.src}
+              title={preview.file.name}
+              className="h-[55vh] w-full rounded-md border"
+            />
           ) : preview?.signedUrl ? (
             preview.file.content_type.startsWith("image/") ? (
               <img src={preview.signedUrl} alt={preview.file.name} className="max-h-[55vh] w-auto rounded-md border" />
@@ -781,6 +789,18 @@ export function FilesSection({ detail, reload, focus }: Props & { focus?: Presen
             <pre className="max-h-[55vh] overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap">
               {preview.rendered.view.text || i18n.t("panel.emptyFile")}
             </pre>
+          ) : preview?.rendered?.view.kind === "markdown" ? (
+            <div className="max-h-[55vh] overflow-auto rounded-md border bg-muted/20 p-3 text-sm leading-relaxed">
+              {renderMarkdown(preview.rendered.view.text, [])}
+            </div>
+          ) : preview?.rendered?.view.kind === "table" ? (
+            <PreviewTable view={preview.rendered.view} />
+          ) : preview?.rendered?.view.kind === "image" ? (
+            <img
+              src={preview.rendered.view.src}
+              alt={preview.rendered.view.alt || preview.file.name}
+              className="max-h-[55vh] w-auto rounded-md border"
+            />
           ) : (
             <pre className="max-h-[55vh] overflow-auto rounded-md border bg-muted/40 p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap">
               {preview?.content || i18n.t("panel.emptyFile")}
@@ -1245,6 +1265,40 @@ export function McpPanel({ detail, reload }: Props) {
           {i18n.t("panel.mcpToolsHint")}
         </p>
       </section>
+    </div>
+  );
+}
+
+/** CSV 预览表：只负责把切好的表头与行画出来；截断与否由渲染器给，不在这里猜。 */
+function PreviewTable({ view }: { view: { head: string[]; rows: string[][]; truncated: boolean } }) {
+  const i18n = useI18n();
+  return (
+    <div className="grid gap-1.5">
+      <div className="max-h-[50vh] overflow-auto rounded-md border">
+        <table className="w-full border-collapse text-[11px]">
+          <thead>
+            <tr>
+              {view.head.map((cell, index) => (
+                <th key={index} className="border-b bg-muted/40 px-2 py-1 text-left font-medium whitespace-nowrap">
+                  {cell}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {view.rows.map((row, rowIndex) => (
+              <tr key={rowIndex} className="odd:bg-muted/10">
+                {row.map((cell, cellIndex) => (
+                  <td key={cellIndex} className="border-b px-2 py-1 align-top">
+                    {cell}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {view.truncated ? <p className="text-[10px] text-muted-foreground">{i18n.t("panel.tableTruncated")}</p> : null}
     </div>
   );
 }

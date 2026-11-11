@@ -3704,8 +3704,44 @@ async function main() {
   check("diagrams.net 默认的压缩页（base64 + raw DEFLATE）也出结构", zipped?.view?.summary === "2 个节点 · 1 条连线", zipped?.view?.summary);
   check("解析不出结构时如实回 null，界面落回纯文本而不是空白框",
     (await renderGroupFile({ name: "c.drawio", content_type: "text/plain", content: "<mxfile><diagram></diagram></mxfile>" })) === null);
-  check("普通文本文件不进任何渲染器，仍走原来的纯文本",
-    (await renderGroupFile({ name: "清单.md", content_type: "text/markdown", content: "# 标题" })) === null);
+  check("没人认领的文本文件不进任何渲染器，仍走原来的纯文本",
+    (await renderGroupFile({ name: "清单.txt", content_type: "text/plain", content: "第一行" })) === null);
+
+  const mdView = await renderGroupFile({ name: "说明.md", content_type: "text/plain", content: "# 标题\n\n- 一条" });
+  check("markdown 文件交给 markdown 渲染器，交出的是正文本身",
+    mdView?.rendererId === "markdown-file" && mdView.view.kind === "markdown" && mdView.view.text.includes("# 标题"),
+    mdView?.view && { id: mdView.rendererId, kind: mdView.view.kind });
+  const csvView = await renderGroupFile({
+    name: "发布.csv",
+    content_type: "text/csv",
+    content: '名称,说明\r\n"a,1","第一行\n第二行"\r\nb,2\r\n',
+  });
+  check("CSV 切表头与行，双引号里的逗号和换行不切列",
+    csvView?.rendererId === "csv-file" && csvView.view.kind === "table"
+      && csvView.view.head.join("|") === "名称|说明"
+      && csvView.view.rows.length === 2
+      && csvView.view.rows[0][0] === "a,1" && csvView.view.rows[0][1] === "第一行\n第二行",
+    csvView?.view);
+  const bigCsv = `a,b\n${Array.from({ length: 600 }, (_, i) => `${i},x`).join("\n")}`;
+  const cappedCsv = await renderGroupFile({ name: "大.csv", content_type: "text/csv", content: bigCsv });
+  check("超出行数上限时截断并标出来，不静默少行",
+    cappedCsv?.view?.rows.length === 500 && cappedCsv.view.truncated === true,
+    { rows: cappedCsv?.view?.rows.length, truncated: cappedCsv?.view?.truncated });
+  const jsonView = await renderGroupFile({ name: "manifest.json", content_type: "application/json", content: '{"a":1,"b":[2,3]}' });
+  check("JSON 能解析就按两空格缩进",
+    jsonView?.view?.kind === "text" && jsonView.view.text.includes('\n  "a": 1'), jsonView?.view?.text);
+  check("坏 JSON 落回纯文本而不是抛错",
+    (await renderGroupFile({ name: "坏.json", content_type: "application/json", content: "{oops" })) === null);
+  const imageView = await renderGroupFile({ name: "图.png", content_type: "image/png", content: "iVBORw0KGgo=" });
+  check("base64 图片拼成 data URL 再画",
+    imageView?.view?.kind === "image" && imageView.view.src === "data:image/png;base64,iVBORw0KGgo=", imageView?.view);
+  check("不是 base64 的图片不接，落回纯文本而不是一张破图",
+    (await renderGroupFile({ name: "图.png", content_type: "image/png", content: "\u0000\u0001binary" })) === null);
+  const pdfLink = await renderGroupFile({ name: "方案.pdf", content_type: "application/pdf", content: "", url: "https://example.com/a.pdf" });
+  check("链接型 PDF 交给浏览器自带阅读器",
+    pdfLink?.view?.kind === "pdf" && pdfLink.view.src === "https://example.com/a.pdf", pdfLink?.view);
+  check("读进文本列的二进制 PDF 不接，避免一个空白框",
+    (await renderGroupFile({ name: "x.pdf", content_type: "application/pdf", content: "%PDF-1.7 …" })) === null);
 
   const dispose = registerFileRenderer({
     id: "smoke-probe",

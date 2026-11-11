@@ -4,3 +4,8 @@
 export { fileRenderers, registerFileRenderer, renderGroupFile } from "../fileRenderers.mjs";
 
 import "./drawio.mjs";
+import "./markdown-file.mjs";
+import "./csv-file.mjs";
+import "./json-file.mjs";
+import "./image-file.mjs";
+import "./pdf-file.mjs";

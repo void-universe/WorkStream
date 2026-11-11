@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "id": "markdown-file",
+  "kind": "file-renderer",
+  "version": "1.0.0",
+  "entry": "src/lib/renderers/markdown-file.mjs",
+  "integrity": "sha256-QsdvNYFgt7WDA+oEfGYhGmYdVnzWO/siS2DgnlQ7RKU="
+}

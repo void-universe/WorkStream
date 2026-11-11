@@ -11,8 +11,13 @@
 // DecompressionStream，Node 22 同名全局对象），把这条通道写死成同步就得在渲染器里自己撸解压。
 // 返回 null 表示「匹配上了但这轮渲染不出来」，主流程照样落回纯文本，不静默吞掉。
 
-/** @typedef {{ name: string, content_type: string, content: string }} CandidateFile */
-/** @typedef {{ kind: "svg", markup: string, summary: string } | { kind: "text", text: string, summary?: string }} RenderedView */
+/** @typedef {{ name: string, content_type: string, content: string, url?: string }} CandidateFile */
+/** @typedef {{ kind: "svg", markup: string, summary: string }
+ *   | { kind: "text", text: string, summary?: string }
+ *   | { kind: "markdown", text: string }
+ *   | { kind: "table", head: string[], rows: string[][], truncated: boolean }
+ *   | { kind: "image", src: string, alt: string }
+ *   | { kind: "pdf", src: string }} RenderedView */
 /** @typedef {{ id: string, order: number, match: (file: CandidateFile) => boolean, render: (file: CandidateFile) => RenderedView | null | Promise<RenderedView | null> }} FileRenderer */
 
 /** @type {Map<string, FileRenderer>} */
