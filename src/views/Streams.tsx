@@ -10,6 +10,7 @@ import { describeError, get, type Agent } from "../api";
 import type { AgentPresence, Message, Stream, StreamDetail, User, Vm } from "../types";
 import { clockOf, shortUuid, timeAgo } from "../lib/format";
 import { flashVars, readFlashColors, type FlashColors } from "../lib/flash";
+import { markMentionSeen, readSeenMentions } from "../lib/mentions";
 import { DeliveryChips, MentionText, MessageImages, PersonAvatar, PresentedCards, RoleBadge } from "../lib/ui";
 import { navigate } from "../lib/route";
 import { Composer, mentionablesOf } from "./chat/Composer";
@@ -37,20 +38,30 @@ type MessagesResult = {
   presence?: AgentPresence[];
 };
 type Counters = Record<string, { queued: number; running: number }>;
-type StreamState = "live" | "queued" | null;
+type StreamState = "mention" | "live" | "queued" | null;
 
 const LIVE_MS = 9_000;
 const QUEUED_MS = 25_000;
 
 function stateTitle(i18n: I18n, state: StreamState) {
+  if (state === "mention") return i18n.t("stream.stateMention");
   if (state === "live") return i18n.t("stream.stateLive");
   if (state === "queued") return i18n.t("stream.stateQueued");
   return undefined;
 }
 
 function stateDot(state: StreamState) {
+  if (state === "mention") return "ws-dot-mention";
   if (state === "live") return "ws-dot-live";
   if (state === "queued") return "ws-dot-queued";
+  return "";
+}
+
+/** 群边框的光环：被 @ 我（黄心跳）盖过有活在跑（绿，30 次/分），再盖过排队。 */
+function borderClass(state: StreamState) {
+  if (state === "mention") return "ws-flash-mention";
+  if (state === "live") return "ws-flash-live";
+  if (state === "queued") return "ws-flash-queued";
   return "";
 }
 
@@ -100,6 +111,7 @@ export function StreamsView({
   const [boards, setBoards] = useState<BoardResult["boards"]>([]);
   const [pulse, setPulse] = useState({ n: 0, ran: [] as string[] });
   const [recent, setRecent] = useState<Record<string, "live" | "queued">>({});
+  const [seen, setSeen] = useState(readSeenMentions);
   const [flashColors] = useState(readFlashColors);
   const [pollError, setPollError] = useState("");
   const sinceRef = useRef(0);
@@ -199,6 +211,9 @@ export function StreamsView({
 
   const stateOf = useCallback(
     (id: string): StreamState => {
+      // 有人 @ 我先于别的状态：群里有没有活在跑是次要的，有人喊我才是最该看见的那条。
+      const mentionSeq = streams.find((entry) => entry.id === id)?.mentioned_seq ?? null;
+      if (mentionSeq && mentionSeq > (seen[id] ?? 0)) return "mention";
       const cell = counters[id];
       if (cell?.running) return "live";
       // 还有活儿没轮到时以“排队”为准，避免刚跑完的绿色盖住积压。
@@ -207,8 +222,15 @@ export function StreamsView({
       if (recent[id] === "queued") return "queued";
       return null;
     },
-    [counters, recent],
+    [counters, recent, streams, seen],
   );
+
+  // 看清了就把水位推到这条 @ 上：黄心跳只在这个水位之后的新 @ 上重新亮。
+  const seeMention = useCallback((id: string, seq: number | null | undefined) => {
+    if (!id || !seq) return;
+    markMentionSeen(id, seq);
+    setSeen((current) => ((current[id] ?? 0) >= seq ? current : { ...current, [id]: seq }));
+  }, []);
 
   const capacity = typeof prefs.layout === "number" ? prefs.layout : 0;
   const slots = useMemo(
@@ -365,7 +387,10 @@ export function StreamsView({
                 pinned={prefs.picked.includes(stream.id)}
                 onPin={() => togglePin(stream.id)}
                 onExpand={() => expand(stream.id)}
-                onEnter={() => navigate(`/stream/${stream.id}`)}
+                onEnter={() => {
+                  seeMention(stream.id, stream.mentioned_seq);
+                  navigate(`/stream/${stream.id}`);
+                }}
               />
             ))}
           </div>
@@ -381,7 +406,10 @@ export function StreamsView({
                 pinned={prefs.picked.includes(stream.id)}
                 onPin={() => togglePin(stream.id)}
                 onExpand={() => expand(stream.id)}
-                onEnter={() => navigate(`/stream/${stream.id}`)}
+                onEnter={() => {
+                  seeMention(stream.id, stream.mentioned_seq);
+                  navigate(`/stream/${stream.id}`);
+                }}
               />
             ))}
           </div>
@@ -414,6 +442,7 @@ export function StreamsView({
                   onSwap={(nextId) => setSlot(index, nextId)}
                   onRemove={() => removeSlot(index)}
                   onQueued={() => markRecent(stream.id, "queued")}
+                  onSeenMention={(seq) => seeMention(stream.id, seq)}
                   onActivity={() => {
                     void tickNow();
                     void onRefresh();
@@ -494,7 +523,7 @@ function StreamTile({
 }) {
   const i18n = useI18n();
   const announcement = stream.announcement.trim();
-  const border = state === "live" ? "ws-flash-live" : state === "queued" ? "ws-flash-queued" : "";
+  const border = borderClass(state);
   return (
     <article
       title={stateTitle(i18n, state)}
@@ -562,7 +591,7 @@ function StreamRow({
   onEnter: () => void;
 }) {
   const i18n = useI18n();
-  const border = state === "live" ? "ws-flash-live" : state === "queued" ? "ws-flash-queued" : "";
+  const border = borderClass(state);
   return (
     <article
       title={stateTitle(i18n, state)}
@@ -652,6 +681,7 @@ function StreamPane({
   onRemove,
   onQueued,
   onActivity,
+  onSeenMention,
 }: {
   stream: Stream;
   streams: Stream[];
@@ -666,6 +696,7 @@ function StreamPane({
   onRemove: () => void;
   onQueued: () => void;
   onActivity: () => void;
+  onSeenMention: (seq: number | null | undefined) => void;
 }) {
   const i18n = useI18n();
   const [detail, setDetail] = useState<StreamDetail | null>(null);
@@ -740,6 +771,11 @@ function StreamPane({
     }
   }, [messages]);
 
+  // 这个群已经摊在这块面板上：里面的 @ 就当你看到了，黄心跳收掉；关掉面板后新来的 @ 还会亮。
+  useEffect(() => {
+    if (stream.mentioned_seq) onSeenMention(stream.mentioned_seq);
+  }, [stream.mentioned_seq]);
+
   const everyoneName = i18n.t("composer.everyone");
   const names = useMemo(
     () => [...mentionablesOf(detail?.members ?? []).map((entry) => entry.name), everyoneName],
@@ -762,7 +798,7 @@ function StreamPane({
   }, [detail]);
 
   const options = streams.filter((entry) => entry.id === stream.id || !picked.includes(entry.id));
-  const border = state === "live" ? "ws-flash-live" : state === "queued" ? "ws-flash-queued" : "";
+  const border = borderClass(state);
 
   return (
     <section

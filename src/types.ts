@@ -203,6 +203,8 @@ export type Stream = {
   mcp_key_set?: boolean;
   my_role?: "owner" | "admin" | "member" | null;
   agent_count?: number;
+  /** 最新一条点名我（真人）的消息序号；本机已读水位比它低就亮黄色心跳边框。 */
+  mentioned_seq?: number | null;
   created_at: string;
   updated_at?: string;
 };

@@ -1,11 +1,12 @@
 // Stream 面板的群状态闪烁颜色：按群存在本机，没配就走主题里的 --flash-* 默认色。
 import type { CSSProperties } from "react";
 
-export type FlashScene = "queued" | "live";
+export type FlashScene = "queued" | "mention" | "live";
 export type FlashColors = Partial<Record<FlashScene, string>>;
 
 const KEY = "workstream.flash";
 const HEX = /^#[0-9a-f]{6}$/i;
+const SCENES: FlashScene[] = ["queued", "mention", "live"];
 
 export function readFlashColors(): Record<string, FlashColors> {
   try {
@@ -14,11 +15,11 @@ export function readFlashColors(): Record<string, FlashColors> {
     for (const [streamId, value] of Object.entries(raw)) {
       if (!streamId || typeof value !== "object" || value === null) continue;
       const entry: FlashColors = {};
-      for (const scene of ["queued", "live"] as const) {
+      for (const scene of SCENES) {
         const color = (value as Record<string, unknown>)[scene];
         if (typeof color === "string" && HEX.test(color)) entry[scene] = color.toLowerCase();
       }
-      if (entry.queued || entry.live) result[streamId] = entry;
+      if (SCENES.some((scene) => entry[scene])) result[streamId] = entry;
     }
     return result;
   } catch {
@@ -32,7 +33,7 @@ export function readStreamFlash(streamId: string): FlashColors {
 
 export function saveFlashColors(streamId: string, colors: FlashColors) {
   const all = readFlashColors();
-  if (colors.queued || colors.live) all[streamId] = colors;
+  if (SCENES.some((scene) => colors[scene])) all[streamId] = colors;
   else delete all[streamId];
   try {
     localStorage.setItem(KEY, JSON.stringify(all));
@@ -42,17 +43,21 @@ export function saveFlashColors(streamId: string, colors: FlashColors) {
 }
 
 export function flashVars(colors?: FlashColors): CSSProperties | undefined {
-  if (!colors?.queued && !colors?.live) return undefined;
+  if (!colors || !SCENES.some((scene) => colors[scene])) return undefined;
   const style = {} as CSSProperties & Record<string, string>;
-  if (colors.queued) style["--flash-queued"] = colors.queued;
-  if (colors.live) style["--flash-live"] = colors.live;
+  for (const scene of SCENES) {
+    if (colors[scene]) style[`--flash-${scene}`] = colors[scene];
+  }
   return style;
 }
 
 export function defaultFlashColors(): Required<FlashColors> {
   const styles = getComputedStyle(document.documentElement);
+  const read = (scene: FlashScene, fallback: string) =>
+    (styles.getPropertyValue(`--flash-${scene}`).trim() || fallback).toLowerCase();
   return {
-    queued: (styles.getPropertyValue("--flash-queued").trim() || "#d97706").toLowerCase(),
-    live: (styles.getPropertyValue("--flash-live").trim() || "#15803d").toLowerCase(),
+    queued: read("queued", "#d97706"),
+    mention: read("mention", "#ca8a04"),
+    live: read("live", "#15803d"),
   };
 }

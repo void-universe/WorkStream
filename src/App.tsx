@@ -5,6 +5,8 @@ import { Button } from "@/components/ui/button";
 import { api, get, getToken, post, setToken, type Agent } from "./api";
 import type { Stream, User, Vm } from "./types";
 import { navigate, useHashRoute } from "./lib/route";
+import { unseenMentionCount } from "./lib/mentions";
+import { applyTabBadge } from "./lib/tabBadge";
 import { readBrandMode, writeBrandMode, type BrandMode } from "./lib/brand";
 import { applyTheme, onSystemThemeChange, readThemeMode, resolvedTheme, type ThemeMode } from "./lib/theme";
 import {
@@ -13,6 +15,9 @@ import {
   createI18n,
   isCompleteLang,
   readStoredLang,
+  readLangPending,
+  markLangPending,
+  clearLangPending,
   resolveInitialLang,
   useI18n,
   writeStoredLang,
@@ -44,10 +49,13 @@ export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [vms, setVms] = useState<Vm[]>([]);
   const [unread, setUnread] = useState(0);
+  const [mentionTick, setMentionTick] = useState(0);
   const [invites, setInvites] = useState(0);
 
   const i18n = useMemo(() => createI18n(lang), [lang]);
   const langPushed = useRef(false);
+  // 语言门上亲手选过：登录后要把它推给账户，而不是让账户里的旧值把刚选的顶回去。
+  const langPickedHere = useRef(false);
   const adoptedUser = useRef<string | null>(null);
 
   useEffect(() => {
@@ -104,8 +112,13 @@ export default function App() {
     if (adoptedUser.current === user.id) return;
     adoptedUser.current = user.id;
     const prefs = user.prefs ?? {};
+    const pickedHere = langPickedHere.current || readLangPending();
     if (isCompleteLang(prefs.lang)) {
-      if (prefs.lang !== lang) {
+      if (pickedHere) {
+        // 刚在这台设备上亲手选过：账户里的旧值不许把它盖回去，反过来把这次选择推上去。
+        if (prefs.lang !== lang) void post("auth.patch", { prefs: { lang } }).catch(() => {});
+        clearLangPending();
+      } else if (prefs.lang !== lang) {
         setLang(prefs.lang);
         writeStoredLang(prefs.lang);
       }
@@ -123,6 +136,21 @@ export default function App() {
     // 这个 effect 只读挂载时那一次的语言和主题：把它们放进依赖，用户在这台设备上手动切换
     // 会立刻被账户里的旧值顶回来，等于「改了没生效」。
   }, [user]);
+
+  // 有人在群里 @ 我：标题栏加计数、favicon 加黄点。浏览器不给网页改标签颜色的口子，
+  // 能做的只有这两处；它和群边框用同一份本机水位，打开那个群计数就跟着掉。
+  const unseenMentions = useMemo(
+    () => (user ? unseenMentionCount(streams) : 0),
+    [streams, user, mentionTick],
+  );
+  useEffect(() => {
+    applyTabBadge(unseenMentions);
+  }, [unseenMentions]);
+  useEffect(() => {
+    const bump = () => setMentionTick((tick) => tick + 1);
+    window.addEventListener("workstream:mentions-seen", bump);
+    return () => window.removeEventListener("workstream:mentions-seen", bump);
+  }, []);
 
   const refreshAll = useCallback(async () => {
     const tasks = await Promise.allSettled([
@@ -195,7 +223,17 @@ export default function App() {
     // 邮件里的验证链接是落地页，不该被选语言这一步挡住。
     if (section === "verify") return <VerifyView token={route.query.get("token") ?? ""} />;
 
-    if (!langChosen) return <LanguageGate onDone={(next) => chooseLang(next, user !== null)} />;
+    if (!langChosen) {
+      return (
+        <LanguageGate
+          onDone={(next) => {
+            langPickedHere.current = true;
+            markLangPending();
+            chooseLang(next, user !== null);
+          }}
+        />
+      );
+    }
 
     if (user === null || section === "login") {
       return (

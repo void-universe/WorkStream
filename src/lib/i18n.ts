@@ -131,6 +131,37 @@ export function readStoredLang(): LocaleId | null {
   }
 }
 
+const LANG_PENDING_KEY = "workstream.lang.pending";
+
+/**
+ * 语言门上亲手选过、还没同步给账户：下次登录以它为准。
+ * 只靠内存里的标记活不过一次刷新——新设备上「选完再登录」经常隔着一次刷新，
+ * 结果账户里的旧值把刚选的语言顶回去，看起来就像「登录后不能切语言」。
+ */
+export function markLangPending(): void {
+  try {
+    localStorage.setItem(LANG_PENDING_KEY, "1");
+  } catch {
+    /* 存不下就只在本次会话里认这一票 */
+  }
+}
+
+export function readLangPending(): boolean {
+  try {
+    return localStorage.getItem(LANG_PENDING_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function clearLangPending(): void {
+  try {
+    localStorage.removeItem(LANG_PENDING_KEY);
+  } catch {
+    /* 同上 */
+  }
+}
+
 export function writeStoredLang(lang: LocaleId): void {
   try {
     localStorage.setItem(LANG_STORAGE_KEY, lang);

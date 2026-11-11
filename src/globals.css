@@ -23,6 +23,7 @@
 :root {
   --background: #f6f6f8;
   --flash-queued: #d97706;
+  --flash-mention: #ca8a04;
   --flash-live: #15803d;
   --signal: #0d7a6b;
   --signal-soft: #ddf1ec;
@@ -134,6 +135,7 @@
   --chart-4: #ad46ff;
   --chart-5: #ff2056;
   --flash-queued: #fbbf24;
+  --flash-mention: #facc15;
   --flash-live: #4ade80;
   --signal: #3ddbb9;
   --signal-soft: #10322c;
@@ -186,14 +188,16 @@ body {
   transform: translateY(-1px);
 }
 
-/* 群状态：被 @ 派活后黄色呼吸（较快，≈运动心率），虚拟员工开跑后绿色（较缓，≈放松心率）。
+/* 群状态：有人 @ 我时黄色心跳（0.65s，≈运动心率），群里有活在推进时绿色（2s 一拍，30 次/分）。
    光环画在伪元素上，卡片自身的发丝边与投影不会被动画抹掉。 */
 .ws-flash-queued,
+.ws-flash-mention,
 .ws-flash-live {
   position: relative;
 }
 
 .ws-flash-queued::after,
+.ws-flash-mention::after,
 .ws-flash-live::after {
   content: "";
   position: absolute;
@@ -208,8 +212,12 @@ body {
   animation: ws-flash-queued 0.65s ease-in-out infinite;
 }
 
+.ws-flash-mention::after {
+  animation: ws-flash-mention 0.65s ease-in-out infinite;
+}
+
 .ws-flash-live::after {
-  animation: ws-flash-live 1.8s ease-in-out infinite;
+  animation: ws-flash-live 2s ease-in-out infinite;
 }
 
 @keyframes ws-flash-queued {
@@ -225,6 +233,22 @@ body {
     box-shadow:
       inset 0 0 18px color-mix(in srgb, var(--flash-queued) 12%, transparent),
       0 0 22px color-mix(in srgb, var(--flash-queued) 28%, transparent);
+  }
+}
+
+@keyframes ws-flash-mention {
+  0%,
+  100% {
+    border-color: color-mix(in srgb, var(--flash-mention) 40%, transparent);
+    background-color: transparent;
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    border-color: var(--flash-mention);
+    background-color: color-mix(in srgb, var(--flash-mention) 6%, transparent);
+    box-shadow:
+      inset 0 0 18px color-mix(in srgb, var(--flash-mention) 14%, transparent),
+      0 0 22px color-mix(in srgb, var(--flash-mention) 30%, transparent);
   }
 }
 
@@ -246,6 +270,10 @@ body {
 
 .ws-dot-queued {
   background-color: var(--flash-queued);
+}
+
+.ws-dot-mention {
+  background-color: var(--flash-mention);
 }
 
 .ws-dot-live {

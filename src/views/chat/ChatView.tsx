@@ -12,6 +12,7 @@ import { describeError, get, type Agent } from "../../api";
 import type { AgentPresence, Message, Presented, StreamDetail, User, Vm } from "../../types";
 import { cn } from "@/lib/utils";
 import { shortUuid, timeAgo } from "../../lib/format";
+import { markMentionSeen } from "../../lib/mentions";
 import { CopyChip, DeliveryChips, MentionText, MessageImages, PersonAvatar, PresentedCards } from "../../lib/ui";
 import { Composer, mentionablesOf, type SendResult } from "./Composer";
 import { FilesSection, MembersPanel, SettingsPanel } from "./Panels";
@@ -183,6 +184,16 @@ export function ChatView({
       });
     }
   }, [messages]);
+
+  // 直接打开某个群（深链或从面板点进来）也算看过：把本机水位推到窗口里最新的那条 @ 我。
+  useEffect(() => {
+    let newest = 0;
+    for (const message of messages) {
+      if (!(message.mentions ?? []).some((entry) => entry.type === "human" && entry.id === user.id)) continue;
+      newest = Math.max(newest, Number(message.seq) || 0);
+    }
+    if (newest) markMentionSeen(streamId, newest);
+  }, [messages, streamId, user.id]);
 
   const mentionables = useMemo(() => mentionablesOf(detail?.members ?? []), [detail]);
   // @所有人 的正文标记也要着色：它是正文里的 @，不是某个成员的名字。

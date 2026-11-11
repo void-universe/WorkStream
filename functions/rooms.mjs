@@ -159,11 +159,31 @@ export const actions = {
     for (const row of agentCount) {
       perStream.set(row.stream_id, (perStream.get(row.stream_id) ?? 0) + 1);
     }
+    // 有人 @ 我（真人或虚拟员工都算，两者都写进同一条 mentions）：取每条群里最新一条点名我的消息序号。
+    // 前端拿它和自己记的已读水位比，高出一个水位就把群边框打成黄色心跳。
+    const recent = ids.length
+      ? await db.messages.list([["stream_id", ids]], {
+        columns: "stream_id,seq,mentions", order: ["seq", { ascending: false }], limit: 200,
+      })
+      : [];
+    const mentioned = new Map();
+    for (const row of recent) {
+      const hit = (Array.isArray(row.mentions) ? row.mentions : [])
+        .some((mention) => mention && mention.type === "human" && mention.id === user.id);
+      const seq = Number(row.seq);
+      if (!hit || !Number.isSafeInteger(seq)) continue;
+      if ((mentioned.get(row.stream_id) ?? 0) < seq) mentioned.set(row.stream_id, seq);
+    }
     return json({
       ok: true,
       items: rows
         .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
-        .map((s) => ({ ...s, my_role: roleOf.get(s.id), agent_count: perStream.get(s.id) ?? 0 })),
+        .map((s) => ({
+          ...s,
+          my_role: roleOf.get(s.id),
+          agent_count: perStream.get(s.id) ?? 0,
+          mentioned_seq: mentioned.get(s.id) ?? null,
+        })),
     });
   },
 

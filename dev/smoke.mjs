@@ -1121,6 +1121,13 @@ async function main() {
   });
   check("消息入队并派发任务", sendClean.payload.queued?.length === 1, sendClean.payload ?? send.payload);
   check("@ 同时通知群内真人", (send.payload.notified ?? []).length === 1, send.payload);
+  const boMine = await call("streams.mine", { token: bToken, method: "GET" });
+  const boStream = (boMine.payload.items ?? []).find((row) => row.id === streamId);
+  check("群列表带出「最新一条 @ 我」的消息序号（黄心跳靠它和自己记的水位比）",
+    boStream?.mentioned_seq === send.payload.message?.seq, boStream);
+  const anaMine = await call("streams.mine", { token: ana, method: "GET" });
+  const anaStream = (anaMine.payload.items ?? []).find((row) => row.id === streamId);
+  check("对照：没被 @ 的人这一栏是 null，不会凭空亮", anaStream?.mentioned_seq === null, anaStream);
   const pending = await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } });
   const pendingMsg = (pending.payload.items ?? []).find((m) => m.id === sendClean.payload.message?.id);
   const pendingDelivery = (pendingMsg?.deliveries ?? []).find((d) => d.agent_id === agentId);

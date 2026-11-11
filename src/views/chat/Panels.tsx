@@ -1011,6 +1011,7 @@ export function SettingsPanel({ detail, myAgents, myVms, reload, onOpenTerminal 
 }
 
 const FLASH_SCENES: { key: FlashScene; labelKey: MsgKey; hintKey: MsgKey }[] = [
+  { key: "mention", labelKey: "panel.flashMention", hintKey: "panel.flashMentionHint" },
   { key: "queued", labelKey: "panel.flashQueued", hintKey: "panel.flashQueuedHint" },
   { key: "live", labelKey: "panel.flashLive", hintKey: "panel.flashLiveHint" },
 ];
