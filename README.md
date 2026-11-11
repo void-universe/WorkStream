@@ -44,7 +44,7 @@ node dev/seed-demo.mjs # one command through the whole chain: signup -> demo emp
 
 ## Deploy
 
-`npm run build` produces `dist/`; the backend is the single Function entry in `functions/`, served as `/functions/v1/app?action=<name>` with the session token in `x-workstream-token`. Register it with `webDirectory: "dist"`, `functionDirectory: "functions"`, `databaseAccess: "read_write"` and the optional secrets `WORKSTREAM_DATA_KEY` and `WORKSTREAM_SMTP_URL` (values are entered through site settings), then apply `sql/0001_init.sql` … `0016_stream.sql` in order. A host that cannot keep a process alive advances one scheduler tick per 5-second frontend poll; where a long-running process is allowed, run with `--worker` (or `WORKSTREAM_WORKER=1`) so the inbox moves with no page open.
+`npm run build` produces `dist/`; the backend is the single Function entry in `functions/`, served as `/functions/v1/app?action=<name>` with the session token in `x-workstream-token`. Register it with `webDirectory: "dist"`, `functionDirectory: "functions"`, `databaseAccess: "read_write"` and the optional secrets `WORKSTREAM_DATA_KEY` and `WORKSTREAM_SMTP_URL` (values are entered through site settings), then apply `sql/0001_init.sql` … `0018_agent_compact_at.sql` in order. A host that cannot keep a process alive advances one scheduler tick per 5-second frontend poll; where a long-running process is allowed, run with `--worker` (or `WORKSTREAM_WORKER=1`) so the inbox moves with no page open.
 
 The server never logs into SSH: the console dials the ttyd gateway from the browser and WorkStream stores only the gateway address. Deployment disclosures, the remaining steps and the current status are in [docs/guide.en.md](docs/guide.en.md).
 

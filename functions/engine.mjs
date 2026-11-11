@@ -760,7 +760,8 @@ async function assemble({
   const { rows, truncated } = await history(db, stream.id, {
     from,
     // 窗口按字符封顶，不按条数：条数上限会让长群聊在预算还没用满时先被截断。
-    maxChars: maxChars ?? Math.floor(streamBudget(stream, agent) * 0.8),
+    // 窗口最多吃掉预算的多少：compact_at 是员工档位上的水位（10–100，默认 95），到线就折叠旧的。
+    maxChars: maxChars ?? Math.floor(streamBudget(stream, agent) * (Number(agent.compact_at ?? 95) / 100)),
     anchor,
     minRows,
   });

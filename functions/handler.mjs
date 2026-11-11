@@ -10,6 +10,7 @@ import { handleMcp } from "./mcp.mjs";
 import { actions as plugins } from "./plugins.mjs";
 import { actions as registries } from "./registries.mjs";
 import { actions as rooms } from "./rooms.mjs";
+import { actions as servers } from "./servers.mjs";
 import { bindEnv, readEnv, smtpEndpoint } from "./runtime.mjs";
 import { actions as skills } from "./skills.mjs";
 import { store } from "./store.mjs";
@@ -22,7 +23,7 @@ const PUBLIC = new Set([
   "auth.register", "auth.verify", "auth.login", "mcp", "site.meta",
 ]);
 
-const ROUTES = { ...accounts, ...agents, ...rooms, ...chat, ...cron, ...delegate, ...dreaming, ...engine, ...vms, ...skills, ...registries, ...plugins, ...trajectory };
+const ROUTES = { ...accounts, ...agents, ...rooms, ...chat, ...cron, ...delegate, ...dreaming, ...engine, ...vms, ...skills, ...registries, ...plugins, ...servers, ...trajectory };
 
 async function siteMeta({ db, env }) {
   void db;

@@ -1,5 +1,5 @@
 // 群聊右侧的操作面板：成员与 @ 派发、群文件、群设置、授权虚拟机、MCP 端点。
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   DownloadIcon,
   EyeIcon,
@@ -463,6 +463,8 @@ export function FilesSection({ detail, reload, focus }: Props & { focus?: Presen
   const [content, setContent] = useState("");
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<Preview | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [currentDir, setCurrentDir] = useState("");
 
   // 返回这次列表拿到的行（失败返回 null），交付卡片定位原件时要靠它决定要不要再报一句"文件不在了"。
   async function refresh(): Promise<GroupFile[] | null> {
@@ -519,7 +521,7 @@ export function FilesSection({ detail, reload, focus }: Props & { focus?: Presen
     }
     setBusy(true);
     try {
-      await post("files.upload", { stream_id: detail.stream.id, name: name.trim(), content, content_type: "text/plain" });
+      await post("files.upload", { stream_id: detail.stream.id, path: currentDir, name: name.trim(), content, content_type: "text/plain" });
       toast.success(i18n.t("panel.toastUploaded"));
       setName("");
       setContent("");
@@ -536,20 +538,21 @@ export function FilesSection({ detail, reload, focus }: Props & { focus?: Presen
   async function openPreview(file: GroupFile) {
     setPreview({ file, loading: true, content: "", error: "", rendered: null });
     try {
-      const result = await get<{ ok: true; name: string; content_type: string; content?: string; signed_url?: string }>(
+      const result = await get<{ ok: true; name: string; content_type: string; content?: string; signed_url?: string; url?: string }>(
         "files.get",
         { id: file.id },
       );
       const content = result.content ?? "";
+      const remote = result.signed_url ?? result.url;
       // 怎么显示交给渲染器注册表：没人接住就是 null，下面照旧落回纯文本，不在这张表里加扩展名判断。
-      const rendered = result.signed_url ? null : await renderGroupFile({
+      const rendered = remote ? null : await renderGroupFile({
         name: result.name,
         content_type: result.content_type,
         content,
       });
       setPreview((current) =>
         current && current.file.id === file.id
-          ? { file, loading: false, content, signedUrl: result.signed_url, error: "", rendered }
+          ? { file, loading: false, content, signedUrl: remote, error: "", rendered }
           : current,
       );
     } catch (error) {
@@ -563,9 +566,10 @@ export function FilesSection({ detail, reload, focus }: Props & { focus?: Presen
 
   async function download(file: GroupFile) {
     try {
-      const result = await get<{ ok: true; name: string; content?: string; signed_url?: string }>("files.get", { id: file.id });
-      if (result.signed_url) {
-        window.open(result.signed_url, "_blank", "noopener");
+      const result = await get<{ ok: true; name: string; content?: string; signed_url?: string; url?: string }>("files.get", { id: file.id });
+      const remote = result.signed_url ?? result.url;
+      if (remote) {
+        window.open(remote, "_blank", "noopener");
         return;
       }
       const blob = new Blob([result.content ?? ""], { type: "text/plain;charset=utf-8" });
@@ -580,12 +584,114 @@ export function FilesSection({ detail, reload, focus }: Props & { focus?: Presen
     }
   }
 
+  const fullOf = (file: GroupFile) => (file.path ? `${file.path}/${file.name}` : file.name);
+  const byDir = useMemo(() => {
+    const map = new Map<string, GroupFile[]>();
+    for (const file of files) {
+      const key = file.path ?? "";
+      map.set(key, [...(map.get(key) ?? []), file]);
+    }
+    for (const list of map.values()) {
+      list.sort((a, b) => Number(b.store === "dir") - Number(a.store === "dir") || a.name.localeCompare(b.name));
+    }
+    return map;
+  }, [files]);
+  const toggleCollapsed = (path: string) => setCollapsed((prev) => {
+    const next = new Set(prev);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    return next;
+  });
+
+  async function mkdir() {
+    const raw = window.prompt(i18n.t("panel.newFolderPrompt"), currentDir ? `${currentDir}/` : "");
+    if (raw === null || !raw.trim()) return;
+    try {
+      await post("files.mkdir", { stream_id: detail.stream.id, path: raw.trim() });
+      setCurrentDir(raw.trim());
+      await refresh();
+    } catch (error) {
+      toast.error(describeError(i18n, error));
+    }
+  }
+
+  const renderTree = (dir: string, depth: number): React.ReactNode =>
+    (byDir.get(dir) ?? []).map((file) => {
+      const full = fullOf(file);
+      const isDir = file.store === "dir";
+      const open = !collapsed.has(full);
+      return (
+        <div key={file.id}>
+          <div className="group flex items-center gap-2.5 rounded-lg px-1.5 py-1.5 hover:bg-accent/60" style={{ paddingLeft: `${6 + depth * 14}px` }}>
+            {isDir ? (
+              <button
+                type="button"
+                className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                onClick={() => {
+                  setCurrentDir(full);
+                  if (!open) toggleCollapsed(full);
+                }}
+              >
+                <span className="w-3 shrink-0 text-[10px] text-muted-foreground">{open ? "▾" : "▸"}</span>
+                <span className="truncate text-xs font-medium">{file.name}/</span>
+              </button>
+            ) : (
+              <>
+                <FileGlyph name={file.name} />
+                <button
+                  type="button"
+                  className="min-w-0 flex-1 text-left"
+                  title={i18n.t("panel.previewOnlineTitle")}
+                  onClick={() => void openPreview(file)}
+                >
+                  <p className="truncate text-xs font-medium">{file.name}</p>
+                  <p className="truncate text-[10px] text-muted-foreground">
+                    {byteSize(i18n, file.size_bytes)} · {file.uploaded_name ?? i18n.t("panel.memberFallback")} · {timeAgo(i18n, file.created_at)}
+                  </p>
+                </button>
+              </>
+            )}
+            <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+              {isDir ? null : (
+                <>
+                  <Button size="icon-xs" variant="ghost" title={i18n.t("panel.previewTitle")} onClick={() => void openPreview(file)}>
+                    <EyeIcon />
+                  </Button>
+                  <Button size="icon-xs" variant="ghost" title={i18n.t("panel.download")} onClick={() => void download(file)}>
+                    <DownloadIcon />
+                  </Button>
+                </>
+              )}
+              <Button
+                size="icon-xs"
+                variant="ghost"
+                className="text-destructive"
+                title={i18n.t("common.delete")}
+                onClick={() =>
+                  void run(i18n, "files.delete", { id: file.id }, i18n.t("common.deleted"), async () => {
+                    await refresh();
+                    await reload();
+                  })
+                }
+              >
+                <Trash2Icon />
+              </Button>
+            </div>
+          </div>
+          {isDir && open ? renderTree(full, depth + 1) : null}
+        </div>
+      );
+    });
+
   return (
     <section className="grid min-w-0 gap-1.5">
       <SectionTitle
         aside={
           <div className="flex items-center gap-2">
             <Badge variant="secondary" className="rounded-full px-1.5 py-0 font-mono text-[10px]">{files.length}</Badge>
+            <Button size="xs" variant="ghost" onClick={() => void mkdir()}>
+              {i18n.t("panel.newFolder")}
+            </Button>
             <Button size="xs" variant="ghost" onClick={() => setUploadOpen((current) => !current)}>
               {uploadOpen ? i18n.t("panel.collapseUpload") : i18n.t("panel.uploadLabel")}
             </Button>
@@ -600,44 +706,7 @@ export function FilesSection({ detail, reload, focus }: Props & { focus?: Presen
       ) : (
         <div>
           <div className="grid gap-0.5 p-1.5">
-            {files.map((file) => (
-              <div key={file.id} className="group flex items-center gap-2.5 rounded-lg px-1.5 py-1.5 hover:bg-accent/60">
-                <FileGlyph name={file.name} />
-                <button
-                  type="button"
-                  className="min-w-0 flex-1 text-left"
-                  title={i18n.t("panel.previewOnlineTitle")}
-                  onClick={() => void openPreview(file)}
-                >
-                  <p className="truncate text-xs font-medium">{file.name}</p>
-                  <p className="truncate text-[10px] text-muted-foreground">
-                    {byteSize(i18n, file.size_bytes)} · {file.uploaded_name ?? i18n.t("panel.memberFallback")} · {timeAgo(i18n, file.created_at)}
-                  </p>
-                </button>
-                <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-                  <Button size="icon-xs" variant="ghost" title={i18n.t("panel.previewTitle")} onClick={() => void openPreview(file)}>
-                    <EyeIcon />
-                  </Button>
-                  <Button size="icon-xs" variant="ghost" title={i18n.t("panel.download")} onClick={() => void download(file)}>
-                    <DownloadIcon />
-                  </Button>
-                  <Button
-                    size="icon-xs"
-                    variant="ghost"
-                    className="text-destructive"
-                    title={i18n.t("common.delete")}
-                    onClick={() =>
-                      void run(i18n, "files.delete", { id: file.id }, i18n.t("common.deleted"), async () => {
-                        await refresh();
-                        await reload();
-                      })
-                    }
-                  >
-                    <Trash2Icon />
-                  </Button>
-                </div>
-              </div>
-            ))}
+            {renderTree("", 0)}
           </div>
         </div>
       )}
@@ -688,9 +757,15 @@ export function FilesSection({ detail, reload, focus }: Props & { focus?: Presen
           ) : preview?.error ? (
             <Notice>{preview.error}</Notice>
           ) : preview?.signedUrl ? (
-            <a href={preview.signedUrl} target="_blank" rel="noopener" className="text-sm text-signal underline">
-              {i18n.t("panel.signedUrlHint")}
-            </a>
+            preview.file.content_type.startsWith("image/") ? (
+              <img src={preview.signedUrl} alt={preview.file.name} className="max-h-[55vh] w-auto rounded-md border" />
+            ) : preview.file.content_type.startsWith("video/") ? (
+              <video src={preview.signedUrl} controls className="max-h-[55vh] w-full rounded-md border" />
+            ) : (
+              <a href={preview.signedUrl} target="_blank" rel="noopener" className="text-sm text-signal underline">
+                {i18n.t("panel.signedUrlHint")}
+              </a>
+            )
           ) : preview?.rendered?.view.kind === "svg" ? (
             <div className="grid min-w-0 gap-1.5">
               {/* markup 由渲染器自己生成：标签文本出图前逐字转义过，所以这里塞进 DOM 的不是群里的原文。 */}

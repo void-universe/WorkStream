@@ -4,31 +4,36 @@ import { AGENT_COLUMNS } from "./agents.mjs";
 import { langOf, systemCopy } from "./copy.mjs";
 import { delegateStatus } from "./delegate.mjs";
 import { STREAM_COLUMNS, humanMembership, requireMembership, requireRole } from "./perm.mjs";
+import { cleanDir, childPath, isUnder, rebase } from "./fs.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, email as emailOf, int, json, newId, now, oneOf, text, uuid } from "./util.mjs";
 
 // 消息行的唯一列清单：写（这里）与读（chat.mjs 的翻页）共用一份，加一列只改一处。
 export const MESSAGE_COLUMNS =
   "id,stream_id,seq,sender_type,sender_id,sender_name,content,mentions,reply_to,kind,error,attachments,presented,on_behalf_of,created_at";
-const FILE_COLUMNS = "id,stream_id,name,size_bytes,content_type,store,uploaded_by,created_at";
+const FILE_COLUMNS = "id,stream_id,path,name,size_bytes,content_type,store,uploaded_by,created_at";
 export const MAX_FILE_BYTES = 400_000;
 
 /** 群文件写入统一走这里：UI 上传与 MCP 工具共用同一套命名/大小规则。 */
-export async function createGroupFile(db, { streamId, userId, userName, lang, name, contentType, content }) {
+export async function createGroupFile(db, { streamId, userId, userName, lang, name, contentType, content, path = "", store = "db", sizeBytes = null }) {
+  const dir = cleanDir(path);
   const cleanName = text(name, { max: 120, name: "name" });
   if (cleanName.includes("/") || cleanName.includes("\\") || cleanName.startsWith(".")) {
     throw new Halt("invalid_file_name", 400);
   }
+  const clash = await db.files.first([["stream_id", streamId], ["path", dir], ["name", cleanName]], { columns: "id" });
+  if (clash) throw new Halt("file_path_exists", 409);
   const type = text(contentType || "text/plain", { max: 80, name: "content_type" });
   const raw = text(content, { max: MAX_FILE_BYTES, name: "content" });
-  const size = new TextEncoder().encode(raw).length;
+  const size = sizeBytes ?? new TextEncoder().encode(raw).length;
   const created = await db.files.insert({
     id: newId(),
     stream_id: streamId,
+    path: dir,
     name: cleanName,
     object_path: null,
     size_bytes: size,
     content_type: type,
-    store: "db",
+    store,
     content: raw,
     uploaded_by: userId,
     created_at: now(),
@@ -36,7 +41,7 @@ export async function createGroupFile(db, { streamId, userId, userName, lang, na
   if (!created) throw new Halt("file_write_failed", 503);
   await insertMessage(db, {
     streamId, senderType: "system", senderId: userId, senderName: "系统",
-    content: systemCopy(lang).fileUploaded({ who: userName, name: cleanName, size }),
+    content: systemCopy(lang).fileUploaded({ who: userName, name: dir ? `${dir}/${cleanName}` : cleanName, size }),
   });
   return created;
 }
@@ -598,8 +603,102 @@ export const actions = {
       name: body.name,
       contentType: body.content_type ?? "text/plain",
       content: body.content,
+      path: body.path ?? "",
     });
     return json({ ok: true, file });
+  },
+
+  /** 只存链接的素材（图片、视频、任意格式）：字节不经过我们，预览按 content_type 决定。 */
+  async "files.link"({ db, user, body }) {
+    const streamId = uuid(body.stream_id, "stream_id");
+    await requireMembership(db, streamId, user.id);
+    const url = text(body.url, { max: 2000, name: "url" });
+    if (!/^https?:\/\//i.test(url)) throw new Halt("invalid_file_url", 400);
+    const file = await createGroupFile(db, {
+      streamId,
+      userId: user.id,
+      userName: user.display_name,
+      lang: langOf(user.prefs),
+      name: body.name,
+      contentType: body.content_type ?? "application/octet-stream",
+      content: url,
+      path: body.path ?? "",
+      store: "link",
+      sizeBytes: int(body.size_bytes, { min: 0, max: Number.MAX_SAFE_INTEGER, name: "size_bytes", fallback: 0 }),
+    });
+    return json({ ok: true, file });
+  },
+
+  /** 建目录（含缺失的祖先），幂等；同名但不是目录则拒绝。 */
+  async "files.mkdir"({ db, user, body }) {
+    const streamId = uuid(body.stream_id, "stream_id");
+    await requireMembership(db, streamId, user.id);
+    const dir = cleanDir(body.path, "path");
+    if (!dir) throw new Halt("invalid_file_path", 400, { reason: "empty" });
+    let current = "";
+    for (const part of dir.split("/")) {
+      const row = await db.files.first([["stream_id", streamId], ["path", current], ["name", part]], { columns: FILE_COLUMNS });
+      if (!row) {
+        await db.files.insert({
+          id: newId(),
+          stream_id: streamId,
+          path: current,
+          name: part,
+          object_path: null,
+          size_bytes: 0,
+          content_type: "inode/directory",
+          store: "dir",
+          content: null,
+          uploaded_by: user.id,
+          created_at: now(),
+        }, { columns: FILE_COLUMNS });
+      } else if (row.store !== "dir") {
+        throw new Halt("file_path_exists", 409);
+      }
+      current = childPath(current, part);
+    }
+    return json({ ok: true, path: dir });
+  },
+
+  /** 改名或移动；目录连同整棵子树一起改 path。权限与删除一致（上传者/群主/管理员）。 */
+  async "files.move"({ db, user, body }) {
+    const id = uuid(body.id, "id");
+    const file = await db.files.byId(id);
+    if (!file) throw new Halt("file_not_found", 404);
+    const { role } = await requireMembership(db, file.stream_id, user.id);
+    if (file.uploaded_by !== user.id && role !== "owner" && role !== "admin") throw new Halt("permission_denied", 403);
+    const targetPath = body.path === undefined ? (file.path ?? "") : cleanDir(body.path);
+    const targetName = body.name === undefined ? file.name : text(body.name, { max: 120, name: "name" });
+    if (targetName.includes("/") || targetName.includes("\\") || targetName.startsWith(".")) {
+      throw new Halt("invalid_file_name", 400);
+    }
+    const oldFull = childPath(file.path ?? "", file.name);
+    const newFull = childPath(targetPath, targetName);
+    if (file.store === "dir" && isUnder(oldFull, newFull)) {
+      throw new Halt("invalid_file_path", 400, { reason: "into_self" });
+    }
+    const clash = await db.files.first(
+      [["stream_id", file.stream_id], ["path", targetPath], ["name", targetName]], { columns: "id" },
+    );
+    if (clash && clash.id !== file.id) throw new Halt("file_path_exists", 409);
+    if (file.store !== "dir") {
+      await db.files.claim([["id", file.id]], { path: targetPath, name: targetName });
+      return json({ ok: true, id: file.id, path: targetPath, name: targetName });
+    }
+    // 目录：先把整棵子树的 path 算好并查重，再写；查不到冲突才动，避免写到一半。
+    const rows = await db.files.list([["stream_id", file.stream_id]], { columns: FILE_COLUMNS, limit: 2000 });
+    const moving = rows.filter((row) => row.id !== file.id && isUnder(oldFull, childPath(row.path ?? "", row.name)));
+    const outside = new Set(rows.filter((row) => !moving.includes(row) && row.id !== file.id)
+      .map((row) => `${row.path ?? ""}\u0000${row.name}`));
+    for (const row of moving) {
+      const nextPath = rebase(oldFull, newFull, row.path ?? "");
+      if (outside.has(`${nextPath}\u0000${row.name}`)) throw new Halt("file_path_exists", 409);
+    }
+    await db.files.claim([["id", file.id]], { path: targetPath, name: targetName });
+    for (const row of moving) {
+      await db.files.claim([["id", row.id]], { path: rebase(oldFull, newFull, row.path ?? "") });
+    }
+    return json({ ok: true, id: file.id, path: targetPath, name: targetName, moved: moving.length });
   },
 
   async "files.get"({ db, user, params }) {
@@ -607,6 +706,9 @@ export const actions = {
     const file = await db.files.byId(id);
     if (!file) throw new Halt("file_not_found", 404);
     await requireMembership(db, file.stream_id, user.id);
+    if (file.store === "link") {
+      return json({ ok: true, name: file.name, content_type: file.content_type, size_bytes: file.size_bytes, url: file.content });
+    }
     if (file.store === "storage") {
       const signed = await signDownload(file.object_path);
       if (signed) return json({ ok: true, name: file.name, content_type: file.content_type, signed_url: signed });
@@ -622,6 +724,17 @@ export const actions = {
     const file = await db.files.byId(id);
     if (!file) throw new Halt("file_not_found", 404);
     const { role } = await requireMembership(db, file.stream_id, user.id);
+    // 删目录就是删整棵子树：先把里面的行按同样的权限规则清掉，再删目录本身。
+    if (file.store === "dir") {
+      const full = childPath(file.path ?? "", file.name);
+      const rows = await db.files.list([["stream_id", file.stream_id]], { columns: FILE_COLUMNS, limit: 2000 });
+      for (const row of rows) {
+        if (row.id !== file.id && isUnder(full, childPath(row.path ?? "", row.name))) {
+          if (row.store === "storage") await removeStorage(row.object_path);
+          await db.files.remove([["id", row.id]]);
+        }
+      }
+    }
     const removed = await deleteGroupFile(db, { file, userId: user.id, role });
     return json({ ok: true, id: removed });
   },

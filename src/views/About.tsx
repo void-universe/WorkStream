@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
-import { describeError, get, post, setToken, type User } from "../api";
+import { describeCode, describeError, get, post, setToken, type User } from "../api";
 import type { Agent } from "../types";
 import type { BrandMode } from "../lib/brand";
 import { LOCALES, useI18n, type LocaleId } from "../lib/i18n";
@@ -22,6 +22,17 @@ type Meta = {
   smtp: boolean;
   data_key: "secret" | "database";
   local_dev: boolean;
+};
+
+/** 一台已登记的部署 server；只回令牌尾号，原文与密文都不出服务端。 */
+type ServerRow = {
+  id: string;
+  name: string;
+  base_url: string;
+  token_tail: string;
+  stream_profile: string;
+  models: string[];
+  last_seen_at: string;
 };
 
 /** 后端只认 ISO 时刻；datetime-local 给的是本地墙上时间，直接 slice 会把 UTC 当本地用。 */
@@ -67,13 +78,50 @@ export function AboutView({
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [meta, setMeta] = useState<Meta | null>(null);
+  const [servers, setServers] = useState<ServerRow[]>([]);
+  const [serverBusy, setServerBusy] = useState("");
 
   useEffect(() => {
     void get<Meta>("site.meta").then(setMeta).catch(() => setMeta(null));
     void get<{ ok: true; items: Agent[] }>("agents.list")
       .then((result) => setMyAgents(result.items))
       .catch(() => setMyAgents([]));
+    void get<{ ok: true; items: ServerRow[] }>("servers.list")
+      .then((result) => setServers(result.items))
+      .catch(() => setServers([]));
   }, []);
+
+  const refreshServers = () => get<{ ok: true; items: ServerRow[] }>("servers.list")
+    .then((result) => setServers(result.items))
+    .catch(() => setServers([]));
+
+  async function testServer(id: string) {
+    setServerBusy(id);
+    try {
+      const result = await post<{ ok: true; result: { reachable: boolean; profile?: string; error?: string } }>("servers.test", { id });
+      if (result.result.reachable) toast.success(result.result.profile ?? "");
+      else toast.error(describeCode(i18n, result.result.error ?? "server_unreachable"));
+      await refreshServers();
+    } catch (error) {
+      toast.error(describeError(i18n, error));
+    } finally {
+      setServerBusy("");
+    }
+  }
+
+  async function removeServer(id: string) {
+    if (!window.confirm(i18n.t("about.serverDeleteConfirm"))) return;
+    setServerBusy(id);
+    try {
+      await post("servers.remove", { id });
+      await refreshServers();
+      toast.success(i18n.t("about.serverDeleted"));
+    } catch (error) {
+      toast.error(describeError(i18n, error));
+    } finally {
+      setServerBusy("");
+    }
+  }
 
   async function saveProfile() {
     try {
@@ -231,6 +279,49 @@ export function AboutView({
           <Button size="sm" className="justify-self-start text-xs" onClick={() => void saveProfile()}>
             {i18n.t("about.saveProfile")}
           </Button>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm">{i18n.t("about.serversTitle")}</CardTitle>
+          <CardDescription className="text-xs">{i18n.t("about.serversDesc")}</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-2">
+          {servers.length === 0 ? (
+            <p className="text-xs text-muted-foreground">{i18n.t("about.serversEmpty")}</p>
+          ) : servers.map((server) => (
+            <div key={server.id} className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-2">
+              <div className="min-w-0">
+                <p className="truncate text-xs font-medium">{server.name} · {server.stream_profile}</p>
+                <p className="truncate font-mono text-[11px] text-muted-foreground">{server.base_url} · {server.token_tail}</p>
+                <p className="text-[11px] text-muted-foreground">
+                  {i18n.tf("about.serverLastSeen", { time: fullStamp(server.last_seen_at) })}
+                  {` · ${i18n.tf("about.serverModels", { n: server.models.length })}`}
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs"
+                  disabled={serverBusy === server.id}
+                  onClick={() => void testServer(server.id)}
+                >
+                  {i18n.t("about.serverTest")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 text-xs text-destructive hover:text-destructive"
+                  disabled={serverBusy === server.id}
+                  onClick={() => void removeServer(server.id)}
+                >
+                  {i18n.t("common.delete")}
+                </Button>
+              </div>
+            </div>
+          ))}
         </CardContent>
       </Card>
 

@@ -65,11 +65,27 @@ type Draft = {
   model: string;
   system_prompt: string;
   context_chars: number;
+  /** 压缩水位：窗口最多吃掉上下文预算的百分比（10–100），默认 95。 */
+  compact_at: number;
   status: "active" | "paused";
   backend: Backend;
   qca_agent_id: string;
+  /** 选中的部署 server；服务端把地址、令牌与档位整份复制进档案。空串表示手填。 */
+  server_id: string;
   /** 切走之前那个自建端点地址，切回自建时还给他，不用重新手打。 */
   prev_openai_url: string;
+};
+
+/** 一台已登记的部署 server（只回令牌尾号，原文与密文都不出服务端）。 */
+type ServerRow = {
+  id: string;
+  name: string;
+  base_url: string;
+  token_tail: string;
+  stream_profile: string;
+  label: string | null;
+  models: string[];
+  last_seen_at: string;
 };
 
 /** 云端 Agent 的默认 API 地址（CN 区）；换区或私有部署就在字段里改成对应 origin。 */
@@ -77,6 +93,14 @@ const QCA_ORIGIN = "https://api.qoder.com.cn";
 
 /** 云端 Agent 那一档不认模型名，档案里存这个占位值；切走时要认得它才敢覆盖用户真填的模型。 */
 const QCA_MODEL = "云端 Agent";
+
+/** 上下文滑杆的档位（token）。档案里存的是字符，按每 token 2 字符折算；滑杆只在这几个档上停。 */
+const CONTEXT_STEPS = [4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 512_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000];
+const CHARS_PER_TOKEN = 2;
+const nearestContextStep = (chars: number) => CONTEXT_STEPS.reduce(
+  (best, step) => (Math.abs(step * CHARS_PER_TOKEN - chars) < Math.abs(best * CHARS_PER_TOKEN - chars) ? step : best),
+  CONTEXT_STEPS[0],
+);
 
 /** 切后端只换该换的：演示地址与云端地址互相预置，令牌一律留空让用户重填——
  *  三种后端的凭据不是一类东西，服务端也会拦"换了后端却没给新凭据"。 */
@@ -94,6 +118,7 @@ function switchBackend(current: Draft, next: Backend): Draft {
     prev_openai_url: next === "openai" ? "" : (current.backend === "openai" ? current.api_base_url : current.prev_openai_url),
     model: next === "qca" ? QCA_MODEL : kept,
     api_key: "",
+    server_id: "",
   };
 }
 
@@ -108,10 +133,12 @@ const EMPTY: Draft = {
   api_key: "",
   model: "",
   system_prompt: "",
-  context_chars: 200000,
+  context_chars: 256_000,
+  compact_at: 95,
   status: "active",
   backend: "stream",
   qca_agent_id: "",
+  server_id: "",
   prev_openai_url: "demo://local",
 };
 
@@ -146,6 +173,8 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
   const [updateCheckedAt, setUpdateCheckedAt] = useState("");
   const [skillBusy, setSkillBusy] = useState("");
   const [busy, setBusy] = useState(false);
+  const [servers, setServers] = useState<ServerRow[]>([]);
+  const [serverForm, setServerForm] = useState({ open: false, name: "", base_url: "", token: "", busy: false });
   const [memoryDraft, setMemoryDraft] = useState("");
   const [memoryScope, setMemoryScope] = useState<"common" | "stream">("common");
   const [memoryStream, setMemoryStream] = useState("");
@@ -166,6 +195,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
   useEffect(() => {
     void refreshList();
     void get<{ ok: true; items: Stream[] }>("streams.mine").then((result) => setStreams(result.items)).catch(() => {});
+    void get<{ ok: true; items: ServerRow[] }>("servers.list").then((result) => setServers(result.items)).catch(() => {});
     void get<{ ok: true; items: Skill[] }>("skills.market")
       .then((result) => setMarketSkills(result.items))
       .catch(() => {});
@@ -224,10 +254,12 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
       api_key_tail: agent.api_key_tail,
       model: agent.model,
       system_prompt: agent.system_prompt,
-      context_chars: agent.context_chars,
+      context_chars: nearestContextStep(agent.context_chars) * CHARS_PER_TOKEN,
+      compact_at: agent.compact_at ?? 95,
       status: agent.status,
       backend: agent.backend === "qca" ? "qca" : agent.backend === "stream" ? "stream" : "openai",
       qca_agent_id: agent.qca_agent_id ?? "",
+      server_id: "",
       prev_openai_url: (agent.backend ?? "openai") === "openai" ? agent.api_base_url : "",
     });
     void (async () => {
@@ -241,6 +273,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
   }, [selected, agents]);
 
   const streamNames = useMemo(() => new Map(streams.map((stream) => [stream.id, stream.name])), [streams]);
+  const pickedServer = servers.find((item) => item.id === draft.server_id) ?? null;
   const installedIds = useMemo(
     () => new Set((detail?.skills ?? []).map((skill) => skill.id)),
     [detail],
@@ -416,6 +449,28 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
     }
   }
 
+  async function addServer() {
+    const name = serverForm.name.trim();
+    const baseUrl = serverForm.base_url.trim();
+    const token = serverForm.token.trim();
+    if (!name || !baseUrl || !token) {
+      toast.error(i18n.t("agent.serverNeedAll"));
+      return;
+    }
+    setServerForm((current) => ({ ...current, busy: true }));
+    try {
+      // 登记当场就探一次发现：问不出档位的地址不会进列表，免得员工建档时才失败。
+      const created = await post<{ ok: true; server: ServerRow }>("servers.create", { name, base_url: baseUrl, token });
+      setServers((current) => [...current, created.server]);
+      setDraft((current) => ({ ...current, backend: "stream", server_id: created.server.id, api_base_url: "", api_key: "" }));
+      setServerForm({ open: false, name: "", base_url: "", token: "", busy: false });
+      toast.success(i18n.t("agent.serverAdded"));
+    } catch (error) {
+      toast.error(describeError(i18n, error));
+      setServerForm((current) => ({ ...current, busy: false }));
+    }
+  }
+
   async function save() {
     if (!draft.name.trim() || !draft.role.trim()) {
       toast.error(i18n.t("agent.needNameRole"));
@@ -423,6 +478,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
     }
     setBusy(true);
     try {
+      const usingServer = draft.server_id !== "";
       const body: Record<string, unknown> = {
         name: draft.name.trim(),
         role: draft.role.trim(),
@@ -431,24 +487,26 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         model: draft.model.trim(),
         system_prompt: draft.system_prompt,
         context_chars: Number(draft.context_chars),
-        api_base_url: draft.api_base_url.trim(),
+        compact_at: Number(draft.compact_at),
         status: draft.status,
         backend: draft.backend,
+        // 选了 server 就把「地址 + 令牌 + 档位」交给服务端整份复制；否则照旧手填。
+        ...(usingServer ? { server_id: draft.server_id } : { api_base_url: draft.api_base_url.trim() }),
         ...(draft.backend === "qca" ? { qca_agent_id: draft.qca_agent_id.trim() } : {}),
       };
       if (draft.id) {
         body.id = draft.id;
-        if (draft.api_key.trim()) body.api_key = draft.api_key.trim();
+        if (!usingServer && draft.api_key.trim()) body.api_key = draft.api_key.trim();
         await post("agents.update", body);
         toast.success(i18n.t("agent.saved"));
       } else {
-        if (!draft.api_key.trim()) {
+        if (!usingServer && !draft.api_key.trim()) {
           toast.error(draft.backend === "qca"
             ? i18n.t("agent.needKeyQca")
             : draft.backend === "stream" ? i18n.t("agent.needKeyStream") : i18n.t("agent.needKeyOpenai"));
           return;
         }
-        body.api_key = draft.api_key.trim();
+        if (!usingServer) body.api_key = draft.api_key.trim();
         const created = await post<{ ok: true; agent: Agent }>("agents.create", body);
         toast.success(i18n.t("agent.created"));
         setSelected(created.agent.id);
@@ -684,19 +742,110 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
                   <TextInput id="agent-qca" value={draft.qca_agent_id} onChange={(event) => setDraft({ ...draft, qca_agent_id: event.target.value })} placeholder="agent_…" className="h-8 font-mono text-xs" />
                 </Field>
               ) : null}
-              <Field label={copy.urlLabel} htmlFor="agent-base" hint={copy.urlHint}>
-                <TextInput id="agent-base" value={draft.api_base_url} onChange={(event) => setDraft({ ...draft, api_base_url: event.target.value })} placeholder={draft.backend === "stream" ? "https://" : undefined} className="h-8 font-mono text-xs" />
-              </Field>
+              {draft.backend === "stream" ? (
+                <Field label={i18n.t("agent.serverLabel")} htmlFor="agent-server" hint={i18n.t("agent.serverHint")}>
+                  <div className="flex gap-2">
+                    <NativeSelect
+                      id="agent-server"
+                      className="h-8 text-xs"
+                      value={draft.server_id}
+                      onChange={(event) => {
+                        const next = event.target.value;
+                        setDraft((current) => ({
+                          ...current,
+                          server_id: next,
+                          api_base_url: next ? "" : current.api_base_url,
+                          api_key: next ? "" : current.api_key,
+                        }));
+                      }}
+                    >
+                      <NativeSelectOption value="">{i18n.t("agent.serverManual")}</NativeSelectOption>
+                      {servers.map((server) => (
+                        <NativeSelectOption key={server.id} value={server.id}>
+                          {`${server.name} · ${server.stream_profile}`}
+                        </NativeSelectOption>
+                      ))}
+                    </NativeSelect>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8 shrink-0 text-xs"
+                      onClick={() => setServerForm((current) => ({ ...current, open: !current.open }))}
+                    >
+                      {i18n.t("agent.serverAdd")}
+                    </Button>
+                  </div>
+                </Field>
+              ) : null}
+              {draft.server_id ? null : (
+                <Field label={copy.urlLabel} htmlFor="agent-base" hint={copy.urlHint}>
+                  <TextInput id="agent-base" value={draft.api_base_url} onChange={(event) => setDraft({ ...draft, api_base_url: event.target.value })} placeholder={draft.backend === "stream" ? "https://" : undefined} className="h-8 font-mono text-xs" />
+                </Field>
+              )}
               <Field label={copy.modelLabel} htmlFor="agent-model" hint={copy.modelHint}>
                 <TextInput id="agent-model" value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} className="h-8 font-mono text-xs" />
               </Field>
-              <Field label={copy.keyLabel} htmlFor="agent-key" hint={copy.keyHint}>
-                <Input id="agent-key" type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder={copy.keyPlaceholder} className="h-8 text-xs" />
-              </Field>
+              {draft.server_id ? null : (
+                <Field label={copy.keyLabel} htmlFor="agent-key" hint={copy.keyHint}>
+                  <Input id="agent-key" type="password" value={draft.api_key} onChange={(event) => setDraft({ ...draft, api_key: event.target.value })} placeholder={copy.keyPlaceholder} className="h-8 text-xs" />
+                </Field>
+              )}
               <Field label={i18n.t("agent.contextLabel")} htmlFor="agent-context" hint={i18n.t("agent.contextHint")}>
-                <Input id="agent-context" type="number" min={2000} max={2000000} step={20000} value={draft.context_chars} onChange={(event) => setDraft({ ...draft, context_chars: Number(event.target.value) })} className="h-8 text-xs" />
+                <div className="flex flex-col gap-1">
+                  <input
+                    id="agent-context"
+                    type="range"
+                    min={0}
+                    max={CONTEXT_STEPS.length - 1}
+                    step={1}
+                    value={CONTEXT_STEPS.indexOf(nearestContextStep(draft.context_chars))}
+                    onChange={(event) => setDraft({ ...draft, context_chars: CONTEXT_STEPS[Number(event.target.value)] * CHARS_PER_TOKEN })}
+                    className="w-full accent-primary"
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    {i18n.tf("agent.contextTokens", {
+                      tokens: nearestContextStep(draft.context_chars).toLocaleString(),
+                      chars: draft.context_chars.toLocaleString(),
+                    })}
+                  </p>
+                </div>
+              </Field>
+              <Field label={i18n.t("agent.compactAtLabel")} htmlFor="agent-compact" hint={i18n.t("agent.compactAtHint")}>
+                <Input
+                  id="agent-compact"
+                  type="number"
+                  min={10}
+                  max={100}
+                  step={1}
+                  value={draft.compact_at}
+                  onChange={(event) => setDraft({ ...draft, compact_at: Number(event.target.value) })}
+                  className="h-8 text-xs"
+                />
               </Field>
             </div>
+
+            {pickedServer ? (
+              <p className="text-xs text-muted-foreground">{`${pickedServer.base_url} · ${pickedServer.token_tail}`}</p>
+            ) : null}
+
+            {draft.backend === "stream" && serverForm.open ? (
+              <div className="grid gap-3 rounded-md border p-3 md:grid-cols-3">
+                <Field label={i18n.t("agent.serverName")} htmlFor="server-name">
+                  <TextInput id="server-name" value={serverForm.name} maxLength={60} onChange={(event) => setServerForm((current) => ({ ...current, name: event.target.value }))} className="h-8 text-xs" />
+                </Field>
+                <Field label={i18n.t("agent.serverUrl")} htmlFor="server-url">
+                  <TextInput id="server-url" value={serverForm.base_url} onChange={(event) => setServerForm((current) => ({ ...current, base_url: event.target.value }))} placeholder="https://" className="h-8 font-mono text-xs" />
+                </Field>
+                <Field label={i18n.t("agent.serverToken")} htmlFor="server-token">
+                  <Input id="server-token" type="password" value={serverForm.token} onChange={(event) => setServerForm((current) => ({ ...current, token: event.target.value }))} className="h-8 text-xs" />
+                </Field>
+                <div className="flex justify-end md:col-span-3">
+                  <Button size="sm" className="h-8 text-xs" disabled={serverForm.busy} onClick={() => void addServer()}>
+                    {serverForm.busy ? i18n.t("agent.saving") : i18n.t("agent.serverSave")}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
 
             {copy.notice ? <Notice tone="info">{copy.notice}</Notice> : null}
 

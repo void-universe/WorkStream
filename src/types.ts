@@ -36,6 +36,8 @@ export type Agent = {
   model: string;
   system_prompt: string;
   context_chars: number;
+  /** 压缩水位（10–100，默认 95）：窗口最多吃掉上下文预算的多少。旧行没有这一列时按 95 读。 */
+  compact_at?: number | null;
   key_source: "secret" | "database" | string;
   color: string;
   status: "active" | "paused";
@@ -414,10 +416,12 @@ export type TrajectoryResponse = {
 export type GroupFile = {
   id: string;
   stream_id: string;
+  /** 父目录（'' = 根）。完整路径 = path ? `${path}/${name}` : name。 */
+  path?: string | null;
   name: string;
   size_bytes: number;
   content_type: string;
-  store: "db" | "storage";
+  store: "db" | "storage" | "dir" | "link";
   created_at: string;
   uploaded_name?: string;
 };

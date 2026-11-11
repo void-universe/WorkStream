@@ -1225,6 +1225,42 @@ async function main() {
     preview.payload.content === "# 发布清单\n1. 备份\n2. 灰度\n3. 回滚方案", preview.payload);
   const badName = await call("files.upload", { token: ana, body: { stream_id: streamId, name: "../etc/passwd", content: "x" } });
   check("穿越文件名被拒", badName.status === 400, badName.payload);
+
+  // 群文件目录树：建多级目录、放进子目录、同名拒绝、外链素材、移动整棵子树、删目录连子树。
+  const mkdir = await call("files.mkdir", { token: ana, body: { stream_id: streamId, path: "art/ui" } });
+  check("建多级目录（缺失的祖先一起建出来）", mkdir.payload.ok === true && mkdir.payload.path === "art/ui", mkdir.payload);
+  const nested = await call("files.upload", {
+    token: ana,
+    body: { stream_id: streamId, path: "art/ui", name: "hero.png", content_type: "image/png", content: "not-a-real-png" },
+  });
+  check("文件落在子目录里（path 记父目录）", nested.payload.file?.path === "art/ui", nested.payload.file);
+  const dup = await call("files.upload", {
+    token: ana,
+    body: { stream_id: streamId, path: "art/ui", name: "hero.png", content: "again" },
+  });
+  check("同一层同名被拒（file_path_exists）", dup.status === 409 && dup.payload.error === "file_path_exists", dup.payload);
+  const traversal = await call("files.mkdir", { token: ana, body: { stream_id: streamId, path: "../escape" } });
+  check("目录穿越被拒（invalid_file_path）", traversal.status === 400 && traversal.payload?.error === "invalid_file_path", traversal.payload);
+  const link = await call("files.link", {
+    token: ana,
+    body: { stream_id: streamId, path: "art/ui", name: "trailer.mp4", url: "https://cdn.example.com/trailer.mp4", content_type: "video/mp4", size_bytes: 1048576 },
+  });
+  check("外链素材（视频）只存 URL", link.payload.file?.store === "link" && link.payload.file?.size_bytes === 1048576, link.payload.file);
+  const linkGet = await call("files.get", { token: ana, method: "GET", body: { id: link.payload.file.id } });
+  check("读外链素材拿到 URL 而不是正文", linkGet.payload.url === "https://cdn.example.com/trailer.mp4", linkGet.payload);
+  const artDir = (await call("files.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items.find((row) => row.store === "dir" && row.name === "art");
+  const moveDir = await call("files.move", { token: ana, body: { id: artDir.id, name: "assets" } });
+  const afterMove = (await call("files.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items;
+  check("移动目录把整棵子树的 path 一起改",
+    moveDir.payload.ok === true
+    && afterMove.some((row) => row.store === "dir" && row.path === "assets" && row.name === "ui")
+    && afterMove.some((row) => row.path === "assets/ui" && row.name === "hero.png"),
+    { moveDir: moveDir.payload, afterMove: afterMove.map((row) => `${row.path}/${row.name}`) });
+  const removedDir = await call("files.delete", { token: ana, body: { id: artDir.id } });
+  const afterTreeDelete = (await call("files.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items;
+  check("删目录连同子树一起删",
+    removedDir.payload.ok === true && !afterTreeDelete.some((row) => row.path === "art" || row.path === "assets" || row.path === "assets/ui"),
+    { removedDir: removedDir.payload, afterDelete: afterTreeDelete.map((row) => `${row.path}/${row.name}`) });
   const vm = await call("vms.create", {
     token: ana,
     body: { label: "构建机", host: "build.internal.example", port: 22, username: "ci", auth_kind: "password", secret: "s3cret", workdir: "/srv/app" },
@@ -6049,6 +6085,110 @@ async function main() {
     x34Spam.ok === false && x34Spam.retryAfterMs === 1, x34Spam);
   x34Clock2 += 1;
   check("……到 10.001 秒照常放行（连点没有把自己越锁越久）", x34Gate2.admit("198.51.100.4").ok === true);
+
+  /* ---------- 35. 迁移工具：只搬执行器，不猜 ---------- */
+  // ssh 那一段只能由真机验证，但「什么地址算数、什么版本能跑、什么配置不生成」是现代码层面的
+  // 决定，错了要么把员工指到连不上的地址，要么让远端带着半份配置上岗——先把这些钉住。
+  {
+    const migration = await import("../scripts/migrate.mjs");
+    const rejectedWith = async (run) => {
+      try {
+        await run();
+        return null;
+      } catch (error) {
+        return error?.code ?? error?.error ?? "thrown";
+      }
+    };
+    check("Node 版本闸：22.12 与 22.20 都在范围内",
+      migration.assertNodeVersion("v22.12.0").minor === 12 && migration.assertNodeVersion("22.20.1").minor === 20);
+    check("对照：22.11 与 24 被拒（下界是版本号，不是印象）",
+      (await rejectedWith(() => migration.assertNodeVersion("22.11.0"))) === "node_version"
+      && (await rejectedWith(() => migration.assertNodeVersion("24.16.0"))) === "node_version");
+    check("公开地址走服务端同一套规则：https 原样放行",
+      migration.normalizeEndpoint("https://box.example.com").url === "https://box.example.com");
+    check("对照：http 与内网默认被拒，显式 --allow-http 才放行",
+      (await rejectedWith(() => migration.normalizeEndpoint("http://box.example.com"))) === "insecure_api_base_url"
+      && (await rejectedWith(() => migration.normalizeEndpoint("http://127.0.0.1:8300"))) === "insecure_api_base_url"
+      && migration.normalizeEndpoint("http://127.0.0.1:8300", { allowHttp: true }).url === "http://127.0.0.1:8300");
+    check("演示端点不能当远端地址（另一台机器上没有 demo://local）",
+      (await rejectedWith(() => migration.normalizeEndpoint("demo://local"))) === "demo_endpoint");
+    check("配置不完整就拒绝生成：令牌不足 32 字符、没有上游都不行",
+      (await rejectedWith(() => migration.buildExecutorConfig({ token: "short", upstreamUrl: "https://api.example.com/v1" }))) === "bad_token"
+      && (await rejectedWith(() => migration.buildExecutorConfig({ token: "x".repeat(40) }))) === "upstream_missing");
+    check("端口是 1-65535 的整数，越界不生成配置",
+      (await rejectedWith(() => migration.buildExecutorConfig({ port: 70000, token: "x".repeat(40), upstreamUrl: "https://api.example.com/v1" }))) === "bad_port");
+    check("--revert 等价于 --to local；--public-url= 的内联写法也认",
+      migration.parseArgs(["--revert"]).to === "local"
+      && migration.parseArgs(["--public-url=https://a.example.com"]).publicUrl === "https://a.example.com");
+    check("远端目录是相对路径且不含空格（ssh/scp 不经过任何引号）",
+      !migration.remoteDirFor("1d4f088f-bc41-4fd0-acb5-97fd6ba77da6").includes(" ")
+      && migration.remoteDirFor("abc").startsWith("workstream-executor/"));
+    check("ssh 用 -p、scp 用 -P：共用一份选项就会静默连到 22 端口",
+      migration.sshCommon({ sshPort: 2222 }).join(" ").includes("-p 2222")
+      && migration.scpCommon({ sshPort: 2222 }).join(" ").includes("-P 2222"));
+    check("user@host:8022 解析成 sshPort（非 22 端口的机器按这个拨号）",
+      migration.parseTarget("u0_a123@192.0.2.50:8022").sshPort === 8022
+      && migration.parseTarget("u0_a123@192.0.2.50:8022").target === "u0_a123@192.0.2.50"
+      && migration.parseTarget("root@box.example.com").sshPort === null);
+    check("A -> B：同机同目录算同一个执行器（launcher 自己会重启），换目录/换机器才停来源",
+      migration.shouldStopSource({ previous: { target: "local", dir: "a" }, target: "local", dir: "a" }) === false
+      && migration.shouldStopSource({ previous: { target: "local", dir: "a" }, target: "local", dir: "b" }) === true
+      && migration.shouldStopSource({ previous: { target: "root@a", dir: "d" }, target: "root@b", dir: "d" }) === true);
+    check("对照：--keep-source 或没有上一次记录时不动来源",
+      migration.shouldStopSource({ previous: { target: "local", dir: "a" }, target: "local", dir: "b", keepSource: true }) === false
+      && migration.shouldStopSource({ previous: null, target: "local", dir: "b" }) === false);
+  }
+
+  /* ---------- 36. 部署 server：登记、复制给员工、删掉不牵连 ---------- */
+  {
+    const box = createStreamServer({
+      upstreamUrl: "http://127.0.0.1:9/v1", upstreamKey: "k", upstreamModel: "m", token: "smoke-server-token",
+    });
+    const boxSrv = await listenStreamServer({ server: box, port: 0 });
+    const reg = await call("auth.register", { body: { email: "srv@example.com", password: "passw0rd-31", display_name: "Srv" } });
+    const verifyToken = decodeURIComponent((reg.payload.verify_link ?? "").split("token=")[1] ?? "");
+    await call("auth.verify", { body: { token: verifyToken } });
+    const owner = (await call("auth.login", { body: { email: "srv@example.com", password: "passw0rd-31" } })).payload.token;
+
+    const created = await call("servers.create", {
+      token: owner,
+      body: { name: "构建机", base_url: boxSrv.origin, token: "smoke-server-token" },
+    });
+    check("登记 server 时当场问出档位", created.payload.ok === true && created.payload.server.stream_profile === "shared", created.payload);
+    check("响应里只有令牌尾号，没有密文或原文",
+      !("token_cipher" in (created.payload.server ?? {})) && String(created.payload.server?.token_tail).endsWith("oken"),
+      created.payload.server);
+    const serverId = created.payload.server.id;
+
+    const agent = await call("agents.create", {
+      token: owner,
+      body: { name: "部署审", role: "验收", server_id: serverId, model: "m" },
+    });
+    check("用 server_id 建员工：地址与档位整份复制过来",
+      agent.payload.ok === true
+      && agent.payload.agent.api_base_url === boxSrv.origin
+      && agent.payload.agent.stream_profile === "shared",
+      agent.payload);
+    check("新建员工默认压缩水位 95", agent.payload.agent?.compact_at === 95, agent.payload.agent);
+    const compactLow = await call("agents.update", { token: owner, body: { id: agent.payload.agent.id, compact_at: 5 } });
+    check("压缩水位低于 10 被拒（invalid_compact_at）", compactLow.payload.error === "invalid_compact_at", compactLow.payload);
+    const compactSet = await call("agents.update", { token: owner, body: { id: agent.payload.agent.id, compact_at: 60 } });
+    check("压缩水位 60 写回档案", compactSet.payload.agent?.compact_at === 60, compactSet.payload.agent);
+
+    const stranger = await call("auth.register", { body: { email: "stranger@example.com", password: "passw0rd-32", display_name: "St" } });
+    const strangerVerify = decodeURIComponent((stranger.payload.verify_link ?? "").split("token=")[1] ?? "");
+    await call("auth.verify", { body: { token: strangerVerify } });
+    const other = (await call("auth.login", { body: { email: "stranger@example.com", password: "passw0rd-32" } })).payload.token;
+    check("对照：别人的列表里看不见这台 server", (await call("servers.list", { token: other })).payload.items?.length === 0);
+    check("对照：拿别人的 server id 建员工被拒",
+      (await call("agents.create", { token: other, body: { name: "偷", role: "x", server_id: serverId, model: "m" } })).payload.error === "server_not_found");
+
+    await call("servers.remove", { token: owner, body: { id: serverId } });
+    const after = await call("agents.list", { token: owner });
+    check("删掉 server 不牵连已经建在上面的员工（副本仍在）",
+      after.payload.items?.find((item) => item.id === agent.payload.agent.id)?.api_base_url === boxSrv.origin);
+    await boxSrv.close();
+  }
 
   console.log(`\n结果：${passed} 项通过，${failures.length} 项失败`);
   if (failures.length) {

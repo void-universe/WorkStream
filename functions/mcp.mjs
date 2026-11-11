@@ -431,20 +431,23 @@ const TOOL_HANDLERS = {
   },
   list_files: async ({ db, scope, args, env, streamId }) => {
     const rows = await db.files.list([["stream_id", streamId]], {
-      columns: "id,name,size_bytes,content_type,store,created_at", limit: 60,
+      columns: "id,path,name,size_bytes,content_type,store,created_at", limit: 60,
     });
-    return { files: rows };
+    // 员工看到的是完整路径：目录树是人建的，工具得按同一套路径说话。
+    return { files: rows.map((row) => ({ ...row, path: row.path ?? "", full: row.path ? `${row.path}/${row.name}` : row.name })) };
   },
   read_file: async ({ db, scope, args, env, streamId }) => {
     const id = args.id ? String(args.id) : null;
-    const wanted = args.name ? text(args.name, { max: 120, name: "name" }) : null;
+    const wanted = args.name ? text(args.name, { max: 320, name: "name" }) : null;
     const rows = await db.files.list([["stream_id", streamId]], {
-      columns: "id,name,size_bytes,content_type,store,content", limit: 100,
+      columns: "id,path,name,size_bytes,content_type,store,content", limit: 100,
     });
-    const file = rows.find((row) => (id ? row.id === id : row.name === wanted));
+    const fullOf = (row) => (row.path ? `${row.path}/${row.name}` : row.name);
+    const file = rows.find((row) => (id ? row.id === id : fullOf(row) === wanted || row.name === wanted));
     if (!file) return { error: "file_not_found" };
-    if (file.store !== "db") return { error: "binary_file_needs_download", name: file.name };
-    return { name: file.name, size_bytes: file.size_bytes, content: truncate(file.content ?? "", 12000) };
+    if (file.store === "link") return { name: fullOf(file), size_bytes: file.size_bytes, url: file.content };
+    if (file.store !== "db") return { error: "binary_file_needs_download", name: fullOf(file) };
+    return { name: fullOf(file), size_bytes: file.size_bytes, content: truncate(file.content ?? "", 12000) };
   },
   upload_file: async ({ db, scope, args, env, streamId }) => {
     const owner = await db.users.byId(scope.ownerId, { columns: "id,display_name,prefs" });
@@ -458,6 +461,7 @@ const TOOL_HANDLERS = {
         name: args.name,
         contentType: args.content_type,
         content: args.content,
+        path: args.path ?? "",
       });
       return {
         ok: true,

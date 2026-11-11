@@ -44,7 +44,7 @@ node dev/seed-demo.mjs # 一条命令跑通：注册→建演示虚拟员工→�
 
 ## 部署
 
-`npm run build` 产出 `dist/`；后端是 `functions/` 里的单个 Function 入口，按 `/functions/v1/app?action=<name>` 提供服务，会话令牌走 `x-workstream-token`。注册时用 `webDirectory: "dist"`、`functionDirectory: "functions"`、`databaseAccess: "read_write"` 和可选的 Secret `WORKSTREAM_DATA_KEY`、`WORKSTREAM_SMTP_URL`（值走站点设置录入），再按顺序应用 `sql/0001_init.sql` … `0016_stream.sql`。不能常驻进程的托管方式由前端每 5 秒轮询推进一格调度；允许常驻进程的部署加 `--worker`（或 `WORKSTREAM_WORKER=1`），不开页面邮箱也会继续推进。
+`npm run build` 产出 `dist/`；后端是 `functions/` 里的单个 Function 入口，按 `/functions/v1/app?action=<name>` 提供服务，会话令牌走 `x-workstream-token`。注册时用 `webDirectory: "dist"`、`functionDirectory: "functions"`、`databaseAccess: "read_write"` 和可选的 Secret `WORKSTREAM_DATA_KEY`、`WORKSTREAM_SMTP_URL`（值走站点设置录入），再按顺序应用 `sql/0001_init.sql` … `0018_agent_compact_at.sql`。不能常驻进程的托管方式由前端每 5 秒轮询推进一格调度；允许常驻进程的部署加 `--worker`（或 `WORKSTREAM_WORKER=1`），不开页面邮箱也会继续推进。
 
 服务端从不登录 SSH：控制台由浏览器直连那台机器上的 ttyd 网关，WorkStream 只存网关地址。部署披露、还没走完的步骤与当前状态见 [docs/guide.md](docs/guide.md)。
 

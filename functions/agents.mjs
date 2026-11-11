@@ -5,13 +5,14 @@ import { askCloudAgent, checkCloudAccess, parseAgentId } from "./qca.mjs";
 import { BACKENDS, BACKEND_IDS, DEMO_BASE_URL, backendFor } from "./backends.mjs";
 import { demoCopy, demoLang, langOf } from "./copy.mjs";
 import { installDefaultSkillsFor, skillsForAgent } from "./skills.mjs";
+import { serverById } from "./servers.mjs";
 import { askStreamServer, checkStreamAccess, probeStreamProfile } from "./stream.mjs";
 import { DEDICATED_PROFILE } from "./streamspec.mjs";
 import { normalizeUsage } from "./usage.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, Interrupted, avatarData, int, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
 
 export const AGENT_COLUMNS =
-  "id,owner_id,name,role,signature,avatar,api_base_url,api_key_tail,model,system_prompt,context_chars,key_source,color,status,backend,qca_agent_id,qca_environment_id,stream_profile,created_at,updated_at";
+  "id,owner_id,name,role,signature,avatar,api_base_url,api_key_tail,model,system_prompt,context_chars,key_source,color,status,backend,qca_agent_id,qca_environment_id,stream_profile,compact_at,created_at,updated_at";
 
 /** 只有服务端自用：密文列永不出现在任何响应里。 */
 export const AGENT_SECRET_COLUMNS = "id,owner_id,api_key_cipher";
@@ -86,8 +87,16 @@ export const actions = {
     // 新建档默认走规范入口：发现决定 shared/dedicated，只认 OpenAI 兼容的地址自动退回那一档。
     // 演示端点与云端不是"默认猜一档"，要显式选 backend（demo://local 挂 stream 会被 assertBackendPair 拒）。
     const backend = oneOf(body.backend ?? "stream", BACKEND_IDS, "backend");
-    const target = safeApiBaseUrl(body.api_base_url, { allowPrivate: privateAllowed(env) });
-    const apiKey = text(body.api_key, { max: 400, name: "api_key" });
+    // 从已登记的部署 server 建员工：地址、令牌与档位都来自那一行；员工仍存自己的一份副本，
+    // 所以以后删掉这台 server 不会把已经跑在上面的员工一起弄坏。
+    const server = body.server_id ? await serverById(db, user, body.server_id) : null;
+    if (server && backend !== "stream") {
+      throw new Halt("server_needs_stream_backend", 400, { backend });
+    }
+    const target = server ? { url: server.base_url } : safeApiBaseUrl(body.api_base_url, { allowPrivate: privateAllowed(env) });
+    const apiKey = server
+      ? await open(server.token_cipher, { supabase: db.client, env })
+      : text(body.api_key, { max: 400, name: "api_key" });
     // 云端 Agent 的模型由云上那份定义决定，本地只留一个展示名。
     const model = backend === "qca"
       ? text(body.model ?? "云端 Agent", { max: 120, name: "model" })
@@ -99,6 +108,7 @@ export const actions = {
     const contextChars = int(body.context_chars, {
       min: 2000, max: CONTEXT_CHARS_MAX, name: "context_chars", fallback: CONTEXT_CHARS_DEFAULT,
     });
+    const compactAt = int(body.compact_at, { min: 10, max: 100, name: "compact_at", fallback: 95 });
     assertBackendPair(backend, target.url, model);
     // 规范对接那一档必须先问清楚再落库：这一格决定提示词措辞与工具注入，两样都发生在调用之前。
     // 问不出结论（连不上/超时/令牌被拒）就整个建档失败——留着一个空档的员工，每轮任务都失败在
@@ -119,6 +129,7 @@ export const actions = {
       signature,
       avatar,
       context_chars: contextChars,
+      compact_at: compactAt,
       key_source: sealed.key_source,
       backend,
       qca_agent_id: qcaAgentId,
@@ -151,6 +162,16 @@ export const actions = {
     const values = { updated_at: now() };
     // 这一轮请求里给过的明文令牌：改档要拿它去问对方认哪一档，不能再解一次密文。
     let keyGiven = null;
+    // 换一台已登记的部署 server：整份复制地址、密封令牌与档位，和手填走同一条发现校验。
+    if (body.server_id) {
+      const server = await serverById(db, user, body.server_id);
+      keyGiven = await open(server.token_cipher, { supabase: db.client, env });
+      values.backend = "stream";
+      values.api_base_url = server.base_url;
+      values.api_key_cipher = server.token_cipher;
+      values.api_key_tail = server.token_tail;
+      values.key_source = server.key_source;
+    }
     if (body.name !== undefined) values.name = text(body.name, { max: 48, name: "name" });
     if (body.role !== undefined) values.role = text(body.role, { max: 400, name: "role" });
     if (body.model !== undefined) values.model = text(body.model, { max: 120, name: "model" });
@@ -160,8 +181,11 @@ export const actions = {
     if (body.context_chars !== undefined) {
       values.context_chars = int(body.context_chars, { min: 2000, max: CONTEXT_CHARS_MAX, name: "context_chars" });
     }
+    if (body.compact_at !== undefined) {
+      values.compact_at = int(body.compact_at, { min: 10, max: 100, name: "compact_at" });
+    }
     if (body.status !== undefined) values.status = oneOf(body.status, ["active", "paused"], "status");
-    if (body.backend !== undefined) {
+    if (body.backend !== undefined && !body.server_id) {
       const next = oneOf(body.backend, BACKEND_IDS, "backend");
       // 换后端等于换一类凭据（sk- 的 Key 和 pt- 的 PAT 不能混用），没给新凭据就挡住，
       // 别让员工带着错凭据上岗、每轮任务都失败在云端鉴权上。
@@ -179,13 +203,13 @@ export const actions = {
       // 改挂另一个云端 agent：environment 与 session 缓存都是围着旧 agent 建的，一起作废。
       values.qca_environment_id = null;
     }
-    if (body.api_base_url !== undefined) {
+    if (body.api_base_url !== undefined && !body.server_id) {
       const target = safeApiBaseUrl(body.api_base_url, { allowPrivate: privateAllowed(env) });
       values.api_base_url = target.url;
       // 换了 API 地址等于换了云端账号所在的那套服务，缓存的 environment/session 都不再适用。
       if ((agent.backend ?? "openai") === "qca") values.qca_environment_id = null;
     }
-    if (body.api_key) {
+    if (body.api_key && !body.server_id) {
       const apiKey = text(body.api_key, { max: 400, name: "api_key" });
       keyGiven = apiKey;
       const sealed = await seal(apiKey, { supabase: db.client, env });
