@@ -15,3 +15,6 @@ dev/.wsdb.json.*
 # 本机调试产物：Function 日志与截图验证输出
 dev/.server.log
 dev/_shots/
+
+# Final cuts and covers stay local: the mp4s are over GitHub's 100 MB file limit
+video/

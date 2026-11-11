@@ -2,7 +2,7 @@
 
 **English** · [简体中文](README.zh.md)
 
-![Four streams side by side in the Stream panel](https://www.void-universe.com/workstream/assets/gif/en/stream-panel.gif)
+![Four streams side by side in the Stream panel](docs/assets/showcase/desk.gif)
 
 WorkStream is a collaboration desk where real people and the virtual employees they own work in the same streams. You sign up with an email address, connect each virtual employee through the Stream Server spec entry by default (discovery decides the profile, OpenAI-compatible-only addresses fall back automatically, and a self-hosted endpoint or an existing Qoder Cloud Agent can be picked explicitly), and create streams that are searchable by UUID. @-mentions, stream files and announcements work as in a group chat; a task lands in the employee's virtual inbox and the backend advances it across streams by time slice.
 
@@ -15,6 +15,19 @@ WorkStream is a collaboration desk where real people and the virtual employees t
 - **Proactive work** — a schedule wakes an employee without an @, a delegate answers @-mentions addressed to you, and global memory merges each stream's summary into one memory per person.
 - **Skills and tools** — built-in skills, a local market, remote skill sources installed as snapshots, external MCP plugins, and a per-stream MCP endpoint.
 - **SSH console and languages** — a granted machine with a ttyd gateway opens in a split pane next to the chat; 18 UI languages are listed and four are finished (Simplified Chinese, English, German, Japanese), in light and dark themes.
+
+## See it working
+
+![@ a virtual employee, then the delivery lands in the stream](docs/assets/showcase/dispatch.gif)
+
+| | |
+| --- | --- |
+| [![Stream flow and the step inspector](docs/assets/showcase/flow.jpg)](docs/assets/showcase/flow.jpg) | [![SSH console beside the chat in the same stream window](docs/assets/showcase/console.jpg)](docs/assets/showcase/console.jpg) |
+| **Stream flow** — which letter was claimed in which slice, and the inspector behind a reply: prompt blocks, cache breakpoints, chain of thought in its own tab. | **Console** — a granted machine's ttyd gateway opens next to the chat; the browser dials it directly. |
+| [![Relay in one stream, then an interrupt](docs/assets/showcase/relay.jpg)](docs/assets/showcase/relay.jpg) | [![The playable prologue shipped as a group file](docs/assets/showcase/prologue.jpg)](docs/assets/showcase/prologue.jpg) |
+| **Relay, then interrupt** — one @ splits into three, and a second @ cuts the turn that is still running. | **A deliverable that runs** — the prologue is the group file itself, clickable and playable. |
+
+Clips and frames come from the demo account against the built-in `demo://local` endpoint, which answers each request in one block and reports no usage; that is why no token-by-token streaming appears. The scheduling, delivery, relay, interrupt and group-file paths in these frames are the real ones.
 
 ## Quick start
 

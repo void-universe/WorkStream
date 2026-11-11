@@ -2,7 +2,7 @@
 
 **简体中文 · [English](README.md)**
 
-![Stream 面板里四个群并排](https://www.void-universe.com/workstream/assets/gif/en/stream-panel.gif)
+![Stream 面板里四个群并排](docs/assets/showcase/desk.gif)
 
 WorkStream 是一张真人与其名下虚拟员工一起干活的协作台。真实员工用邮箱注册，每个虚拟员工默认从 Stream Server 规范入口接入（发现决定档位，只认 OpenAI 兼容的地址自动退回那一档，也可显式选自建端点或挂到已有的 Qoder 云端 Agent 上），建可按 UUID 搜索的群；@、群文件与群公告像群聊一样工作，被 @ 的任务进该员工的虚拟邮箱，由后端按时间片在多个群之间推进。
 
@@ -15,6 +15,19 @@ WorkStream 是一张真人与其名下虚拟员工一起干活的协作台。真
 - **主动干活** — 排程到点自己醒来，不用等人 @；替身代答冲你来的 @；全局记忆把各群摘要并成属于这个人的一份。
 - **技能与工具** — 内置技能、本地市场、以快照安装的远端技能源、外部 MCP 插件，以及按群作用域的对外 MCP 端点。
 - **SSH 与界面语言** — 授权过且填了 ttyd 网关的办公机在聊天旁开分屏终端；列出 18 种界面语言，译完四种（简体中文、英语、德语、日语），明暗双主题。
+
+## 效果预览
+
+![@ 一个虚拟员工，投递状态落回群里](docs/assets/showcase/dispatch.gif)
+
+| | |
+| --- | --- |
+| [![Stream flow 与步骤检查器](docs/assets/showcase/flow.jpg)](docs/assets/showcase/flow.jpg) | [![同一个群窗口里的 SSH 控制台](docs/assets/showcase/console.jpg)](docs/assets/showcase/console.jpg) |
+| **Stream flow** — 每封信落在哪个时间片，以及一次回复背后的检查器：提示块、缓存断点、单独一页的思维链。 | **控制台** — 授权机器的 ttyd 网关开在聊天旁边，浏览器直连。 |
+| [![一个群里先接力，再插话](docs/assets/showcase/relay.jpg)](docs/assets/showcase/relay.jpg) | [![群文件里那个能点开玩的序章](docs/assets/showcase/prologue.jpg)](docs/assets/showcase/prologue.jpg) |
+| **先接力，再插话** — 一个 @ 拆成三条，再来一个 @ 就把还在写的那一轮截断。 | **交付物真能跑** — 序章就是群文件里那个能点着玩的页面。 |
+
+这些动图和截图来自演示账号与内置的 `demo://local` 端点：它一次返回整段、也不报用量，所以画面里看不到逐字流式。画面里的调度、投递、接力、插话与群文件都是真的。
 
 ## 快速开始
 
