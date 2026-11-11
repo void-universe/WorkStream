@@ -6174,11 +6174,22 @@ async function main() {
     check("压缩水位低于 10 被拒（invalid_compact_at）", compactLow.payload.error === "invalid_compact_at", compactLow.payload);
     const compactSet = await call("agents.update", { token: owner, body: { id: agent.payload.agent.id, compact_at: 60 } });
     check("压缩水位 60 写回档案", compactSet.payload.agent?.compact_at === 60, compactSet.payload.agent);
+    const thinkSet = await call("agents.update", { token: owner, body: { id: agent.payload.agent.id, think_effort: "high" } });
+    check("思考档位写入档案", thinkSet.payload.agent?.think_effort === "high", thinkSet.payload.agent);
+    const thinkBad = await call("agents.update", { token: owner, body: { id: agent.payload.agent.id, think_effort: "turbo" } });
+    check("思考档位非法被拒（invalid_think_effort）",
+      thinkBad.status === 400 && thinkBad.payload.error === "invalid_think_effort", thinkBad.payload);
+    const usage = await call("agents.usage", { token: owner, method: "GET", body: { id: agent.payload.agent.id } });
+    check("用量聚合：三个窗口都在，且命中率与花费可算",
+      usage.status === 200 && ["5m", "1h", "all"].every((name) => usage.payload.windows?.[name]),
+      usage.payload);
 
     const stranger = await call("auth.register", { body: { email: "stranger@example.com", password: "passw0rd-32", display_name: "St" } });
     const strangerVerify = decodeURIComponent((stranger.payload.verify_link ?? "").split("token=")[1] ?? "");
     await call("auth.verify", { body: { token: strangerVerify } });
     const other = (await call("auth.login", { body: { email: "stranger@example.com", password: "passw0rd-32" } })).payload.token;
+    const usageStranger = await call("agents.usage", { token: other, method: "GET", body: { id: agent.payload.agent.id } });
+    check("用量聚合：别人的员工看不了", usageStranger.status === 403, usageStranger.payload);
     check("对照：别人的列表里看不见这台 server", (await call("servers.list", { token: other })).payload.items?.length === 0);
     check("对照：拿别人的 server id 建员工被拒",
       (await call("agents.create", { token: other, body: { name: "偷", role: "x", server_id: serverId, model: "m" } })).payload.error === "server_not_found");

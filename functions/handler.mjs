@@ -14,6 +14,7 @@ import { actions as servers } from "./servers.mjs";
 import { bindEnv, readEnv, smtpEndpoint } from "./runtime.mjs";
 import { actions as skills } from "./skills.mjs";
 import { actions as standin } from "./standin.mjs";
+import { actions as cost } from "./cost.mjs";
 import { store } from "./store.mjs";
 import { actions as trajectory } from "./trajectory.mjs";
 import { Halt, fail, json, now, sha256Hex, text } from "./util.mjs";
@@ -24,7 +25,7 @@ const PUBLIC = new Set([
   "auth.register", "auth.verify", "auth.login", "mcp", "site.meta",
 ]);
 
-const ROUTES = { ...accounts, ...agents, ...rooms, ...chat, ...cron, ...delegate, ...dreaming, ...engine, ...vms, ...skills, ...registries, ...plugins, ...servers, ...standin, ...trajectory };
+const ROUTES = { ...accounts, ...agents, ...rooms, ...chat, ...cron, ...delegate, ...dreaming, ...engine, ...vms, ...skills, ...registries, ...plugins, ...servers, ...standin, ...cost, ...trajectory };
 
 async function siteMeta({ db, env }) {
   void db;

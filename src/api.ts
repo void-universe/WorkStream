@@ -285,6 +285,8 @@ const ERROR_KEYS: Record<string, MsgKey> = {
   invalid_api_key: "errors.invalid_api_key",
   invalid_avatar: "errors.invalid_avatar",
   invalid_compact_at: "errors.invalid_compact_at",
+  invalid_think_effort: "errors.invalid_think_effort",
+  invalid_prices: "errors.invalid_prices",
   invalid_context_chars: "errors.invalid_context_chars",
   invalid_current_password: "errors.invalid_current_password",
   invalid_display_name: "errors.invalid_display_name",

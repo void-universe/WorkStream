@@ -67,6 +67,8 @@ type Draft = {
   context_chars: number;
   /** 压缩水位：窗口最多吃掉上下文预算的百分比（10–100），默认 95。 */
   compact_at: number;
+  /** 思考档位：空串 = 不指定；其余与服务器 models[].effort 对齐。 */
+  think_effort: string;
   status: "active" | "paused";
   backend: Backend;
   qca_agent_id: string;
@@ -135,6 +137,7 @@ const EMPTY: Draft = {
   system_prompt: "",
   context_chars: 256_000,
   compact_at: 95,
+  think_effort: "",
   status: "active",
   backend: "stream",
   qca_agent_id: "",
@@ -256,6 +259,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
       system_prompt: agent.system_prompt,
       context_chars: nearestContextStep(agent.context_chars) * CHARS_PER_TOKEN,
       compact_at: agent.compact_at ?? 95,
+      think_effort: agent.think_effort ?? "",
       status: agent.status,
       backend: agent.backend === "qca" ? "qca" : agent.backend === "stream" ? "stream" : "openai",
       qca_agent_id: agent.qca_agent_id ?? "",
@@ -488,6 +492,7 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
         system_prompt: draft.system_prompt,
         context_chars: Number(draft.context_chars),
         compact_at: Number(draft.compact_at),
+        think_effort: draft.think_effort || null,
         status: draft.status,
         backend: draft.backend,
         // 选了 server 就把「地址 + 令牌 + 档位」交给服务端整份复制；否则照旧手填。
@@ -784,6 +789,15 @@ export function AgentsView({ onChanged, focusAgentId = "" }: { onChanged: () => 
               )}
               <Field label={copy.modelLabel} htmlFor="agent-model" hint={copy.modelHint}>
                 <TextInput id="agent-model" value={draft.model} onChange={(event) => setDraft({ ...draft, model: event.target.value })} className="h-8 font-mono text-xs" />
+              </Field>
+              <Field label={i18n.t("agent.thinkLabel")} htmlFor="agent-think" hint={i18n.t("agent.thinkHint")}>
+                <NativeSelect id="agent-think" className="h-8 text-xs" value={draft.think_effort} onChange={(event) => setDraft({ ...draft, think_effort: event.target.value })}>
+                  <NativeSelectOption value="">{i18n.t("agent.thinkOff")}</NativeSelectOption>
+                  <NativeSelectOption value="low">{i18n.t("agent.thinkLow")}</NativeSelectOption>
+                  <NativeSelectOption value="medium">{i18n.t("agent.thinkMedium")}</NativeSelectOption>
+                  <NativeSelectOption value="high">{i18n.t("agent.thinkHigh")}</NativeSelectOption>
+                  <NativeSelectOption value="max">{i18n.t("agent.thinkMax")}</NativeSelectOption>
+                </NativeSelect>
               </Field>
               {draft.server_id ? null : (
                 <Field label={copy.keyLabel} htmlFor="agent-key" hint={copy.keyHint}>

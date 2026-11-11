@@ -38,6 +38,7 @@ export type Agent = {
   context_chars: number;
   /** 压缩水位（10–100，默认 95）：窗口最多吃掉上下文预算的多少。旧行没有这一列时按 95 读。 */
   compact_at?: number | null;
+  think_effort?: string | null;
   key_source: "secret" | "database" | string;
   color: string;
   status: "active" | "paused";

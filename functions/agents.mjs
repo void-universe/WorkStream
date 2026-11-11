@@ -11,8 +11,16 @@ import { DEDICATED_PROFILE } from "./streamspec.mjs";
 import { normalizeUsage } from "./usage.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, Interrupted, avatarData, int, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
 
+// 思考档位是「员工选择 + 服务器声明」两方合一的：这里只校验形状，真正的支持集在发现阶段
+// （/stream-server/v1 的 models[].effort）由界面用来只显示可用档，不在这里猜。
+const THINK_LEVELS = ["off", "low", "medium", "high", "max"];
+function thinkEffortOf(value) {
+  if (value === undefined || value === null || value === "") return null;
+  return oneOf(value, THINK_LEVELS, "think_effort");
+}
+
 export const AGENT_COLUMNS =
-  "id,owner_id,name,role,signature,avatar,api_base_url,api_key_tail,model,system_prompt,context_chars,key_source,color,status,backend,qca_agent_id,qca_environment_id,stream_profile,compact_at,kind,created_at,updated_at";
+  "id,owner_id,name,role,signature,avatar,api_base_url,api_key_tail,model,system_prompt,context_chars,key_source,color,status,backend,qca_agent_id,qca_environment_id,stream_profile,compact_at,think_effort,kind,created_at,updated_at";
 
 /** 只有服务端自用：密文列永不出现在任何响应里。 */
 export const AGENT_SECRET_COLUMNS = "id,owner_id,api_key_cipher";
@@ -110,6 +118,7 @@ export const actions = {
       min: 2000, max: CONTEXT_CHARS_MAX, name: "context_chars", fallback: CONTEXT_CHARS_DEFAULT,
     });
     const compactAt = int(body.compact_at, { min: 10, max: 100, name: "compact_at", fallback: 95 });
+    const thinkEffort = thinkEffortOf(body.think_effort);
     assertBackendPair(backend, target.url, model);
     // 规范对接那一档必须先问清楚再落库：这一格决定提示词措辞与工具注入，两样都发生在调用之前。
     // 问不出结论（连不上/超时/令牌被拒）就整个建档失败——留着一个空档的员工，每轮任务都失败在
@@ -131,6 +140,7 @@ export const actions = {
       avatar,
       context_chars: contextChars,
       compact_at: compactAt,
+      think_effort: thinkEffort,
       key_source: sealed.key_source,
       backend,
       qca_agent_id: qcaAgentId,
@@ -185,6 +195,7 @@ export const actions = {
     if (body.compact_at !== undefined) {
       values.compact_at = int(body.compact_at, { min: 10, max: 100, name: "compact_at" });
     }
+    if (body.think_effort !== undefined) values.think_effort = thinkEffortOf(body.think_effort);
     if (body.status !== undefined) values.status = oneOf(body.status, ["active", "paused"], "status");
     if (body.backend !== undefined && !body.server_id) {
       const next = oneOf(body.backend, BACKEND_IDS, "backend");
@@ -461,11 +472,13 @@ export function upstreamCode(error, fallback = "upstream_unreachable") {
  * （那一发正文与思考链都是空的）。只往外交增量、不参与这一轮的结果，不传就与从前一模一样。
  */
 export async function chatCompletion({
-  baseUrl, apiKey, model, messages, tools, maxTokens, timeoutMs = 120000, onInterrupt, onDelta = null,
+  baseUrl, apiKey, model, messages, tools, maxTokens, reasoningEffort = null, timeoutMs = 120000, onInterrupt, onDelta = null,
 }) {
   const started = Date.now();
   const body = { model, messages, stream: true, stream_options: { include_usage: true } };
   if (maxTokens) body.max_tokens = maxTokens;
+  // 思考档位是可选字段：上游不认的档位应当由它自己报错，不在这里静默丢掉。
+  if (reasoningEffort) body.reasoning_effort = reasoningEffort;
   if (tools?.length) {
     body.tools = tools;
     body.tool_choice = "auto";

@@ -193,6 +193,7 @@ export function createStreamServer({
             messages: body.messages,
             tools: Array.isArray(body.tools) ? body.tools : null,
             maxTokens: Number(body.max_tokens) || null,
+            reasoningEffort: typeof body.thinking === "string" && body.thinking ? body.thinking : null,
             timeoutMs,
             // 叫停走 chatCompletion 已有的那套纪律：分片边界问一次，静默 800ms 也问一次，
             // 不在这里另写一个读循环。

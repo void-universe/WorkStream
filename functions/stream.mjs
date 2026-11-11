@@ -301,7 +301,7 @@ async function readTurnStream({ body, origin, token, turnId, onInterrupt, starte
 }
 
 /** shared 档：一轮的全部输入都在请求里，服务器不挂我们的库，所以它不需要数据库钥匙。 */
-async function runSharedTurn({ origin, token, model, messages, tools, maxTokens, timeoutMs, onInterrupt }) {
+async function runSharedTurn({ origin, token, model, messages, tools, maxTokens, thinking, timeoutMs, onInterrupt }) {
   const started = Date.now();
   // turn_id 由客户端生成：连接断了也要能叫停与取结果，等对方在响应体里回一个 id 就晚了。
   const turnId = newId();
@@ -322,6 +322,7 @@ async function runSharedTurn({ origin, token, model, messages, tools, maxTokens,
           model,
           messages,
           ...(maxTokens ? { max_tokens: maxTokens } : {}),
+          ...(thinking ? { thinking } : {}),
           ...(tools?.length ? { tools, tool_choice: "auto" } : {}),
         }),
         redirect: "manual",
@@ -412,7 +413,7 @@ const PROFILE_ROUTES = {
   },
   [SHARED_PROFILE]: ({ origin, key, agent, messages, tools, maxTokens, timeoutMs, onInterrupt }) =>
     runSharedTurn({
-      origin, token: key, model: agent.model, messages, tools, maxTokens, timeoutMs, onInterrupt,
+      origin, token: key, model: agent.model, messages, tools, maxTokens, thinking: agent.think_effort, timeoutMs, onInterrupt,
     }),
   [DEDICATED_PROFILE]: ({ db, agent, streamId, origin, key, messages, timeoutMs, onInterrupt, persistSession }) =>
     runDedicatedTurn({
