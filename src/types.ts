@@ -179,6 +179,18 @@ export type Plugin = {
   updated_at: string;
 };
 
+/** 已登记的部署 server：地址、令牌尾号与它自己声明的档位；从它建档时整份复制进员工。 */
+export type ServerRow = {
+  id: string;
+  name: string;
+  base_url: string;
+  token_tail: string;
+  stream_profile: string;
+  label: string | null;
+  models: string[];
+  last_seen_at: string;
+};
+
 export type Stream = {
   id: string;
   name: string;

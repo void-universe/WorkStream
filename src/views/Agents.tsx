@@ -14,6 +14,7 @@ import type {
   MailItem,
   Memory,
   RemoteSkill,
+  ServerRow,
   Skill,
   SkillUpdateIssue,
   SkillUpdateRow,
@@ -76,18 +77,6 @@ type Draft = {
   server_id: string;
   /** 切走之前那个自建端点地址，切回自建时还给他，不用重新手打。 */
   prev_openai_url: string;
-};
-
-/** 一台已登记的部署 server（只回令牌尾号，原文与密文都不出服务端）。 */
-type ServerRow = {
-  id: string;
-  name: string;
-  base_url: string;
-  token_tail: string;
-  stream_profile: string;
-  label: string | null;
-  models: string[];
-  last_seen_at: string;
 };
 
 /** 云端 Agent 的默认 API 地址（CN 区）；换区或私有部署就在字段里改成对应 origin。 */
