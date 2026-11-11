@@ -56,7 +56,7 @@ export async function resolveDelegate(db, { human, streamId, atMs = Date.now() }
   if (!window.active) return { ...base, active: false, reason: window.reason, agent: null };
 
   if (!agentId) return { ...base, active: false, reason: "no_agent", agent: null };
-  const agent = await db.agents.byId(agentId, { columns: "id,name,status,owner_id,backend" });
+  const agent = await db.agents.byId(agentId, { columns: "id,name,status,owner_id,backend,kind" });
   if (!agent) return { ...base, active: false, reason: "agent_missing", agent: null };
   // 替身必须是本人名下的员工：借别人的员工代自己说话，等于让第三方读你的群上下文。
   if (agent.owner_id !== human.id) return { ...base, active: false, reason: "agent_not_owned", agent: null };
@@ -65,8 +65,11 @@ export async function resolveDelegate(db, { human, streamId, atMs = Date.now() }
     [["stream_id", streamId], ["principal_type", "agent"], ["principal_id", agent.id]],
     { columns: "id" },
   );
-  if (!inStream) return { ...base, active: false, reason: "agent_not_in_stream", agent: null };
-  return { ...base, active: true, reason: null, agent };
+  // 专属替身会跟着"你在的群"走：不在群里不算失败，发送时应把它补进去（下面 queueDelegateMail）。
+  if (!inStream && agent.kind !== "standin") {
+    return { ...base, active: false, reason: "agent_not_in_stream", agent: null };
+  }
+  return { ...base, active: true, reason: null, agent, needsJoin: !inStream };
 }
 
 /** 群现场要显示的替身状态：本群覆盖、账号班表、当下是否真生效。 */
@@ -102,6 +105,17 @@ export async function queueDelegateMail(db, { human, streamId, message, weight, 
     agent_name: agent?.name ?? null,
   });
   if (!resolved.active) return outcome(false, resolved.reason, null);
+  // 替身自动覆盖"你在的群"：这一群你刚进、替身还没被拉进来，就在派发这一刻补上。
+  if (resolved.needsJoin) {
+    await db.members.insert({
+      id: newId(),
+      stream_id: streamId,
+      principal_type: "agent",
+      principal_id: resolved.agent.id,
+      role: "member",
+      joined_at: now(),
+    }, { columns: "id" });
+  }
   if (skipAgents?.has(resolved.agent.id)) return outcome(false, "already_queued", null);
   await db.mail.insert({
     id: newId(),

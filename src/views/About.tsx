@@ -80,6 +80,9 @@ export function AboutView({
   const [meta, setMeta] = useState<Meta | null>(null);
   const [servers, setServers] = useState<ServerRow[]>([]);
   const [serverBusy, setServerBusy] = useState("");
+  const [standin, setStandin] = useState<{ enabled: boolean; agent: { id: string; name: string } | null }>({ enabled: false, agent: null });
+  const [standinServer, setStandinServer] = useState("");
+  const [standinBusy, setStandinBusy] = useState(false);
 
   useEffect(() => {
     void get<Meta>("site.meta").then(setMeta).catch(() => setMeta(null));
@@ -87,9 +90,42 @@ export function AboutView({
       .then((result) => setMyAgents(result.items))
       .catch(() => setMyAgents([]));
     void get<{ ok: true; items: ServerRow[] }>("servers.list")
-      .then((result) => setServers(result.items))
+      .then((result) => {
+        setServers(result.items);
+        setStandinServer((current) => current || result.items[0]?.id || "");
+      })
       .catch(() => setServers([]));
+    void get<{ ok: true; enabled: boolean; agent: { id: string; name: string } | null }>("standin.get")
+      .then((result) => setStandin({ enabled: result.enabled, agent: result.agent }))
+      .catch(() => setStandin({ enabled: false, agent: null }));
   }, []);
+
+  async function refreshStandin() {
+    const state = await get<{ ok: true; enabled: boolean; agent: { id: string; name: string } | null }>("standin.get").catch(() => null);
+    if (state) setStandin({ enabled: state.enabled, agent: state.agent });
+  }
+
+  async function toggleStandin() {
+    setStandinBusy(true);
+    try {
+      if (standin.enabled) {
+        await post("standin.disable", {});
+        toast.success(i18n.t("about.standinOffToast"));
+      } else {
+        if (!standinServer) {
+          toast.error(i18n.t("about.standinNeedServer"));
+          return;
+        }
+        await post("standin.enable", { server_id: standinServer });
+        toast.success(i18n.t("about.standinOnToast"));
+      }
+      await refreshStandin();
+    } catch (error) {
+      toast.error(describeError(i18n, error));
+    } finally {
+      setStandinBusy(false);
+    }
+  }
 
   const refreshServers = () => get<{ ok: true; items: ServerRow[] }>("servers.list")
     .then((result) => setServers(result.items))
@@ -322,6 +358,42 @@ export function AboutView({
               </div>
             </div>
           ))}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm">{i18n.t("about.standinTitle")}</CardTitle>
+          <CardDescription className="text-xs">{i18n.t("about.standinDesc")}</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label={i18n.t("about.standinServerLabel")} htmlFor="standin-server">
+              <NativeSelect
+                id="standin-server"
+                className="h-8 text-xs"
+                value={standinServer}
+                onChange={(event) => setStandinServer(event.target.value)}
+              >
+                {servers.length === 0 ? <NativeSelectOption value="">{i18n.t("about.standinNeedServer")}</NativeSelectOption> : null}
+                {servers.map((server) => (
+                  <NativeSelectOption key={server.id} value={server.id}>{server.name}</NativeSelectOption>
+                ))}
+              </NativeSelect>
+            </Field>
+            <div className="flex items-end gap-2 pb-0.5">
+              <Button
+                size="sm"
+                variant={standin.enabled ? "outline" : "default"}
+                className="h-8 text-xs"
+                disabled={standinBusy}
+                onClick={() => void toggleStandin()}
+              >
+                {standin.enabled ? i18n.t("about.standinOff") : i18n.t("about.standinOn")}
+              </Button>
+              {standin.agent ? <p className="text-xs text-muted-foreground">{standin.agent.name}</p> : null}
+            </div>
+          </div>
         </CardContent>
       </Card>
 

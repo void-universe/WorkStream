@@ -6183,6 +6183,24 @@ async function main() {
     check("对照：拿别人的 server id 建员工被拒",
       (await call("agents.create", { token: other, body: { name: "偷", role: "x", server_id: serverId, model: "m" } })).payload.error === "server_not_found");
 
+    // AI 替身：一键开、隐藏、覆盖你在的群、一键关。
+    const standinGroup = await call("streams.create", {
+      token: owner, body: { name: "替身验收群", join_policy: "request", agent_ids: [], vm_ids: [] },
+    });
+    const standinOn = await call("standin.enable", { token: owner, body: { server_id: serverId } });
+    check("一键开替身：建隐藏员工并加入你在的群",
+      standinOn.payload.enabled === true && (standinOn.payload.joined ?? []).includes(standinGroup.payload.stream.id),
+      standinOn.payload);
+    const listedAfter = await call("agents.list", { token: owner });
+    check("替身不出现在员工列表里",
+      !(listedAfter.payload.items ?? []).some((row) => row.kind === "standin"),
+      (listedAfter.payload.items ?? []).map((row) => row.kind ?? null));
+    const standinState = await call("standin.get", { token: owner });
+    check("替身状态指向那条隐藏员工", standinState.payload.enabled === true && Boolean(standinState.payload.agent?.id), standinState.payload);
+    const standinOff = await call("standin.disable", { token: owner });
+    check("一键关：替身停用", standinOff.payload.enabled === false
+      && (await call("standin.get", { token: owner })).payload.enabled === false, standinOff.payload);
+
     await call("servers.remove", { token: owner, body: { id: serverId } });
     const after = await call("agents.list", { token: owner });
     check("删掉 server 不牵连已经建在上面的员工（副本仍在）",

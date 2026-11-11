@@ -12,7 +12,7 @@ import { normalizeUsage } from "./usage.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, Interrupted, avatarData, int, json, maskKey, newId, now, oneOf, safeApiBaseUrl, text, truncate, uuid } from "./util.mjs";
 
 export const AGENT_COLUMNS =
-  "id,owner_id,name,role,signature,avatar,api_base_url,api_key_tail,model,system_prompt,context_chars,key_source,color,status,backend,qca_agent_id,qca_environment_id,stream_profile,compact_at,created_at,updated_at";
+  "id,owner_id,name,role,signature,avatar,api_base_url,api_key_tail,model,system_prompt,context_chars,key_source,color,status,backend,qca_agent_id,qca_environment_id,stream_profile,compact_at,kind,created_at,updated_at";
 
 /** 只有服务端自用：密文列永不出现在任何响应里。 */
 export const AGENT_SECRET_COLUMNS = "id,owner_id,api_key_cipher";
@@ -31,7 +31,8 @@ export const actions = {
     const rows = await db.agents.list([["owner_id", user.id]], {
       columns: AGENT_COLUMNS, order: ["created_at", { ascending: true }],
     });
-    return json({ ok: true, items: rows });
+    // 专属替身不是"你的员工"：它是你本人，列表不单列它，设置页用 standin.get 单独管。
+    return json({ ok: true, items: rows.filter((row) => row.kind !== "standin") });
   },
 
   async "agents.get"({ db, user, params }) {
