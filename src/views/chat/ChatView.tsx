@@ -1,5 +1,7 @@
 // 群聊主视图：时间线 + @ 派发输入框 + 右侧操作面板。
 // 站点 Function 不能常驻后台，所以时间片推进由这里的轮询驱动（标签页切到后台时自动停）。
+import { messageRendererFor } from "../../lib/messageRenderers";
+import "../../lib/renderers/markdown-message";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FolderIcon, MegaphoneIcon, SettingsIcon, TerminalIcon, UsersIcon, XIcon } from "lucide-react";
 import { toast } from "sonner";
@@ -477,7 +479,12 @@ function MessageRow({
             )}
           >
             <MessageImages attachments={message.attachments} />
-            <MentionText content={message.content} names={names} />
+            {(() => {
+              const renderer = messageRendererFor(message);
+              return renderer
+                ? renderer.render({ message, mentions: names })
+                : <MentionText content={message.content} names={names} />;
+            })()}
           </div>
         ) : null}
         {/* 只交了文件、正文空着的回合：气泡不渲染，交付卡片就是这条消息的全部内容。 */}

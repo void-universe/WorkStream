@@ -1,4 +1,6 @@
 // Stream 面板：群就是流。网格/列表看全局，2/4/9 格同时推进多个项目。
+import { messageRendererFor } from "../lib/messageRenderers";
+import "../lib/renderers/markdown-message";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -904,7 +906,12 @@ function PaneMessage({
             )}
           >
             <MessageImages attachments={message.attachments} dense />
-            <MentionText content={message.content} names={names} />
+            {(() => {
+              const renderer = messageRendererFor(message);
+              return renderer
+                ? renderer.render({ message, mentions: names })
+                : <MentionText content={message.content} names={names} />;
+            })()}
           </div>
         ) : null}
         {/* 监控位没有群文件抽屉可开，卡片只用来认出交付物，整块不可点。 */}
