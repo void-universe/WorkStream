@@ -1845,6 +1845,28 @@ async function main() {
     composed.promptSlots.map(([id]) => id).join(",") ===
       "identity,signature,guide,announcement,skills,history.access,memory.common,summary,transcript,memory.stream,trigger",
     { 实际: composed.promptSlots.map(([id]) => id) });
+  // 分层不该等"两轮请求撞出来"才发现（8d 是请求体那一层的兜底）：让每一块都非空，装配完当场判归位。
+  // 串层的后果是不声不响的——一个易变块混进 system，断点之后所有稳定内容连同工具声明每轮重付一遍。
+  const layerCtx = {
+    ...slotCtx,
+    steerNote: "插话：先答这一条。",
+    delegate: { name: "林", id: "00000000-0000-4000-8000-0000000000d1" },
+    cron: { name: "晨检", due_at: "2026-01-01T09:00:00+08:00", instruction: "看一眼线上告警", merged: 0 },
+  };
+  const layerBlocks = PROMPT_SECTIONS
+    .map((section) => ({ id: section.id, volatile: section.volatile, text: section.build(layerCtx) }))
+    .filter((block) => block.text);
+  const layered = composePrompt(layerCtx);
+  const misfiled = layerBlocks.filter((block) => (block.volatile
+    ? layered.system.includes(block.text) || !layered.context.includes(block.text)
+    : !layered.system.includes(block.text) || layered.context.includes(block.text)));
+  check("分层是结构性的：稳定块只进 system、易变块只进用户位快照，一块都不许串层",
+    layerBlocks.length === layered.promptSlots.length && misfiled.length === 0,
+    { 块数: layerBlocks.length, 串层: misfiled.map((block) => block.id) });
+  const volatileFlags = layered.promptSlots.map(([, , volatile]) => volatile);
+  check("发出去的槽位稳定在前、易变在后：断点之后不再有稳定内容替人重付",
+    volatileFlags.lastIndexOf(false) < volatileFlags.indexOf(true),
+    { 顺序: layered.promptSlots.map(([id]) => id).join(",") });
   check("正文逐字对得上：身份打头、触发消息收尾，块之间恰好一个空行",
     composed.text.startsWith("你是虚拟员工「小S」（角色：测试），正在 WorkStream 群「槽位群」里工作。\n\n")
     && composed.text.endsWith("上一条 @ 你的消息：安娜：@小S 干活")
