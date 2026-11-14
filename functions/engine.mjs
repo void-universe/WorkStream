@@ -9,7 +9,7 @@ import { queueDelegateMail } from "./delegate.mjs";
 import { ownerDream, queueDreaming, runDream } from "./dream.mjs";
 import { executeTool, INTERNAL_TOOL_NAMES, toolDefinitions } from "./mcp.mjs";
 import { connectorToolDefs } from "./plugins.mjs";
-import { composeAsk, composeSystemPrompt } from "./prompt.mjs";
+import { composeAsk, composePrompt } from "./prompt.mjs";
 import { open } from "./sec.mjs";
 import { insertMessage, nextSeq } from "./rooms.mjs";
 import { requireMembership } from "./perm.mjs";
@@ -714,19 +714,20 @@ async function imageParts(db, message, limit = 4) {
   return parts;
 }
 
-/** 一轮请求的上下文：正文由提示词槽位表装配（见 functions/prompt.mjs），这里只补图。
- *  连带的 promptSlots 是这一步真正落下的块与各自字符数，要进步骤轨迹——命中率掉了得能对出是哪一块动的。
+/** 一轮请求的上下文：稳定块进 system（工具声明跟着它一起可缓存），易变块进用户位的运行时快照。
+ *  两段的块序都由提示词槽位表决定（见 functions/prompt.mjs）；连带的 promptSlots 是这一步真正落下的块
+ *  与各自字符数，要进步骤轨迹——命中率掉了得能对出是哪一块动的。
  *  后端条目在这里解析一次：措辞（吃不吃工具）与传输走的是同一份判定，不能各查各的。 */
 async function buildContext({ db, agent, stream, prepared, trigger, skills, steerNote, delegate, cron }) {
   const images = await imageParts(db, trigger);
-  const { system, promptSlots } = composeSystemPrompt({
+  const { system, context, promptSlots } = composePrompt({
     agent, stream, prepared, trigger, skills, steerNote, delegate, cron, backend: backendFor(agent),
   });
   return {
     promptSlots,
     messages: [
       { role: "system", content: system },
-      { role: "user", content: composeAsk({ images }) },
+      { role: "user", content: composeAsk({ images, context }) },
     ],
   };
 }

@@ -10,7 +10,7 @@ import { executeTool, INTERNAL_TOOL_NAMES } from "../functions/mcp.mjs";
 import { connectorToolDefs } from "../functions/plugins.mjs";
 import { catchUp, clockToMs, dueOwnerIds, fireDueSchedules, nextOccurrence, upcomingOccurrences } from "../functions/cron.mjs";
 import { isUpdateAvailable } from "../functions/registries.mjs";
-import { CACHE_BREAKPOINT_ID, PROMPT_SECTIONS, composeSystemPrompt } from "../functions/prompt.mjs";
+import { CACHE_BREAKPOINT_ID, PROMPT_SECTIONS, composePrompt } from "../functions/prompt.mjs";
 import { delegateWindow } from "../functions/delegate.mjs";
 import { BACKENDS, BACKEND_IDS, DEMO_BASE_URL, backendFor, validateBackends } from "../functions/backends.mjs";
 import { LOCALE_IDS } from "../functions/locales.mjs";
@@ -114,9 +114,14 @@ function startMockUpstream() {
       res.on("error", () => {});
       const system = String(body.messages?.[0]?.content ?? "");
       // 按触发消息本身认剧本：下一轮的转录里也带着上一轮的关键词，按全文匹配会把两封混成一份。
-      const trig = String(system.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "");
+      // 触发行与排程块现在落在用户位的运行时快照里（functions/prompt.mjs），按整条消息找，不再只看 system。
+      const wireText = (body.messages ?? [])
+        .map((message) => (typeof message.content === "string" ? message.content : ""))
+        .join("\n\n");
+      const blocks = wireText.split("\n\n");
+      const trig = String(blocks.find((block) => block.startsWith("上一条 @ 你的消息")) ?? "");
       // 排程那一轮没有触发消息，按排程块认剧本：静默巡检只回空正文（正文空着才是这一轮的正当结局），其余一次说清。
-      const cronBlock = String(system.split("\n\n").find((b) => b.startsWith("这一轮是你自己的排程到点了")) ?? "");
+      const cronBlock = String(blocks.find((block) => block.startsWith("这一轮是你自己的排程到点了")) ?? "");
       // 接龙剧本（§30）认的是「谁在说话」：设定块第一句带着员工名，两个员工才能各自回敬对方。
       const speakerOf = (text) => /你是虚拟员工「(.+?)」/.exec(text)?.[1] ?? "";
       // 压缩剧本 boom 要在 SSE 头发出之前决定状态码，所以这一条单独前置。
@@ -261,7 +266,7 @@ function startMockUpstream() {
       // 这条排在下面"插话重排"之前：重跑那一轮的上下文里同时带着半截提示和这条新的触发消息，
       // 先认提示会让它秒回，就再也掐不出第二次插话。
       if (trig.includes("慢慢改")) { await say("正在慢慢改这一版，一行一行来", 140); return; }
-      if (system.includes("被 @ 你的新消息打断")) { sayFast("已按插话重排：一、准备；二、执行；三、复盘。"); return; }
+      if (wireText.includes("被 @ 你的新消息打断")) { sayFast("已按插话重排：一、准备；二、执行；三、复盘。"); return; }
       // 真人 @ 的那轮回空正文是失败（同事在等回答），和排程那一轮的"没事就不说话"是两种德性。
       if (trig.includes("空手回话")) { send({}, "stop"); finish(); return; }
       if (trig.includes("突发甲")) { sayFast("回甲已落群"); return; }
@@ -1528,16 +1533,18 @@ async function main() {
     x8bAbsorbed.every(({ rows }) => rows.length === 1 && rows[0].status === "cancelled"
       && rows[0].error === "interrupted" && rows[0].meta?.receipt === "steer" && rows[0].meta?.from_mail === x8bOrigin[0]?.id),
     x8bAbsorbed);
-  // 半截正文要能复原：重跑那一轮的系统提示里带着它，这是"模型可见的必须可复原"在插话路径上的落点。
+  // 半截正文要能复原：重跑那一轮的运行时快照里带着它，这是"模型可见的必须可复原"在插话路径上的落点。
   // 只数这一段窗口里的请求：前面那次单插话测试也留过重跑提示，全量数会把两件事算成一件事。
+  // 插话块（steer）是易变块，落在用户位的快照里，所以按整条消息找。
+  const x8bWire = (body) => (body.messages ?? []).map((m) => String(m.content ?? "")).join("\n\n");
   const x8bSteerNotes = mock.seen.slice(x8bSeenFrom)
-    .map((body) => String(body.messages?.[0]?.content ?? ""))
-    .filter((system) => system.includes("上一条回复说到一半被 @ 你的新消息打断了"));
+    .map((body) => x8bWire(body))
+    .filter((wire) => wire.includes("上一条回复说到一半被 @ 你的新消息打断了"));
   check("第 3 次插话后不再重排：上游只接到两次带半截正文的重跑请求",
     x8bSteerNotes.length === 2
-    && x8bSteerNotes.every((system) => system.includes("已输出的半截是："))
-    && x8bSteerNotes.some((system) => system.includes("正在慢慢")),
-    x8bSteerNotes.map((system) => system.slice(system.indexOf("上一条回复说到一半"), system.indexOf("请以这条插话为准") + 8)));
+    && x8bSteerNotes.every((wire) => wire.includes("已输出的半截是："))
+    && x8bSteerNotes.some((wire) => wire.includes("正在慢慢")),
+    x8bSteerNotes.map((wire) => wire.slice(wire.indexOf("上一条回复说到一半"), wire.indexOf("请以这条插话为准") + 8)));
   check("掐断的半截正文不落群：这一节里没有一句以它开头的话",
     ((await call("messages.list", { token: ana, method: "GET", body: { stream_id: streamId } })).payload.items ?? [])
       .filter((m) => m.sender_id === mockAgentId)
@@ -1567,9 +1574,10 @@ async function main() {
     body: { stream_id: streamId, content: "@小M 复述最后一条流水号", mentions: [{ type: "agent", id: mockAgentId }] },
   });
   await call("scheduler.tick", { token: ana, method: "GET" });
+  // 转录现在落在用户位的运行时快照里（functions/prompt.mjs），所以按整条消息拼起来找。
   const seenWith = (needle) => String((mock.seen
-    .filter((body) => String(body.messages?.[0]?.content ?? "").includes(needle))
-    .pop() ?? {}).messages?.[0]?.content ?? "");
+    .filter((body) => (body.messages ?? []).some((m) => String(m.content ?? "").includes(needle)))
+    .pop() ?? {}).messages?.map((m) => String(m.content ?? "")).join("\n\n") ?? "");
   const wideSystem = seenWith("复述最后一条流水号");
   check("预算够大时窗口装下全部记录（不再有条数上限把最旧的挤掉）",
     wideSystem.includes("长流水 404") && wideSystem.includes("长流水 0"), wideSystem.slice(0, 200));
@@ -1777,7 +1785,7 @@ async function main() {
     await call("scheduler.tick", { token: ana, method: "GET" });
   }
 
-  step("8d. 前缀缓存：稳定态下上一轮窗口整段可复用");
+  step("8d. 前缀缓存：稳定块逐字复用，易变块落在用户位");
   for (const word of ["前缀甲", "前缀乙"]) {
     await call("messages.send", {
       token: ana,
@@ -1785,22 +1793,30 @@ async function main() {
     });
     await call("scheduler.tick", { token: ana, method: "GET" });
   }
-  // 按「上一条 @ 你的消息」那一块认轮次：下一轮的转录里也带着上一轮的关键词，按全文匹配会两轮取到同一份。
-  const triggered = (needle) => String(mock.seen
-    .map((body) => String(body.messages?.[0]?.content ?? ""))
-    .filter((system) => (system.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "").includes(needle))
-    .pop() ?? "");
-  const [prev, curr] = [triggered("前缀甲"), triggered("前缀乙")];
-  let shared = 0;
-  while (shared < prev.length && shared < curr.length && prev[shared] === curr[shared]) shared += 1;
-  // 转录窗口之后才是每轮必变的块（本群记忆 / 触发消息），公共前缀至少要覆盖到窗口末尾。
-  const windowEnd = ["\n\n本群记忆", "\n\n上一条 @ 你的消息"]
-    .map((mark) => prev.indexOf(mark)).find((at) => at > 0) ?? prev.length;
-  check("两轮请求的公共前缀覆盖整段上一轮窗口（头部没滑动，提供商侧前缀缓存能吃下）",
-    shared >= windowEnd && windowEnd > 0,
-    { 命中率: `${((shared / curr.length) * 100).toFixed(1)}%`, 断点后: curr.slice(shared, shared + 40) });
-  check("每轮只新付本轮新增的记录与触发消息（可复用前缀 ≥95%）", shared / curr.length >= 0.95,
-    { 命中率: `${((shared / curr.length) * 100).toFixed(1)}%`, 长度: [prev.length, curr.length], 断点后: curr.slice(shared, shared + 60) });
+  // 按触发语认轮次：下一轮的转录里也带着上一轮的关键词，所以只认用户位快照里「上一条 @ 你的消息」那一行。
+  const triggeredBody = (needle) => mock.seen
+    .filter((body) => (String(body.messages?.[1]?.content ?? "").split("\n")
+      .find((line) => line.startsWith("上一条 @ 你的消息")) ?? "").includes(needle))
+    .pop();
+  const triggered = (needle) => String(triggeredBody(needle)?.messages?.[1]?.content ?? "");
+  const [prevBody, currBody] = [triggeredBody("前缀甲"), triggeredBody("前缀乙")];
+  const [prevSystem, currSystem] = [prevBody, currBody].map((body) => String(body.messages?.[0]?.content ?? ""));
+  check("两轮 system 逐字相同：工具声明之前的整段前缀可复用",
+    prevSystem.length > 0 && prevSystem === currSystem,
+    { systemLength: currSystem.length });
+  check("易变块不再落在 system 里：转录与触发消息都在用户位的运行时快照里",
+    !currSystem.includes("最近记录：") && !currSystem.includes("上一条 @ 你的消息")
+    && String(currBody.messages?.[1]?.content ?? "").includes("上一条 @ 你的消息")
+    && String(currBody.messages?.[1]?.content ?? "").includes("你的长期记忆"),
+    { userLength: String(currBody.messages?.[1]?.content ?? "").length });
+  // 服务端按「工具声明 → system → 用户位」的顺序渲染 token，所以可复用长度是 system 加工具声明，
+  // 不是线上的 JSON 前缀（JSON 里工具排在 messages 之后，用 JSON 前缀量会量成 43%）。
+  // 夹具里转录较长，稳定前缀占八成多；这条是地板，掉了说明又有每轮必变的内容挤进了 system。
+  const stableChars = currSystem.length + JSON.stringify(currBody.tools ?? []).length;
+  const wireChars = JSON.stringify(currBody).length;
+  check("稳定前缀（system + 工具声明）占整份请求体 ≥85%：每轮只新付用户位里的运行时快照",
+    stableChars / wireChars >= 0.85,
+    { 稳定占比: `${((stableChars / wireChars) * 100).toFixed(1)}%`, 稳定: stableChars, 全体: wireChars });
 
   step("8d2. 提示词槽位表：位置是从表里领的号，缓存断点写在表里");
   check("槽位 id 唯一、都有整数 order 和 build（重复 id 会静默覆盖，重复 order 让顺序取决于插入先后）",
@@ -1824,18 +1840,18 @@ async function main() {
     steerNote: "",
     backend: backendFor({ backend: "openai" }),
   };
-  const composed = composeSystemPrompt(slotCtx);
+  const composed = composePrompt(slotCtx);
   check("落下的槽位与顺序按表分配（这一份夹具应当是这十一个块）",
     composed.promptSlots.map(([id]) => id).join(",") ===
       "identity,signature,guide,announcement,skills,history.access,memory.common,summary,transcript,memory.stream,trigger",
     { 实际: composed.promptSlots.map(([id]) => id) });
   check("正文逐字对得上：身份打头、触发消息收尾，块之间恰好一个空行",
-    composed.system.startsWith("你是虚拟员工「小S」（角色：测试），正在 WorkStream 群「槽位群」里工作。\n\n")
-    && composed.system.endsWith("上一条 @ 你的消息：安娜：@小S 干活")
-    && !composed.system.includes("\n\n\n")
-    && composed.system.split("\n\n").length === composed.promptSlots.length,
-    { 字符数: composed.system.length });
-  const trimmed = composeSystemPrompt({
+    composed.text.startsWith("你是虚拟员工「小S」（角色：测试），正在 WorkStream 群「槽位群」里工作。\n\n")
+    && composed.text.endsWith("上一条 @ 你的消息：安娜：@小S 干活")
+    && !composed.text.includes("\n\n\n")
+    && composed.text.split("\n\n").length === composed.promptSlots.length,
+    { 字符数: composed.text.length });
+  const trimmed = composePrompt({
     ...slotCtx,
     agent: { ...slotCtx.agent, signature: "", system_prompt: "" },
     stream: { ...slotCtx.stream, announcement: "" },
@@ -1844,20 +1860,20 @@ async function main() {
   });
   check("没有内容的槽位不落块，也不在正文里留下空段",
     trimmed.promptSlots.map(([id]) => id).join(",") === "identity,history.access,transcript,trigger"
-    && trimmed.system.split("\n\n").length === 4 && !trimmed.system.includes("\n\n\n"),
+    && trimmed.text.split("\n\n").length === 4 && !trimmed.text.includes("\n\n\n"),
     { 实际: trimmed.promptSlots.map(([id]) => id) });
-  const clouded = composeSystemPrompt({ ...slotCtx, agent: { ...slotCtx.agent, backend: "qca" }, backend: backendFor({ backend: "qca" }) });
+  const clouded = composePrompt({ ...slotCtx, agent: { ...slotCtx.agent, backend: "qca" }, backend: backendFor({ backend: "qca" }) });
   check("云端通道只多一块云端须知、只换这两处措辞，其余块和它们的顺序照旧",
     clouded.promptSlots.map(([id]) => id).filter((id) => id !== "backend.tools").join(",")
       === composed.promptSlots.map(([id]) => id).join(",")
-    && clouded.system.includes("本次由云端 Agent 作答")
-    && clouded.system.includes("由 WorkStream 侧补给你")
-    && !clouded.system.includes("需要时用 set_signature 更新"),
+    && clouded.text.includes("本次由云端 Agent 作答")
+    && clouded.text.includes("由 WorkStream 侧补给你")
+    && !clouded.text.includes("需要时用 set_signature 更新"),
     { 云端槽位: clouded.promptSlots.map(([id]) => id) });
   check("对照：自建端点那一份仍然是本地措辞（不是所有员工都被当成云端）",
-    composed.system.includes("调用 search_history / read_window 工具")
-    && composed.system.includes("需要时用 set_signature 更新")
-    && !composed.system.includes("本次由云端 Agent 作答"), {});
+    composed.text.includes("调用 search_history / read_window 工具")
+    && composed.text.includes("需要时用 set_signature 更新")
+    && !composed.text.includes("本次由云端 Agent 作答"), {});
   step("8d3. 后端清单：这条通道吃不吃工具是字段，不是注释");
   check("五条通道的能力位都在表上，只有不吃工具的那两条带措辞",
     BACKENDS.map((entry) => entry.id).join(",") === "openai,demo,qca,stream,stream-dedicated"
@@ -1925,12 +1941,12 @@ async function main() {
     unknownBackend = error;
   }
   check("列里出现清单没有的值就地抛，不静默按自建处理", unknownBackend?.code === "unknown_backend", unknownBackend?.code);
-  const demoComposed = composeSystemPrompt({ ...slotCtx, backend: backendFor({ backend: "openai", api_base_url: DEMO_BASE_URL }) });
+  const demoComposed = composePrompt({ ...slotCtx, backend: backendFor({ backend: "openai", api_base_url: DEMO_BASE_URL }) });
   check("演示通道吃工具：它拿的是本地那一套措辞（能力位不是按地址划的）",
     demoComposed.promptSlots.map(([id]) => id).join(",") === composed.promptSlots.map(([id]) => id).join(",")
-    && demoComposed.system.includes("按需调用对应工具") && !demoComposed.system.includes("本次由云端 Agent 作答"),
+    && demoComposed.text.includes("按需调用对应工具") && !demoComposed.text.includes("本次由云端 Agent 作答"),
     demoComposed.promptSlots.map(([id]) => id));
-  const ownedSlots = composeSystemPrompt({
+  const ownedSlots = composePrompt({
     ...slotCtx,
     prepared: { ...slotCtx.prepared, owner: "跨群结论：甲那边数字是 3（哨标DREAMBLOCK）" },
   });
@@ -4011,13 +4027,13 @@ async function main() {
   });
   check("单独启用的那个群会落任务", dSendLocal.payload.delegated?.[0]?.active === true, dSendLocal.payload);
 
-  const withDelegate = composeSystemPrompt({ ...slotCtx, delegate: { name: "林", id: linId } });
+  const withDelegate = composePrompt({ ...slotCtx, delegate: { name: "林", id: linId } });
   check("替身这一轮单独成一块，位置在本群记忆之后、触发消息之前",
     withDelegate.promptSlots.map(([id]) => id).join(",")
       === "identity,signature,guide,announcement,skills,history.access,memory.common,summary,transcript,memory.stream,delegate,trigger",
     withDelegate.promptSlots.map(([id]) => id));
   check("这块要求替身自报是替身，且不冒充本人、不替本人承诺",
-    withDelegate.system.includes("你是「林」的替身") && withDelegate.system.includes("不要冒充 ta 本人"));
+    withDelegate.text.includes("你是「林」的替身") && withDelegate.text.includes("不要冒充 ta 本人"));
   check("替身块标注为易变：它不会打断平时接活的那段前缀",
     PROMPT_SECTIONS.find((section) => section.id === "delegate")?.volatile === true);
   check("不是替身的那一轮不落这一块", !composed.promptSlots.some(([id]) => id === "delegate"));
@@ -4202,12 +4218,14 @@ async function main() {
     Date.parse(morningRow?.next_run_at ?? 0) > Date.now() && morningRow?.last_run_at === firedMail?.meta?.cron?.due_at, morningRow);
   check("合并掉的三个对点全记进合并计数：界面上要能看出这一轮替我少发了几条",
     morningRow?.merged_runs === 3, morningRow?.merged_runs);
-  const morningSeen = cronMock.seen.filter((body) => String(body.messages?.[0]?.content ?? "").includes("看一眼线上告警"));
+  // 排程块在用户位的运行时快照里（functions/prompt.mjs），按整条消息找。
+  const morningWire = (body) => (body?.messages ?? []).map((m) => String(m.content ?? "")).join("\n\n");
+  const morningSeen = cronMock.seen.filter((body) => morningWire(body).includes("看一眼线上告警"));
   check("上游确实收到排程块：排程名、合并数与要办的事都进了提示词",
-    morningSeen.length === 1 && String(morningSeen[0].messages[0].content).includes("合并了 3 个")
-      && String(morningSeen[0].messages[0].content).includes("看一眼线上告警"), morningSeen.length);
+    morningSeen.length === 1 && morningWire(morningSeen[0]).includes("合并了 3 个")
+      && morningWire(morningSeen[0]).includes("看一眼线上告警"), morningSeen.length);
   check("排程那一轮没有原始消息，触发块如实说明是谁醒的，不谎称补发任务",
-    String(morningSeen[0]?.messages?.[0]?.content ?? "").includes("没有人 @ 你，这一轮是你自己的排程醒的"));
+    morningWire(morningSeen[0]).includes("没有人 @ 你，这一轮是你自己的排程醒的"));
   const patrol = ((await call("messages.list", { token: ana, method: "GET", body: { stream_id: cronStreamId } })).payload.items ?? [])
     .find((m) => m.sender_id === cronAgentId);
   check("巡检结果落进群", String(patrol?.content).includes("排程巡检"), patrol);
@@ -4405,7 +4423,7 @@ async function main() {
   check("自己停掉的排程时钟写空：界面上一条暂停的排程不该装作还在跑",
     (await db.schedules.byId(morningId))?.next_run_at === null, await db.schedules.byId(morningId));
 
-  const withCron = composeSystemPrompt({
+  const withCron = composePrompt({
     ...slotCtx,
     cron: { name: "晨间巡检", due_at: "2026-01-12T01:00:00.000Z", instruction: "看一眼线上告警", merged: 3 },
   });
@@ -4414,10 +4432,10 @@ async function main() {
       === "identity,signature,guide,announcement,skills,history.access,memory.common,summary,transcript,memory.stream,cron,trigger",
     withCron.promptSlots.map(([id]) => id));
   check("这块把合并数与要办的事都写进去，并允许这一轮留空正文",
-    withCron.system.includes("合并了 3 个") && withCron.system.includes("看一眼线上告警")
-      && withCron.system.includes("正文留空即可"), withCron.system.slice(0, 400));
+    withCron.text.includes("合并了 3 个") && withCron.text.includes("看一眼线上告警")
+      && withCron.text.includes("正文留空即可"), withCron.text.slice(0, 400));
   check("这块说清正就是那条群消息：不许再补发一条把同一件事念两遍",
-    withCron.system.includes("正文会直接进群") && withCron.system.includes("别再补发一条"));
+    withCron.text.includes("正文会直接进群") && withCron.text.includes("别再补发一条"));
   check("排程块标注为易变：它不该打断员工平时接活的那段前缀",
     PROMPT_SECTIONS.find((section) => section.id === "cron")?.volatile === true);
   check("不是排程的那一轮不落这一块", !composed.promptSlots.some(([id]) => id === "cron"));
@@ -4741,14 +4759,16 @@ async function main() {
     await call("scheduler.tick", { token: ana, method: "GET" });
     x29Carried = x29Mock.seen.find((body) => {
       // 认触发块而不是整句：主人显示名在这个群里是别的写法，硬抄上一节的「安娜：」会永远匹配不上。
-      const system = String(body.messages?.[0]?.content ?? "");
-      return (system.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "").includes("@小D 全局记忆进提示词了吗");
+      // 触发行在用户位的运行时快照里（functions/prompt.mjs），所以按整条消息找。
+      const wire = (body.messages ?? []).map((message) => String(message.content ?? "")).join("\n\n");
+      return (wire.split("\n\n").find((b) => b.startsWith("上一条 @ 你的消息")) ?? "").includes("@小D 全局记忆进提示词了吗");
     });
   }
+  const x29Wire = String(x29Carried?.messages?.map((message) => String(message.content ?? "")).join("\n\n") ?? "");
   check("归并出来的全局记忆下一轮就被装配：模型可见的必须能从这一轮的请求里看见",
-    String(x29Carried?.messages?.[0]?.content).includes("我的全局记忆"), {
+    x29Wire.includes("我的全局记忆"), {
       触发: x29NextRound.payload.ok,
-      块: String(x29Carried?.messages?.[0]?.content).slice(0, 120),
+      块: x29Wire.slice(0, 120),
       最近请求: x29Mock.seen.slice(-3).map((body) => String(body.messages?.[0]?.content ?? "").slice(-90)),
     });
 
@@ -5833,17 +5853,17 @@ async function main() {
       && backendFor({ backend: "stream", stream_profile: SHARED_PROFILE }).caps.tools === true
       && backendFor({ backend: "stream", stream_profile: "openai" }).caps.tools === true,
     BACKENDS.filter((entry) => entry.transport === "stream").map((entry) => [entry.id, entry.caps.tools]));
-  const x32DedPrompt = composeSystemPrompt({ ...slotCtx, backend: backendFor({ backend: "stream", stream_profile: "dedicated" }) });
-  const x32SharedPrompt = composeSystemPrompt({ ...slotCtx, backend: backendFor({ backend: "stream", stream_profile: SHARED_PROFILE }) });
+  const x32DedPrompt = composePrompt({ ...slotCtx, backend: backendFor({ backend: "stream", stream_profile: "dedicated" }) });
+  const x32SharedPrompt = composePrompt({ ...slotCtx, backend: backendFor({ backend: "stream", stream_profile: SHARED_PROFILE }) });
   check("专属档的措辞说清群工具调不到，不叫它照着技能说明假执行",
-    x32DedPrompt.system.includes("本次由这台 server 上的专属员工作答")
-      && x32DedPrompt.system.includes("请把结论直接写进正文")
-      && !x32DedPrompt.system.includes("按需调用对应工具")
-      && !x32DedPrompt.system.includes("调用 search_history / read_window 工具"), x32DedPrompt.system.slice(0, 220));
+    x32DedPrompt.text.includes("本次由这台 server 上的专属员工作答")
+      && x32DedPrompt.text.includes("请把结论直接写进正文")
+      && !x32DedPrompt.text.includes("按需调用对应工具")
+      && !x32DedPrompt.text.includes("调用 search_history / read_window 工具"), x32DedPrompt.text.slice(0, 220));
   check("对照：分时那一档照旧带工具说明（抑制只写在不吃工具的那一档上）",
-    x32SharedPrompt.system.includes("按需调用对应工具")
-      && x32SharedPrompt.system.includes("调用 search_history / read_window 工具")
-      && !x32SharedPrompt.system.includes("本次由这台 server 上的专属员工作答"), x32SharedPrompt.system.slice(0, 220));
+    x32SharedPrompt.text.includes("按需调用对应工具")
+      && x32SharedPrompt.text.includes("调用 search_history / read_window 工具")
+      && !x32SharedPrompt.text.includes("本次由这台 server 上的专属员工作答"), x32SharedPrompt.text.slice(0, 220));
 
   const x32DedRoom = await call("streams.create", { token: ana, body: { name: "专属隔离组", agent_ids: [x32DedId] } });
   const x32DedRoomId = x32DedRoom.payload.stream?.id;

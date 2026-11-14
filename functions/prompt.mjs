@@ -1,15 +1,20 @@
-// 提示词槽位表：虚拟员工每一轮看到的那段 system 正文在这里装配。
+// 提示词槽位表：虚拟员工每一轮看到的内容在这里装配，分两层落地。
 //
-// 为什么要一张表而不是在 engine 里往下 push：块序即缓存序。提供商侧的前缀缓存按「从头开始最长匹配」
-// 命中，一个每轮都变的块排在中间，它后面的所有内容每轮都要重新付一次钱。所以位置是被分配的资源，
-// 必须由 volatile（这一轮会不会变）+ order（同一档内的先后）两个字段决定，不能由代码行的先后决定——
+// 为什么分两层：提供商侧的前缀缓存按「从头开始最长匹配」命中，而工具声明（这本仓库里是 20 个 schema）
+// 在请求体里排在 messages 之后、在服务端渲染的 token 序里也一样。只要 messages 里有一处每轮都变的内容，
+// 它后面的整段工具声明就每轮重新计费。所以"每轮会变的块"不能待在 system 里，要落到用户位那条消息上
+// （对应 deepseek-harness 的做法：稳定段成为提示词文本，动态上下文成为带来源的 user 角色快照），
+// system 只留稳态下逐字不变的块，让 tools 落进可复用前缀。
+//
+// 为什么要一张表而不是在 engine 里往下 push：块序即缓存序，位置是被分配的资源，必须由
+// volatile（这一轮会不会变）+ order（同一档内的先后）两个字段决定，不能由代码行的先后决定——
 // 后者会让"顺手加一块"变成一次悄无声息的缓存退化。
 //
 // volatile 的判定口径：同一(员工,群)连续两轮之间会变的块。长期记忆在追加、摘要在压、转录在长、
-// 本群记忆在写、触发消息每轮都换、插话提示只在被打断的那轮出现，所以它们都在断点之后。
-// 身份、签名、守则、公告、技能、取史说明、全局记忆在稳态下不变（全局记忆只在归并落地那一次变），排在断点之前；
+// 本群记忆在写、触发消息每轮都换、插话提示只在被打断的那轮出现，所以它们都在断点之后，进用户位。
+// 身份、签名、守则、公告、技能、取史说明、全局记忆在稳态下不变（全局记忆只在归并落地那一次变），留在 system；
 // 它们偶尔会变（改签名、装技能、并过一次梦），那种轮次付一次断点，是产品能接受的。
-// 这条不变量由 dev/smoke.mjs 的 8d 兜住：两轮请求的公共前缀必须覆盖整段上一轮窗口，且可复用 ≥95%。
+// 这条不变量由 dev/smoke.mjs 的 8d 兜住：两轮 system 必须逐字相同，整份请求体的可复用前缀 ≥95%。
 import { imageMark, renderTranscript } from "./transcript.mjs";
 
 // 内容块的抬头：装配用它拼出每一块的正文。
@@ -169,7 +174,7 @@ export const PROMPT_SECTIONS = [
   }
 }
 
-/** 缓存断点：第一个易变块。它之前的一切在稳态下逐字复用，它之后的每轮重写。 */
+/** 缓存断点：第一个易变块。它之前的块留在 system 里逐字复用，它之后的块每轮写进用户位。 */
 export const CACHE_BREAKPOINT_ID = PROMPT_SECTIONS
   .slice()
   .sort((a, b) => Number(a.volatile) - Number(b.volatile) || a.order - b.order)
@@ -179,29 +184,40 @@ const ORDERED = PROMPT_SECTIONS
   .slice()
   .sort((a, b) => Number(a.volatile) - Number(b.volatile) || a.order - b.order);
 
+/** 用户位那段上下文快照的抬头：说清它不是用户在说话，模型才不会把它当成新的指令。 */
+const CONTEXT_HEADER = "以下是 WorkStream 提供的本轮运行时上下文（不是用户原话）：";
+const ASK = "请按上面的上下文回应这条任务。";
+
 /**
- * 装配 system 正文。返回的 `promptSlots` 是这一步实际落下的块，按发出顺序给出
- * `[槽位 id, 字符数, 是否每轮重写]`——只记口径不记正文（正文里大半是群里本来就能翻的转录），
- * 命中率掉了就靠它对出断点动到了哪一块。
+ * 装配一轮的两段正文：`system` 是稳定块（逐字复用，工具声明跟在它后面，一起进可缓存前缀），
+ * `context` 是易变块（每轮写进用户位）。`text` 是两段按块序拼回来的全文，只给对账用。
+ * `promptSlots` 是这一步实际落下的块，按发出顺序给出 `[槽位 id, 字符数, 是否每轮重写]`——
+ * 只记口径不记正文（正文里大半是群里本来就能翻的转录），命中率掉了就靠它对出断点动到了哪一块。
  */
-export function composeSystemPrompt(ctx) {
-  const blocks = [];
+export function composePrompt(ctx) {
+  const stable = [];
+  const volatile = [];
   for (const section of ORDERED) {
     const text = section.build(ctx);
     if (!text) continue;
-    blocks.push({ id: section.id, volatile: section.volatile, text });
+    (section.volatile ? volatile : stable).push({ id: section.id, volatile: section.volatile, text });
   }
+  const system = stable.map((block) => block.text).join("\n\n");
+  const context = volatile.map((block) => block.text).join("\n\n");
   return {
-    system: blocks.map((block) => block.text).join("\n\n"),
-    promptSlots: blocks.map((block) => [block.id, block.text.length, block.volatile]),
+    system,
+    context,
+    text: [system, context].filter(Boolean).join("\n\n"),
+    promptSlots: [...stable, ...volatile].map((block) => [block.id, block.text.length, block.volatile]),
   };
 }
 
-/** 用户位：带图的那一轮把图直接给模型，正文只多一句说明。 */
-export function composeAsk({ images = [] }) {
-  if (!images.length) return "请按上面的上下文回应这条任务。";
-  return [
-    { type: "text", text: "请按上面的上下文回应这条任务。这条消息附有图片，图像内容在下面直接给你，需要时描述或据此行动。" },
-    ...images,
-  ];
+/** 用户位：易变块先按块序铺开，再跟上这一轮的提问；带图的那一轮把图直接给模型。 */
+export function composeAsk({ images = [], context = "" } = {}) {
+  const head = context ? `${CONTEXT_HEADER}\n\n${context}` : "";
+  const ask = images.length
+    ? `${ASK}这条消息附有图片，图像内容在下面直接给你，需要时描述或据此行动。`
+    : ASK;
+  const text = head ? `${head}\n\n${ask}` : ask;
+  return images.length ? [{ type: "text", text }, ...images] : text;
 }

@@ -677,7 +677,10 @@ async function readUpstreamStream(stream, { onInterrupt, onDelta = null, started
 function demoComplete({ messages, tools, summary, lang, window }) {
   const copy = demoCopy(lang);
   const last = [...messages].reverse().find((m) => m.role === "user");
-  const prompt = String(last?.content ?? "");
+  // 用户位现在是一段运行时上下文快照（functions/prompt.mjs）：易变块在前、提问在后。
+  // 演示模型要"读的那句话"是快照里的触发行，不是整段快照——否则它会照着上下文抬头敷衍一句。
+  const raw = String(last?.content ?? "");
+  const prompt = raw.split("\n").find((line) => line.startsWith("上一条 @ 你的消息")) ?? raw;
   const wantsTool = Boolean(tools?.length) && /查|history|之前|上文|历史|文件/.test(prompt);
   if (wantsTool) {
     const search = tools.find((t) => t.type === "function" && t.function?.name === "search_history");
