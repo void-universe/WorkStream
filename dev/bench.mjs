@@ -121,7 +121,11 @@ function startUpstream({ chunkMs = 8, pieces = 4, slowChunks = 100, slowChunkMs 
         return;
       }
       const system = String(body.messages?.[0]?.content ?? "");
-      const trigger = triggerOf(system);
+      // 易变块现在落在用户位的运行时快照里（functions/prompt.mjs）：剧本按整条请求认，不再只看 system。
+      const wire = (body.messages ?? [])
+        .map((message) => (typeof message.content === "string" ? message.content : ""))
+        .join("\n\n");
+      const trigger = triggerOf(wire);
       const record = {
         at: Date.now(),
         firstByteAt: 0,
@@ -130,6 +134,7 @@ function startUpstream({ chunkMs = 8, pieces = 4, slowChunks = 100, slowChunkMs 
         agent: /你是虚拟员工「([^」]+)」/.exec(system)?.[1] ?? "",
         stream: /WorkStream 群「([^」]+)」/.exec(system)?.[1] ?? "",
         system,
+        wire,
         trigger,
         marker: markerOf(trigger),
         reply: "",
@@ -378,17 +383,17 @@ async function runBurst({ upstream, budget, streamCount, rounds, label }) {
     const name = `压测群${i}`;
     const mine = calls.filter((call) => call.stream === name).sort((a, b) => a.at - b.at);
     mine.forEach((call, k) => {
-      if (k > 0 && !call.system.includes(`已处理 ${marker(i, k)}`)) fifoBreaks.push({ 群: i, 第几次: k + 1 });
+      if (k > 0 && !call.wire.includes(`已处理 ${marker(i, k)}`)) fifoBreaks.push({ 群: i, 第几次: k + 1 });
       if (k > 0 && call.at < mine[k - 1].endAt) pairOverlaps.push({ 群: i, 第几次: k + 1 });
       if (k > 0) {
-        const prev = mine[k - 1].system;
+        const prev = mine[k - 1].wire;
         let shared = 0;
-        while (shared < prev.length && shared < call.system.length && prev[shared] === call.system[shared]) shared += 1;
-        prefixRatios.push(shared / call.system.length);
+        while (shared < prev.length && shared < call.wire.length && prev[shared] === call.wire[shared]) shared += 1;
+        prefixRatios.push(shared / call.wire.length);
       }
     });
     // 上下文里出现别的群的标记 = 串群（窗口取错群、或装配把两群混在一起）。
-    const seen = new Set(mine.flatMap((call) => call.system.match(/S\d+T\d+/g) ?? [])
+    const seen = new Set(mine.flatMap((call) => call.wire.match(/S\d+T\d+/g) ?? [])
       .map((mark) => Number(/^S(\d+)/.exec(mark)[1])));
     if ([...seen].some((index) => index !== i)) leaks.push({ 群: i, 混入: [...seen] });
     const texts = (await world.messages(streams[i].id))
@@ -619,7 +624,7 @@ async function preemptScenario(upstream) {
       { 落群: reply.content });
     const rerun = upstream.calls.filter((call) => call.stream === stream.name).at(-1);
     check(`B2：插话 ${stream.name} 的重答上下文带着半截输出与新指令`,
-      rerun.system.includes("被 @ 你的新消息打断") && rerun.system.includes("慢写正文"),
+      rerun.wire.includes("被 @ 你的新消息打断") && rerun.wire.includes("慢写正文"),
       { 触发: rerun.trigger });
   }
   check("B2：插话都在 500ms 内掐断上游", Math.max(...steerLatency) < 500, steerLatency);
@@ -699,7 +704,7 @@ async function relayScenario(upstream) {
 
   const relayCalls = calls.filter((call) => call.trigger.includes("接力")).sort((a, b) => a.at - b.at);
   const missing = relayCalls.filter((call, k) => k > 0
-    && !new RegExp(`\\[虚拟\\] .*接力-${k + 1}`).test(transcriptOf(call.system)));
+    && !new RegExp(`\\[虚拟\\] .*接力-${k + 1}`).test(transcriptOf(call.wire)));
   check("B3：每一棒的上下文里都带着上一棒的回复（承接不断档）",
     relayCalls.length === 3 && missing.length === 0,
     missing.map((call) => ({ 员工: call.agent, 触发: call.trigger })));
