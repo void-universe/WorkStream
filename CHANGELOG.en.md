@@ -1,6 +1,12 @@
 # CHANGELOG
 
-A version number only holds at the moment a tag is cut: `package.json` is currently `0.1.2`, the newest tag is `v0.1.2`, so the first section below is called **0.1.2 (1.0.0 candidate)** -- it records the capabilities already merged into `main` and already pinned into `npm run qa`. The source of truth for feature behavior itself remains [docs/guide.en.md](docs/guide.en.md) and [docs/arch/scheduler.en.md](docs/arch/scheduler.en.md); this file only records "which merge brought what" and "what is still missing", without copying a second manual.
+A version number only holds at the moment a tag is cut: `package.json` is currently `0.1.3`, the newest tag is `v0.1.3`, so the first section below is called **0.1.3 (1.0.0 candidate)** -- it records the capabilities already merged into `main` and already pinned into `npm run qa`. The source of truth for feature behavior itself remains [docs/guide.en.md](docs/guide.en.md) and [docs/arch/scheduler.en.md](docs/arch/scheduler.en.md); this file only records "which merge brought what" and "what is still missing", without copying a second manual.
+
+## 0.1.3 (1.0.0 candidate)
+
+- Self-check floor: `npm run qa` **1091 checks, 0 failures** (the count follows the final summary line; the floor is recorded in [AGENTS.md](AGENTS.md) and may only go up, never down).
+- The prompt is assembled on two surfaces: the system message carries only the blocks that stay byte-identical between rounds, and the blocks that change every round (memory, summary, transcript, notes, delegate, schedule, trigger, steer) compose a runtime snapshot in the user position. The provider renders the tool declarations after the system text, so one earlier break made all 20 schemas (about 1920 tokens) miss every round. Measured on real DeepSeek traffic: **41-48% before, 95-96% after**; the same-body control gives 45.9% with the volatile block at the end of the system text versus 94.9% with it in the user snapshot, and first token moved from 600-1230ms to 383-836ms. The arrangement is described in 5.1 of [docs/arch/scheduler.en.md](docs/arch/scheduler.en.md) and the finding is recorded as P12 in 6.2.
+- Two assembly-time gates join the request-level one: with every block non-empty, a stable block may only appear in the system message and a volatile block only in the user snapshot, and the emitted slots must be stable-first. Smoke 8d still pins the request-level fact (two rounds' system messages byte-identical, stable prefix at least 85% of the body), so a mislaid block now reports at assembly as well as on the second round.
 
 ## 0.1.2 (1.0.0 candidate)
 
