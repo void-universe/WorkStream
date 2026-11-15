@@ -12,6 +12,7 @@ import { actions as registries } from "./registries.mjs";
 import { actions as rooms } from "./rooms.mjs";
 import { actions as servers } from "./servers.mjs";
 import { bindEnv, readEnv, smtpEndpoint } from "./runtime.mjs";
+import { createThrottle } from "./throttle.mjs";
 import { actions as skills } from "./skills.mjs";
 import { actions as standin } from "./standin.mjs";
 import { actions as cost } from "./cost.mjs";
@@ -54,13 +55,20 @@ async function storagePresent() {
 
 export function makeHandler({ env }) {
   bindEnv(env);
+  // 登录失败计数按 handler 一份（进程内），阈值走环境变量：默认 10 次 / 5 分钟。
+  const throttle = createThrottle({
+    max: Number(readEnv("WORKSTREAM_LOGIN_MAX_FAILS")) || 10,
+    windowMs: Number(readEnv("WORKSTREAM_LOGIN_WINDOW_MS")) || 300_000,
+  });
   return async function handleApp({ request, supabase }) {
     const url = new URL(request.url);
     const action = text(url.searchParams.get("action") ?? routeFromPath(url.pathname), {
       max: 48, name: "action", required: false,
     });
     const db = store(supabase);
-    const context = { request, supabase, db, env, params: url.searchParams, user: null, session: null };
+    const context = {
+      request, supabase, db, env, params: url.searchParams, user: null, session: null, throttle,
+    };
 
     if (!action) return fail("missing_action", 400);
     if (action === "mcp") {
@@ -103,7 +111,7 @@ export function makeHandler({ env }) {
 function respond(error) {
   if (error instanceof Halt) {
     const extra = error.status >= 500 ? {} : error.detail ?? {};
-    return fail(error.error, error.status, extra);
+    return fail(error.error, error.status, extra, error.headers ?? {});
   }
   // 未分类异常统一收敛为稳定错误码，不回显堆栈或上游原文。
   return fail("server_error", 500);

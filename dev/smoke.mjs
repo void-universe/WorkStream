@@ -33,6 +33,7 @@ import { demoCopy, systemCopy } from "../functions/copy.mjs";
 import { parseTranscript, renderTranscript } from "../functions/transcript.mjs";
 import { Interrupted, newId, now } from "../functions/util.mjs";
 import { createFixtureClient } from "./fixture-supabase.mjs";
+import { wireOf } from "./wire.mjs";
 import { fileRenderers, registerFileRenderer, renderGroupFile } from "../src/lib/renderers/index.mjs";
 import { hitRateOf, newUsage, tallyUsage } from "../src/lib/usageStats.mjs";
 
@@ -115,9 +116,7 @@ function startMockUpstream() {
       const system = String(body.messages?.[0]?.content ?? "");
       // 按触发消息本身认剧本：下一轮的转录里也带着上一轮的关键词，按全文匹配会把两封混成一份。
       // 触发行与排程块现在落在用户位的运行时快照里（functions/prompt.mjs），按整条消息找，不再只看 system。
-      const wireText = (body.messages ?? [])
-        .map((message) => (typeof message.content === "string" ? message.content : ""))
-        .join("\n\n");
+      const wireText = wireOf(body);
       const blocks = wireText.split("\n\n");
       const trig = String(blocks.find((block) => block.startsWith("上一条 @ 你的消息")) ?? "");
       // 排程那一轮没有触发消息，按排程块认剧本：静默巡检只回空正文（正文空着才是这一轮的正当结局），其余一次说清。
@@ -6333,6 +6332,60 @@ async function main() {
       after.payload.items?.find((item) => item.id === agent.payload.agent.id)?.api_base_url === boxSrv.origin);
     await boxSrv.close();
   }
+
+  step("8f. 并发与限流：同一群 20 路同时写不丢，登录连续失败会被挡住");
+  const burstAgent = await call("agents.create", {
+    token: ana,
+    body: {
+      name: "并发员", role: "并发", backend: "openai",
+      api_base_url: "demo://local", api_key: "concurrency-key-1", model: "demo",
+    },
+  });
+  const burstStream = await call("streams.create", {
+    token: ana, body: { name: "并发群", agent_ids: [burstAgent.payload.agent.id] },
+  });
+  const burstSends = await Promise.all(Array.from({ length: 20 }, (_, i) => call("messages.send", {
+    token: ana,
+    body: {
+      stream_id: burstStream.payload.stream.id,
+      content: `@并发员 并发第 ${i + 1} 条`,
+      mentions: [{ type: "agent", id: burstAgent.payload.agent.id }],
+    },
+  })));
+  check("20 路同时写同一个群：全部落库（序号争用按预算重试，不再 503）",
+    burstSends.every((row) => row.status === 200 && row.payload.queued?.length === 1),
+    burstSends.map((row) => `${row.status}:${row.payload.error ?? "ok"}`));
+  const burstItems = (await call("messages.list", {
+    token: ana, method: "GET", body: { stream_id: burstStream.payload.stream.id },
+  })).payload.items ?? [];
+  check("并发写的序号唯一：CAS 没有发出重号",
+    new Set(burstItems.map((row) => row.seq)).size === burstItems.length, burstItems.length);
+  for (let round = 0; round < 45; round += 1) {
+    const tick = await call("scheduler.tick", { token: ana, method: "GET" });
+    if ((tick.payload.ran ?? []).length === 0 && (tick.payload.queued ?? 0) === 0) break;
+  }
+
+  // 单独一个 handler 把阈值降到 3 次，免得影响其他小节里真实的错误口令用例。
+  const strictLogin = makeHandler({
+    env: (name) => (name === "WORKSTREAM_LOGIN_MAX_FAILS" ? "3" : undefined),
+  });
+  const attempt = async () => {
+    const request = new Request("http://local/functions/v1/app?action=auth.login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "throttle@example.com", password: "wrong-password" }),
+    });
+    const response = await strictLogin({ request, supabase });
+    const payload = await response.json().catch(() => ({}));
+    return { status: response.status, retryAfter: response.headers.get("retry-after"), ...payload };
+  };
+  const attempts = [];
+  for (let i = 0; i < 4; i += 1) attempts.push(await attempt());
+  check("同一 (IP, 账号) 连错 3 次之后第 4 次直接 429，并给出 Retry-After",
+    attempts.slice(0, 3).every((row) => row.status === 401 && row.error === "bad_credentials")
+    && attempts[3].status === 429 && attempts[3].error === "too_many_attempts"
+    && Number(attempts[3].retryAfter) >= 1,
+    attempts.map((row) => `${row.status}:${row.error ?? ""}`));
 
   console.log(`\n结果：${passed} 项通过，${failures.length} 项失败`);
   if (failures.length) {

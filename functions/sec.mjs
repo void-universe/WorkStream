@@ -1,10 +1,19 @@
 // 口令散列、会话令牌、以及静态加密（虚拟员工 API Key、虚拟机凭据）。
 import { Halt, b64ToBytes, bytesToB64, newId, now, randomHex, sha256Hex } from "./util.mjs";
+import { readEnv } from "./runtime.mjs";
 
-const PBKDF2_ITERATIONS = 150_000;
+const DEFAULT_PBKDF2_ITERATIONS = 150_000;
 const WORKSPACE_STATE_ID = "00000000-0000-4000-8000-000000000001";
 
-async function deriveKey(password, saltHex, iterations = PBKDF2_ITERATIONS) {
+/** 轮数是与部署相关的成本旋钮（15 万轮本机约 90ms CPU），可用环境变量调；区间外落回默认。 */
+export function pbkdf2Iterations() {
+  const raw = Number(readEnv("WORKSTREAM_PBKDF2_ITERATIONS"));
+  if (!Number.isFinite(raw)) return DEFAULT_PBKDF2_ITERATIONS;
+  const rounded = Math.floor(raw);
+  return rounded >= 10_000 && rounded <= 1_000_000 ? rounded : DEFAULT_PBKDF2_ITERATIONS;
+}
+
+async function deriveKey(password, saltHex, iterations = DEFAULT_PBKDF2_ITERATIONS) {
   const material = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(password),
@@ -35,14 +44,15 @@ const bytesToHex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, "
 
 export async function hashPassword(password) {
   const salt = randomHex(16);
-  const derived = await deriveKey(password, salt);
-  return { salt, hash: derived, iterations: PBKDF2_ITERATIONS };
+  const iterations = pbkdf2Iterations();
+  const derived = await deriveKey(password, salt, iterations);
+  return { salt, hash: derived, iterations };
 }
 
 export async function verifyPassword(password, record) {
   const salt = record?.salt ?? record?.password_salt;
   const stored = record?.hash ?? record?.password_hash;
-  const iterations = record?.iterations ?? record?.password_iterations ?? PBKDF2_ITERATIONS;
+  const iterations = record?.iterations ?? record?.password_iterations ?? pbkdf2Iterations();
   if (!salt || !stored) return false;
   const derived = await deriveKey(password, salt, iterations);
   const a = await sha256Hex(derived);

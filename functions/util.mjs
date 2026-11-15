@@ -7,16 +7,17 @@ export const UUID_RE =
 export const json = (body, status = 200, extra = {}) =>
   Response.json(body, { status, headers: { "cache-control": "no-store", ...extra } });
 
-export const fail = (error, status = 400, extra = {}) =>
-  json({ ok: false, error, ...extra }, status);
+export const fail = (error, status = 400, extra = {}, headers = {}) =>
+  json({ ok: false, error, ...extra }, status, headers);
 
 export class Halt extends Error {
-  constructor(error, status = 400, detail = {}) {
+  constructor(error, status = 400, detail = {}, headers = {}) {
     super(error);
     this.name = "Halt";
     this.error = error;
     this.status = status;
     this.detail = detail;
+    this.headers = headers;
   }
 }
 

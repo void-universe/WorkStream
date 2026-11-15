@@ -6,6 +6,7 @@ import { delegateStatus } from "./delegate.mjs";
 import { STREAM_COLUMNS, humanMembership, requireMembership, requireRole } from "./perm.mjs";
 import { cleanDir, childPath, isUnder, rebase } from "./fs.mjs";
 import { Halt, CONTEXT_CHARS_DEFAULT, CONTEXT_CHARS_MAX, email as emailOf, int, json, newId, now, oneOf, text, uuid } from "./util.mjs";
+import { readEnv } from "./runtime.mjs";
 
 // 消息行的唯一列清单：写（这里）与读（chat.mjs 的翻页）共用一份，加一列只改一处。
 export const MESSAGE_COLUMNS =
@@ -96,9 +97,12 @@ async function memberDirectory(db, streamId, lang) {
   };
 }
 
-/** 分配群内消息序号：单行比较并写，冲突后最多重试 5 次。 */
+/** 分配群内消息序号：单行比较并写。冲突时不立刻放弃——并发写同一个群是常态（多路 @ 同时到达），
+ *  退避一小段再来，直到环境变量给的预算用完；预算用完才如实报 503，并带上 Retry-After 让前端退避。 */
 export async function nextSeq(db, streamId) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  const budget = Number(readEnv("WORKSTREAM_SEQ_RETRY_MS")) || 3000;
+  const deadline = Date.now() + Math.max(200, budget);
+  for (;;) {
     const stream = await db.streams.byId(streamId, { columns: "id,next_seq" });
     if (!stream) throw new Halt("stream_not_found", 404);
     const current = Number(stream.next_seq ?? 1);
@@ -108,8 +112,12 @@ export async function nextSeq(db, streamId) {
       { stamp: false },
     );
     if (claimed) return current;
+    if (Date.now() >= deadline) {
+      throw new Halt("seq_contention", 503, {}, { "retry-after": "1" });
+    }
+    // 抖动不可省：同一时刻的 N 个竞争者若用同一个固定间隔，会一直一起撞同一个 CAS。
+    await new Promise((resolve) => setTimeout(resolve, 4 + Math.random() * 16));
   }
-  throw new Halt("seq_contention", 503);
 }
 
 async function insertMessage(db, { streamId, senderType, senderId, senderName, content, mentions, replyTo, kind, attachments, presented, onBehalfOf }) {

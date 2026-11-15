@@ -1229,6 +1229,7 @@
   "errors.file_path_exists": "この階層に同名のファイルまたはフォルダーがあります。",
   "errors.invalid_file_path": "パスが不正です（..・空の階層なし、最大 6 階層）。",
   "errors.seq_contention": "メッセージが混雑し枠が埋まりました。再送してください。",
+  "errors.too_many_attempts": "試行回数が多すぎます。しばらくしてからもう一度お試しください。",
   "errors.upstream_unauthorized": "上流がこの Key を拒否しました。",
   "errors.upstream_not_found": "上流にこのモデルやエンドポイントがありません。",
   "errors.upstream_rate_limited": "上流のレート制限でこのターンは失敗。再度 @ で再試行します。",

@@ -1,6 +1,13 @@
 # CHANGELOG
 
-A version number only holds at the moment a tag is cut: `package.json` is currently `0.1.3`, the newest tag is `v0.1.3`, so the first section below is called **0.1.3 (1.0.0 candidate)** -- it records the capabilities already merged into `main` and already pinned into `npm run qa`. The source of truth for feature behavior itself remains [docs/guide.en.md](docs/guide.en.md) and [docs/arch/scheduler.en.md](docs/arch/scheduler.en.md); this file only records "which merge brought what" and "what is still missing", without copying a second manual.
+A version number only holds at the moment a tag is cut: `package.json` is currently `0.1.3`, the newest tag is `v0.1.3`, so everything merged after that tag sits under **Unreleased** until the next version is cut. The source of truth for feature behavior itself remains [docs/guide.en.md](docs/guide.en.md) and [docs/arch/scheduler.en.md](docs/arch/scheduler.en.md); this file only records "which merge brought what" and "what is still missing", without copying a second manual.
+
+## Unreleased
+
+- Burst on one stream no longer fails at the sequence counter: `nextSeq` retries with jitter inside a time budget (`WORKSTREAM_SEQ_RETRY_MS`, 3 seconds by default) instead of giving up after five attempts, reports `seq_contention` with a `retry-after` header when the budget runs out, and the browser retries that one 503 once on its own. Measured on one stream: 20 parallel sends went from **10/20** to **20/20**, 40 parallel from **6/40** to **40/40**.
+- Login failures are counted per (IP, account) in a sliding window (`WORKSTREAM_LOGIN_MAX_FAILS` / `WORKSTREAM_LOGIN_WINDOW_MS`, 10 per 5 minutes by default) and answered with `429 too_many_attempts` plus `retry-after`; PBKDF2 cost is a knob too (`WORKSTREAM_PBKDF2_ITERATIONS`). Measured before: 20 wrong passwords in 1.8s, every one a 401, no lockout and 90ms of CPU each.
+- `npm run preflight` (qa + build + bench) is the release gate now, and every fixture that reads what the model saw goes through `wireOf(body)` in [dev/wire.mjs](dev/wire.mjs) rather than `messages[0]`.
+- Self-check floor: `npm run qa` **1094 checks, 0 failures**; `npm run bench` 76 checks, 0 failures.
 
 ## 0.1.3 (1.0.0 candidate)
 

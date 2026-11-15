@@ -17,6 +17,7 @@ import { discoverStreamServer, askStreamServer } from "../functions/stream.mjs";
 import { SHARED_PROFILE, endpointPath } from "../functions/streamspec.mjs";
 import { newId } from "../functions/util.mjs";
 import { createFixtureClient } from "./fixture-supabase.mjs";
+import { wireOf } from "./wire.mjs";
 import { listenStreamServer } from "./stream-server.mjs";
 
 process.env.WORKSTREAM_DEV = "1";
@@ -122,9 +123,7 @@ function startUpstream({ chunkMs = 8, pieces = 4, slowChunks = 100, slowChunkMs 
       }
       const system = String(body.messages?.[0]?.content ?? "");
       // 易变块现在落在用户位的运行时快照里（functions/prompt.mjs）：剧本按整条请求认，不再只看 system。
-      const wire = (body.messages ?? [])
-        .map((message) => (typeof message.content === "string" ? message.content : ""))
-        .join("\n\n");
+      const wire = wireOf(body);
       const trigger = triggerOf(wire);
       const record = {
         at: Date.now(),

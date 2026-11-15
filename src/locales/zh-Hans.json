@@ -1229,6 +1229,7 @@
   "errors.file_path_exists": "这一层已经有同名文件或目录。",
   "errors.invalid_file_path": "路径不合法：不能有 ..、空段，最多 6 层。",
   "errors.seq_contention": "群里消息太密集，这条没排上，请重发。",
+  "errors.too_many_attempts": "尝试次数太多，请稍后再试。",
   "errors.upstream_unauthorized": "上游拒绝了这把 Key。",
   "errors.upstream_not_found": "上游找不到这个模型或端点。",
   "errors.upstream_rate_limited": "上游限流，这一轮没跑成，要重新 @ 才会再试。",

@@ -56,6 +56,7 @@ const ERROR_KEYS: Record<string, MsgKey> = {
   invalid_size_bytes: "errors.invalid_size_bytes",
   invalid_url: "errors.invalid_url",
   seq_contention: "errors.seq_contention",
+  too_many_attempts: "errors.too_many_attempts",
   upstream_unauthorized: "errors.upstream_unauthorized",
   upstream_not_found: "errors.upstream_not_found",
   upstream_rate_limited: "errors.upstream_rate_limited",
@@ -372,18 +373,28 @@ export async function api<T>(action: Action, options: Options = {}): Promise<T> 
   }
   const method = options.method ?? (options.body === undefined ? "GET" : "POST");
   const token = getToken();
-  const response = await fetch(`/functions/v1/app?${params.toString()}`, {
-    method,
-    credentials: "same-origin",
-    headers: {
-      "content-type": "application/json",
-      // 站点 Function 的适配层会剥掉前端的 authorization / cookie，
-      // 会话令牌走自定义头才能到达业务 handler。
-      ...(token ? { "x-workstream-token": token } : {}),
-    },
-    body: method === "GET" ? undefined : JSON.stringify(options.body ?? {}),
-  });
-  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  const send = async () => {
+    const res = await fetch(`/functions/v1/app?${params.toString()}`, {
+      method,
+      credentials: "same-origin",
+      headers: {
+        "content-type": "application/json",
+        // 站点 Function 的适配层会剥掉前端的 authorization / cookie，
+        // 会话令牌走自定义头才能到达业务 handler。
+        ...(token ? { "x-workstream-token": token } : {}),
+      },
+      body: method === "GET" ? undefined : JSON.stringify(options.body ?? {}),
+    });
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    return { res, body };
+  };
+  let { res: response, body: payload } = await send();
+  // 群内序号争用是唯一一种"服务端还没落库"的 503：退避后重发一次是安全的，不会写出重复消息。
+  // 其他 503 一律不重试——非幂等请求被重放比失败一次更糟。
+  if (response.status === 503 && payload.error === "seq_contention") {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    ({ res: response, body: payload } = await send());
+  }
   if (!response.ok || payload.ok !== true) {
     const code = typeof payload.error === "string" ? payload.error : `http_${response.status}`;
     if (code === "login_required") {

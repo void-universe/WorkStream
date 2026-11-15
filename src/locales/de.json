@@ -1229,6 +1229,7 @@
   "errors.file_path_exists": "Hier gibt es bereits eine Datei oder einen Ordner mit diesem Namen.",
   "errors.invalid_file_path": "Ungültiger Pfad: kein '..', keine leeren Segmente, höchstens sechs Ebenen.",
   "errors.seq_contention": "Zu dichte Nachrichten in der Gruppe — diese bekam keinen Platz, bitte erneut senden.",
+  "errors.too_many_attempts": "Zu viele Versuche — bitte kurz warten und erneut versuchen.",
   "errors.upstream_unauthorized": "Der Upstream hat diesen Key abgelehnt.",
   "errors.upstream_not_found": "Der Upstream kennt dieses Modell oder diesen Endpoint nicht.",
   "errors.upstream_rate_limited": "Der Upstream drosselt — diese Runde lief nicht; erst ein neues @ versucht es erneut.",

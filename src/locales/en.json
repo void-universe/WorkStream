@@ -1229,6 +1229,7 @@
   "errors.file_path_exists": "A file or folder with that name already exists here.",
   "errors.invalid_file_path": "Invalid path: no '..', no empty segments, at most six levels.",
   "errors.seq_contention": "The group was too busy and this message didn't get a slot — please resend.",
+  "errors.too_many_attempts": "Too many attempts — wait a moment and try again.",
   "errors.upstream_unauthorized": "Upstream rejected this Key.",
   "errors.upstream_not_found": "Upstream can't find this model or endpoint.",
   "errors.upstream_rate_limited": "Upstream is rate-limited and this turn didn't run; @ them again to retry.",

@@ -1,6 +1,7 @@
 // 真实员工账号、验证令牌与开发态收件箱。
 import { hashPassword, hashToken, newSessionToken, verifyPassword } from "./sec.mjs";
 import { smtpEndpoint } from "./runtime.mjs";
+import { throttleKey } from "./throttle.mjs";
 import { LOCALE_IDS } from "./locales.mjs";
 import { Halt, avatarData, email as emailOf, json, later, newId, now, oneOf, text, uuid } from "./util.mjs";
 
@@ -64,12 +65,24 @@ export const actions = {
     return json({ ok: true, verify_link: link });
   },
 
-  async "auth.login"({ db, body, request }) {
+  async "auth.login"({ db, body, request, throttle }) {
     const email = emailOf(body.email);
     const password = text(body.password, { min: 1, max: 200, name: "password" });
+    // 先看这个 (IP, 账号) 还有没有额度：超额时连 PBKDF2 都不跑，否则每次错误口令都是一次 90ms 的 CPU 消耗。
+    const key = throttleKey(request, email);
+    const gate = throttle.check(key);
+    if (!gate.allowed) {
+      throw new Halt("too_many_attempts", 429,
+        { retry_after_ms: gate.retryAfterMs },
+        { "retry-after": String(Math.max(1, Math.ceil(gate.retryAfterMs / 1000))) });
+    }
     const user = await db.users.first([["email", email]]);
     const ok = user ? await verifyPassword(password, user) : false;
-    if (!user || !ok) throw new Halt("bad_credentials", 401);
+    if (!user || !ok) {
+      throttle.fail(key);
+      throw new Halt("bad_credentials", 401);
+    }
+    throttle.pass(key);
     const token = newSessionToken();
     const session = await db.sessions.insert({
       id: newId(),

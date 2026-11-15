@@ -21,6 +21,7 @@
     "migrate": "node scripts/migrate.mjs",
     "dev:registry": "node dev/fixture-registry.mjs",
     "qa": "node scripts/check-node.mjs && node dev/check-schema.mjs && node dev/smoke.mjs",
+    "preflight": "npm run qa && npm run build && npm run bench",
     "seed": "node dev/seed-demo.mjs"
   },
   "dependencies": {
